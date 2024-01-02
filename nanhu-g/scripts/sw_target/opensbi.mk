@@ -11,7 +11,7 @@ OPENSBI_DTB := $(abspath $(INSTALL_LOC)/XSTop.dtb)
 
 # sub platform-specific OpenSBI compilation flags 
 USER_FLAGS := SERVE_PLAT=h \
-              HART_COUNT=1 \
+              HART_COUNT=2 \
 	      RV_TARGET=xiangshan \
 	      WITH_SM=n
 
