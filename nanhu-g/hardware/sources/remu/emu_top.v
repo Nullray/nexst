@@ -91,46 +91,88 @@ module emu_top(
     wire   [1:0]  io_mmio_rid;
     wire          io_mmio_ruser;
 
+    wire          io_dma_awready;
+    wire          io_dma_awvalid;
+    wire   [35:0] io_dma_awaddr;
+    wire   [2:0]  io_dma_awprot;
+    wire   [13:0] io_dma_awid;
+    wire          io_dma_awuser;
+    wire   [7:0]  io_dma_awlen;
+    wire   [2:0]  io_dma_awsize;
+    wire   [1:0]  io_dma_awburst;
+    wire          io_dma_awlock;
+    wire   [3:0]  io_dma_awcache;
+    wire   [3:0]  io_dma_awqos;
+    wire          io_dma_wready;
+    wire          io_dma_wvalid;
+    wire   [127:0]io_dma_wdata;
+    wire   [15:0] io_dma_wstrb;
+    wire          io_dma_wlast;
+    wire          io_dma_bready;
+    wire          io_dma_bvalid;
+    wire   [1:0]  io_dma_bresp;
+    wire   [13:0] io_dma_bid;
+    wire          io_dma_buser;
+    wire          io_dma_arready;
+    wire          io_dma_arvalid;
+    wire   [35:0] io_dma_araddr;
+    wire   [2:0]  io_dma_arprot;
+    wire   [13:0] io_dma_arid;
+    wire          io_dma_aruser;
+    wire   [7:0]  io_dma_arlen;
+    wire   [2:0]  io_dma_arsize;
+    wire   [1:0]  io_dma_arburst;
+    wire          io_dma_arlock;
+    wire   [3:0]  io_dma_arcache;
+    wire   [3:0]  io_dma_arqos;
+    wire          io_dma_rready;
+    wire          io_dma_rvalid;
+    wire   [1:0]  io_dma_rresp;
+    wire   [127:0]io_dma_rdata;
+    wire          io_dma_rlast;
+    wire   [13:0] io_dma_rid;
+    wire          io_dma_ruser;
+
     wire uart_intr;
 
     XSTop xs(
-        .dma_0_awready  (),
-        .dma_0_awvalid  (),
-        .dma_0_awid     (),
-        .dma_0_awaddr   (),
-        .dma_0_awlen    (),
-        .dma_0_awsize   (),
-        .dma_0_awburst  (),
-        .dma_0_awlock   (),
-        .dma_0_awcache  (),
-        .dma_0_awprot   (),
-        .dma_0_awqos    (),
-        .dma_0_wready   (),
-        .dma_0_wvalid   (),
-        .dma_0_wdata    (),
-        .dma_0_wstrb    (),
-        .dma_0_wlast    (),
-        .dma_0_bready   (),
-        .dma_0_bvalid   (),
-        .dma_0_bid      (),
-        .dma_0_bresp    (),
-        .dma_0_arready  (),
-        .dma_0_arvalid  (),
-        .dma_0_arid     (),
-        .dma_0_araddr   (),
-        .dma_0_arlen    (),
-        .dma_0_arsize   (),
-        .dma_0_arburst  (),
-        .dma_0_arlock   (),
-        .dma_0_arcache  (),
-        .dma_0_arprot   (),
-        .dma_0_arqos    (),
-        .dma_0_rready   (),
-        .dma_0_rvalid   (),
-        .dma_0_rid      (),
-        .dma_0_rdata    (),
-        .dma_0_rresp    (),
-        .dma_0_rlast    (),
+        .dma_0_awready          (io_dma_awready),
+        .dma_0_awvalid          (io_dma_awvalid),
+        .dma_0_awid             (0),
+        .dma_0_awaddr           (io_dma_awaddr),
+        .dma_0_awlen            (io_dma_awlen),
+        .dma_0_awsize           (io_dma_awsize),
+        .dma_0_awburst          (io_dma_awburst),
+        .dma_0_awlock           (io_dma_awlock),
+        .dma_0_awcache          (io_dma_awcache),
+        .dma_0_awprot           (io_dma_awprot),
+        .dma_0_awqos            (io_dma_awqos),
+        .dma_0_wready           (io_dma_wready),
+        .dma_0_wvalid           (io_dma_wvalid),
+        .dma_0_wdata            (io_dma_wdata),
+        .dma_0_wstrb            (io_dma_wstrb),
+        .dma_0_wlast            (io_dma_wlast),
+        .dma_0_bready           (io_dma_bready),
+        .dma_0_bvalid           (io_dma_bvalid),
+        .dma_0_bid              (),
+        .dma_0_bresp            (io_dma_bresp),
+        .dma_0_arready          (io_dma_arready),
+        .dma_0_arvalid          (io_dma_arvalid),
+        .dma_0_arid             (0),
+        .dma_0_araddr           (io_dma_araddr),
+        .dma_0_arlen            (io_dma_arlen),
+        .dma_0_arsize           (io_dma_arsize),
+        .dma_0_arburst          (io_dma_arburst),
+        .dma_0_arlock           (io_dma_arlock),
+        .dma_0_arcache          (io_dma_arcache),
+        .dma_0_arprot           (io_dma_arprot),
+        .dma_0_arqos            (io_dma_arqos),
+        .dma_0_rready           (io_dma_rready),
+        .dma_0_rvalid           (io_dma_rvalid),
+        .dma_0_rid              (),
+        .dma_0_rdata            (io_dma_rdata),
+        .dma_0_rresp            (io_dma_rresp),
+        .dma_0_rlast            (io_dma_rlast),
         .peripheral_0_awready   (io_mmio_awready),
         .peripheral_0_awvalid   (io_mmio_awvalid),
         .peripheral_0_awid      (io_mmio_awid),
@@ -545,7 +587,27 @@ module emu_top(
     wire        m01_axil_rvalid;
     wire        m01_axil_rready;
 
-    axil_interconnect_wrap_1x2 #(
+    wire [31:0] m02_axil_awaddr;
+    wire [2:0]  m02_axil_awprot;
+    wire        m02_axil_awvalid;
+    wire        m02_axil_awready;
+    wire [31:0] m02_axil_wdata;
+    wire [3:0]  m02_axil_wstrb;
+    wire        m02_axil_wvalid;
+    wire        m02_axil_wready;
+    wire [1:0]  m02_axil_bresp;
+    wire        m02_axil_bvalid;
+    wire        m02_axil_bready;
+    wire [31:0] m02_axil_araddr;
+    wire [2:0]  m02_axil_arprot;
+    wire        m02_axil_arvalid;
+    wire        m02_axil_arready;
+    wire [31:0] m02_axil_rdata;
+    wire [1:0]  m02_axil_rresp;
+    wire        m02_axil_rvalid;
+    wire        m02_axil_rready;
+
+    /*axil_interconnect_wrap_1x2 #(
         .DATA_WIDTH     (32),
         .ADDR_WIDTH     (32),
         .M00_BASE_ADDR  (32'h10000000),
@@ -612,8 +674,62 @@ module emu_top(
         .m01_axil_rresp     (m01_axil_rresp),
         .m01_axil_rvalid    (m01_axil_rvalid),
         .m01_axil_rready    (m01_axil_rready)
-    );
+    );*/
 
+    axil_interconnect #(
+        .S_COUNT(1),
+        .M_COUNT(3),
+        .DATA_WIDTH(32),
+        .ADDR_WIDTH(32),
+        .STRB_WIDTH(4),
+        .M_BASE_ADDR({ 32'h60000000,32'h30000000, 32'h10000000 }),
+        .M_ADDR_WIDTH({ 32, 32, 32 }),
+        .M_CONNECT_READ({ 1, 1, 1 }),
+        .M_CONNECT_WRITE({ 1, 1, 1 }),
+        .M_SECURE({ 0, 0, 0 })
+    )
+    axil_interconnect_inst (
+        .clk(clk),
+        .rst(rst),
+        .s_axil_awaddr({ s00_axil_awaddr }),
+        .s_axil_awprot({ s00_axil_awprot }),
+        .s_axil_awvalid({ s00_axil_awvalid }),
+        .s_axil_awready({ s00_axil_awready }),
+        .s_axil_wdata({ s00_axil_wdata }),
+        .s_axil_wstrb({ s00_axil_wstrb }),
+        .s_axil_wvalid({ s00_axil_wvalid }),
+        .s_axil_wready({ s00_axil_wready }),
+        .s_axil_bresp({ s00_axil_bresp }),
+        .s_axil_bvalid({ s00_axil_bvalid }),
+        .s_axil_bready({ s00_axil_bready }),
+        .s_axil_araddr({ s00_axil_araddr }),
+        .s_axil_arprot({ s00_axil_arprot }),
+        .s_axil_arvalid({ s00_axil_arvalid }),
+        .s_axil_arready({ s00_axil_arready }),
+        .s_axil_rdata({ s00_axil_rdata }),
+        .s_axil_rresp({ s00_axil_rresp }),
+        .s_axil_rvalid({ s00_axil_rvalid }),
+        .s_axil_rready({ s00_axil_rready }),
+        .m_axil_awaddr({ m02_axil_awaddr ,m01_axil_awaddr, m00_axil_awaddr }),
+        .m_axil_awprot({ m02_axil_awprot, m01_axil_awprot, m00_axil_awprot }),
+        .m_axil_awvalid({ m02_axil_awvalid, m01_axil_awvalid, m00_axil_awvalid }),
+        .m_axil_awready({ m02_axil_awready, m01_axil_awready, m00_axil_awready }),
+        .m_axil_wdata({ m02_axil_wdata, m01_axil_wdata, m00_axil_wdata }),
+        .m_axil_wstrb({ m02_axil_wstrb, m01_axil_wstrb, m00_axil_wstrb }),
+        .m_axil_wvalid({ m02_axil_wvalid, m01_axil_wvalid, m00_axil_wvalid }),
+        .m_axil_wready({ m02_axil_wready, m01_axil_wready, m00_axil_wready }),
+        .m_axil_bresp({ m02_axil_bresp, m01_axil_bresp, m00_axil_bresp }),
+        .m_axil_bvalid({ m02_axil_bvalid, m01_axil_bvalid, m00_axil_bvalid }),
+        .m_axil_bready({ m02_axil_bready, m01_axil_bready, m00_axil_bready }),
+        .m_axil_araddr({ m02_axil_araddr, m01_axil_araddr, m00_axil_araddr }),
+        .m_axil_arprot({ m02_axil_arprot, m01_axil_arprot, m00_axil_arprot }),
+        .m_axil_arvalid({ m02_axil_arvalid, m01_axil_arvalid, m00_axil_arvalid }),
+        .m_axil_arready({ m02_axil_arready, m01_axil_arready, m00_axil_arready }),
+        .m_axil_rdata({ m02_axil_rdata, m01_axil_rdata, m00_axil_rdata }),
+        .m_axil_rresp({ m02_axil_rresp, m01_axil_rresp, m00_axil_rresp }),
+        .m_axil_rvalid({ m02_axil_rvalid, m01_axil_rvalid, m00_axil_rvalid }),
+        .m_axil_rready({ m02_axil_rready, m01_axil_rready, m00_axil_rready })
+    );
     bootrom u_bootrom (
         .clk                (clk),
         .rst                (rst),
@@ -661,6 +777,77 @@ module emu_top(
         .s_axilite_rvalid   (m01_axil_rvalid),
         .s_axilite_rready   (m01_axil_rready),
         .intr               (uart_intr)
+    );
+
+    EmuDMA #(
+        .MMIO_ADDR_WIDTH     (32),
+        .MMIO_DATA_WIDTH     (32),
+        .DMA_ADDR_WIDTH      (36),
+        .DMA_DATA_WIDTH      (128),
+        .DMA_ID_WIDTH        (4),
+    )u_dmamodel(
+        .clk                    (clk),
+        .rst                    (rst),
+
+        .s_mmio_axi_awaddr   (m02_axil_awaddr),
+        .s_mmio_axi_awprot   (m02_axil_awprot),
+        .s_mmio_axi_awvalid  (m02_axil_awvalid),
+        .s_mmio_axi_awready  (m02_axil_awready),
+        .s_mmio_axi_wdata    (m02_axil_wdata),
+        .s_mmio_axi_wstrb    (m02_axil_wstrb),
+        .s_mmio_axi_wvalid   (m02_axil_wvalid),
+        .s_mmio_axi_wready   (m02_axil_wready),
+        .s_mmio_axi_bresp    (m02_axil_bresp),
+        .s_mmio_axi_bvalid   (m02_axil_bvalid),
+        .s_mmio_axi_bready   (m02_axil_bready),
+        .s_mmio_axi_araddr   (m02_axil_araddr),
+        .s_mmio_axi_arprot   (m02_axil_arprot),
+        .s_mmio_axi_arvalid  (m02_axil_arvalid),
+        .s_mmio_axi_arready  (m02_axil_arready),
+        .s_mmio_axi_rdata    (m02_axil_rdata),
+        .s_mmio_axi_rresp    (m02_axil_rresp),
+        .s_mmio_axi_rvalid   (m02_axil_rvalid),
+        .s_mmio_axi_rready   (m02_axil_rready),
+
+        .m_dma_axi_awid         (),
+        .m_dma_axi_awaddr       (io_dma_awaddr),
+        .m_dma_axi_awlen        (io_dma_awlen),
+        .m_dma_axi_awsize       (io_dma_awsize),
+        .m_dma_axi_awburst      (io_dma_awburst),
+        .m_dma_axi_awlock       (io_dma_awlock),
+        .m_dma_axi_awcache      (io_dma_awcache),
+        .m_dma_axi_awregion     (),
+        .m_dma_axi_awqos        (io_dma_awqos),
+        .m_dma_axi_awprot       (io_dma_awprot),
+        .m_dma_axi_awvalid      (io_dma_awvalid),
+        .m_dma_axi_awready      (io_dma_awready),
+        .m_dma_axi_wdata        (io_dma_wdata),
+        .m_dma_axi_wstrb        (io_dma_wstrb),
+        .m_dma_axi_wlast        (io_dma_wlast),
+        .m_dma_axi_wvalid       (io_dma_wvalid),
+        .m_dma_axi_wready       (io_dma_wready),
+        .m_dma_axi_bid          (0),
+        .m_dma_axi_bresp        (io_dma_bresp),
+        .m_dma_axi_bvalid       (io_dma_bvalid),
+        .m_dma_axi_bready       (io_dma_bready),
+        .m_dma_axi_arid         (),
+        .m_dma_axi_araddr       (io_dma_araddr),
+        .m_dma_axi_arlen        (io_dma_arlen),
+        .m_dma_axi_arsize       (io_dma_arsize),
+        .m_dma_axi_arburst      (io_dma_arburst),
+        .m_dma_axi_arlock       (io_dma_arlock),
+        .m_dma_axi_arcache      (io_dma_arcache),
+        .m_dma_axi_arregion     (),
+        .m_dma_axi_arqos        (io_dma_arqos),
+        .m_dma_axi_arprot       (io_dma_arprot),
+        .m_dma_axi_arvalid      (io_dma_arvalid),
+        .m_dma_axi_arready      (io_dma_arready),
+        .m_dma_axi_rid          (0),
+        .m_dma_axi_rdata        (io_dma_rdata),
+        .m_dma_axi_rresp        (io_dma_rresp),
+        .m_dma_axi_rlast        (io_dma_rlast),
+        .m_dma_axi_rvalid       (io_dma_rvalid),
+        .m_dma_axi_rready       (io_dma_rready)
     );
 
 endmodule
