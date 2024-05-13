@@ -18,7 +18,8 @@ for more detailed information of Xiangshan Nanhu microarchitecture
 the AMD/Xilinx Ultrascale+ VU37P FPGA chip
 (https://www.xilinx.com/products/boards-and-kits/vcu128.html) 
 
-- **NM37**, a custom acceleration card designed by our team
+- **NM37**, a custom acceleration card designed by our team, 
+allowing integration of a PCIe-attached NVMe SSD to XiangShan SoC   
 
 # Prerequisite
 
@@ -34,9 +35,13 @@ the AMD/Xilinx Ultrascale+ VU37P FPGA chip
 `ln -s ../tools/ tools` 
 
 3. Install Linux kernel header on the x86 server 
-side where the FPGA board/card is attached
+side where the FPGA board/card is attached   
 
-4. All compilation operations are launched in the directory of `work_farm`
+4. Install `minicom` on the x86 server  
+
+5. Prepare the Chisel compilation environment on the x86 server  
+
+5. All compilation operations are launched in the directory of `work_farm`
 
 # Hardware Generation (including Nanhu-G core and its SoC wrapper)
 
@@ -60,7 +65,7 @@ side where the FPGA board/card is attached
     The bitstream file is located in   
     `nanhu-g/ready_for_download/proto_vcu128/`
     
-    Log files, timing/utilization reports and 
+    Log files, timing and utilization reports and 
     design checkpoint files (.dcp) generated during Xilinx Vivado design flow 
     are located in   
     `work_farm/fpga/vivado_out/target_nanhu-g_proto_vcu128/` 
@@ -70,9 +75,8 @@ side where the FPGA board/card is attached
     `work_farm/fpga/vivado_prj/shell_vcu128_vcu128/` and   
     `work_farm/fpga/vivado_prj/target_nanhu-g_proto_vcu128`, respectively.   
 
-    
 **If you want to deploy prototyping on the NM37 card, please 
-substitute the `vcu128` to `nm37_vu37p` in each command line.**
+substitute the `vcu128` to `nm37_vu37p` in each command line.** 
 
 # RISC-V Side Software Compilation
 
@@ -85,14 +89,19 @@ substitute the `vcu128` to `nm37_vu37p` in each command line.**
 
 ## Linux boot via OpenSBI
 
+If you want to deploy prototyping on the NM37 card with NVMe SSD, please 
+substitute the value of `DT_TARGET` from `XSTop` to `XSTop_pci` in the following command line.
+
 ### DTB generation
-`make PRJ="target:nanhu-g:proto" FPGA_BD=vcu128 target_dt`   
+`make PRJ="target:nanhu-g:proto" FPGA_BD=vcu128 DT_TARGET=XSTop target_dt` 
+
+If you want to generate the device tree blob that specifies the PCIe root port, please substitute the `DT_TARGET` variable by `XSTop_pci`   
 
 ### Linux kernel (v5.16) compilation
 `make PRJ="target:nanhu-g:proto" FPGA_BD=vcu128 ARCH=riscv phy_os.os`   
 
 ### OpenSBI compilation (RV_BOOT.bin generation)
-`make PRJ="target:nanhu-g:proto" FPGA_BD=vcu128 ARCH=riscv opensbi`   
+`make PRJ="target:nanhu-g:proto" FPGA_BD=vcu128 ARCH=riscv DT_TARGET=XSTop opensbi`   
 
     The boot image (i.e., RV_BOOT.bin) is located in
     `nanhu-g/ready_for_download/proto_vcu128/`
@@ -121,9 +130,11 @@ substitute the `vcu128` to `nm37_vu37p` in each command line.**
 
 ## Evaluation steps
 
-- Copy `bootrom.bin`, `RV_BOOT.bin` generated in the steps above and `tools/proto` directory to the x86 host machine.
+- Ensure that `bootrom.bin`, `RV_BOOT.bin` mentioned in the above steps   
+  and `tools/proto` directory have been generated or located on the x86 host machine.   
 
-- Use Vivado toolset to program the FPGA with `system.bit` generated in the steps above (in `nanhu-g/ready_for_download/proto_vcu128/`).
+- Use Vivado toolset to program the FPGA with `system.bit` generated in the steps above   
+(in `nanhu-g/ready_for_download/proto_vcu128/`).
 
 - Restart the x86 host machine to probe the FPGA as a PCIe device.
 
@@ -132,6 +143,9 @@ substitute the `vcu128` to `nm37_vu37p` in each command line.**
     `cd shell/software/build/xdma_drv && sudo insmod xdma.ko`
 
     If successful, a series of `/dev/xdma<N>*` devices will be created (`<N>` is an assigned number), and detailed log can be viewed in `sudo dmesg`.
+
+- Open minicom to setup a console as the XiangShan terminal.  
+    Please launch `sudo minicom -s /dev/xdma0_ttyUL0` to configure the terminal as 115200n8    
 
 - Load images & run.
 
@@ -142,7 +156,7 @@ substitute the `vcu128` to `nm37_vu37p` in each command line.**
     sudo ./load_and_run.sh xdma<N> bootrom.bin RV_BOOT.bin # <N> is the assigned xdma device number
     ```
 
-    This will reset the XiangShan core, load images and start the execution. At the end the serial is connected and the user can interact with the system running on XiangShan. To exit the serial connection, press the escape key CTRL+\\.
+    This will reset the XiangShan core, load images and start the execution. At the end the serial is connected and the user can interact with the system running on XiangShan. To exit the serial connection, press the escape key CTRL+A+X.
 
     To resume the serial connection without a system reset, use the following command:
 
