@@ -9,7 +9,7 @@
 
 `timescale 10 ns / 1 ns
 
-module role_top (
+module placeholder_role_wrapper (
   input         aclk,
   input         aresetn,
 
@@ -144,9 +144,42 @@ module role_top (
   input   [15:0]  s2r_intr
 );
 
-  role role_i
+  placeholder_role role_i
     (.aclk(aclk),
     .aresetn(aresetn),
+    .m_axi_io_araddr(m_axi_io_araddr),
+    .m_axi_io_arburst(m_axi_io_arburst),
+    .m_axi_io_arcache(m_axi_io_arcache),
+    .m_axi_io_arlen(m_axi_io_arlen),
+    .m_axi_io_arlock(m_axi_io_arlock),
+    .m_axi_io_arprot(m_axi_io_arprot),
+    .m_axi_io_arqos(m_axi_io_arqos),
+    .m_axi_io_arready(m_axi_io_arready),
+    .m_axi_io_arsize(m_axi_io_arsize),
+    .m_axi_io_arvalid(m_axi_io_arvalid),
+    .m_axi_io_awaddr(m_axi_io_awaddr),
+    .m_axi_io_awburst(m_axi_io_awburst),
+    .m_axi_io_awcache(m_axi_io_awcache),
+    .m_axi_io_awlen(m_axi_io_awlen),
+    .m_axi_io_awlock(m_axi_io_awlock),
+    .m_axi_io_awprot(m_axi_io_awprot),
+    .m_axi_io_awqos(m_axi_io_awqos),
+    .m_axi_io_awready(m_axi_io_awready),
+    .m_axi_io_awsize(m_axi_io_awsize),
+    .m_axi_io_awvalid(m_axi_io_awvalid),
+    .m_axi_io_bready(m_axi_io_bready),
+    .m_axi_io_bresp(m_axi_io_bresp),
+    .m_axi_io_bvalid(m_axi_io_bvalid),
+    .m_axi_io_rdata(m_axi_io_rdata),
+    .m_axi_io_rlast(m_axi_io_rlast),
+    .m_axi_io_rready(m_axi_io_rready),
+    .m_axi_io_rresp(m_axi_io_rresp),
+    .m_axi_io_rvalid(m_axi_io_rvalid),
+    .m_axi_io_wdata(m_axi_io_wdata),
+    .m_axi_io_wlast(m_axi_io_wlast),
+    .m_axi_io_wready(m_axi_io_wready),
+    .m_axi_io_wstrb(m_axi_io_wstrb),
+    .m_axi_io_wvalid(m_axi_io_wvalid),
     .m_axi_mem_araddr(m_axi_mem_araddr),
     .m_axi_mem_arburst(m_axi_mem_arburst),
     .m_axi_mem_arcache(m_axi_mem_arcache),
@@ -196,7 +229,45 @@ module role_top (
     .s_axi_ctrl_wdata(s_axi_ctrl_wdata),
     .s_axi_ctrl_wready(s_axi_ctrl_wready),
     .s_axi_ctrl_wstrb(s_axi_ctrl_wstrb),
-    .s_axi_ctrl_wvalid(s_axi_ctrl_wvalid)
-  );
- 
+    .s_axi_ctrl_wvalid(s_axi_ctrl_wvalid),
+    .s_axi_dma_araddr(s_axi_dma_araddr),
+    .s_axi_dma_arburst(s_axi_dma_arburst),
+    .s_axi_dma_arcache(s_axi_dma_arcache),
+    .s_axi_dma_arlen(s_axi_dma_arlen),
+    .s_axi_dma_arlock(s_axi_dma_arlock),
+    .s_axi_dma_arprot(s_axi_dma_arprot),
+    .s_axi_dma_arqos(s_axi_dma_arqos),
+    .s_axi_dma_arready(s_axi_dma_arready),
+    .s_axi_dma_arsize(s_axi_dma_arsize),
+    .s_axi_dma_arvalid(s_axi_dma_arvalid),
+    .s_axi_dma_awaddr(s_axi_dma_awaddr),
+    .s_axi_dma_awburst(s_axi_dma_awburst),
+    .s_axi_dma_awcache(s_axi_dma_awcache),
+    .s_axi_dma_awlen(s_axi_dma_awlen),
+    .s_axi_dma_awlock(s_axi_dma_awlock),
+    .s_axi_dma_awprot(s_axi_dma_awprot),
+    .s_axi_dma_awqos(s_axi_dma_awqos),
+    .s_axi_dma_awready(s_axi_dma_awready),
+    .s_axi_dma_awsize(s_axi_dma_awsize),
+    .s_axi_dma_awvalid(s_axi_dma_awvalid),
+    .s_axi_dma_bready(s_axi_dma_bready),
+    .s_axi_dma_bresp(s_axi_dma_bresp),
+    .s_axi_dma_bvalid(s_axi_dma_bvalid),
+    .s_axi_dma_rdata(s_axi_dma_rdata),
+    .s_axi_dma_rlast(s_axi_dma_rlast),
+    .s_axi_dma_rready(s_axi_dma_rready),
+    .s_axi_dma_rresp(s_axi_dma_rresp),
+    .s_axi_dma_rvalid(s_axi_dma_rvalid),
+    .s_axi_dma_wdata(s_axi_dma_wdata),
+    .s_axi_dma_wlast(s_axi_dma_wlast),
+    .s_axi_dma_wready(s_axi_dma_wready),
+    .s_axi_dma_wstrb(s_axi_dma_wstrb),
+    .s_axi_dma_wvalid(s_axi_dma_wvalid),
+    .m_axis_trace_tvalid(m_axis_trace_tvalid),
+    .m_axis_trace_tready(m_axis_trace_tready),
+    .m_axis_trace_tdata(m_axis_trace_tdata),
+    .m_axis_trace_tkeep(m_axis_trace_tkeep),
+    .m_axis_trace_tlast(m_axis_trace_tlast)
+);
+
 endmodule

@@ -13,3 +13,9 @@
 [submodule "nanhu-g/software/rootfs"]
 	path = nanhu-g/software/rootfs
 	url = ../rootfs.git
+[submodule "tools/remu/framework"]
+	path = tools/remu/framework
+	url = ../../remu/remu.git
+[submodule "tools/remu/iverilog"]
+	path = tools/remu/iverilog
+	url = ../../remu/iverilog.git
