@@ -681,11 +681,11 @@ proc create_root_design { parentCell } {
   connect_bd_intf_net [get_bd_intf_pins xdma_rp/S_AXI_LITE] \
         [get_bd_intf_pins axi_ic_pcie_rp_mmio/M01_AXI]
 
-  # Address mapper for QDMA AXI MM
-  # out_addr = {28'd0, base_reg[7:0], in_addr[27:0]}
+  # Address mapper for XDMA AXI MM
+  # out_addr = {29'd0, in_addr[34:0]}
 
-  set const_28b0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 const_28b0 ]
-  set_property -dict [list CONFIG.CONST_WIDTH {28} CONFIG.CONST_VAL {0x0} ] $const_28b0
+    set const_29b0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 const_29b0 ]
+  set_property -dict [list CONFIG.CONST_WIDTH {29} CONFIG.CONST_VAL {0x0} ] $const_29b0
 
   set pair_list [list \
     {xdma_ep m_axib_araddr axi_ic_ddr_mem S00_AXI_araddr} \
@@ -699,18 +699,39 @@ proc create_root_design { parentCell } {
     set dst_port  [lindex ${pair} 3]
 
     set slice [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlslice:1.0 slice_${src_blk}_${src_port} ]
-    set_property -dict [list CONFIG.DIN_WIDTH {64} CONFIG.DIN_FROM {27} CONFIG.DIN_TO {0}] $slice
+    set_property -dict [list CONFIG.DIN_WIDTH {64} CONFIG.DIN_FROM {35} CONFIG.DIN_TO {0}] $slice
 
     set concat [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconcat:2.1 concat_${dst_blk}_${dst_port} ]
-    set_property -dict [list CONFIG.NUM_PORTS {3}] $concat
+    set_property -dict [list CONFIG.NUM_PORTS {2}] $concat
 
     connect_bd_net [get_bd_pins ${src_blk}/${src_port}] [get_bd_pins ${slice}/Din]
     connect_bd_net [get_bd_pins ${slice}/Dout] [get_bd_pins ${concat}/In0]
-    connect_bd_net [get_bd_pins axi_mm_base_reg/gpio_io_o] [get_bd_pins ${concat}/In1]
-    connect_bd_net [get_bd_pins const_28b0/dout] [get_bd_pins ${concat}/In2]
+    connect_bd_net [get_bd_pins const_29b0/dout] [get_bd_pins ${concat}/In1]
     connect_bd_net [get_bd_pins ${concat}/dout] [get_bd_pins ${dst_blk}/${dst_port}]
   }
 
+#=============================================
+  # XiangShan AXI MM Addr Map
+  # outAddr = inAddr - 0x80000000
+  
+  set c_addsub_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:c_addsub:12.0 c_addsub_0 ]
+  set_property -dict [list CONFIG.A_Width.VALUE_SRC USER CONFIG.B_Width.VALUE_SRC USER CONFIG.A_Type.VALUE_SRC PROPAGATED] [get_bd_cells c_addsub_0]
+  set_property -dict [list CONFIG.A_Width {36} CONFIG.B_Width {36} CONFIG.Add_Mode {Subtract} CONFIG.Latency {0} CONFIG.B_Constant {true} CONFIG.B_Value {000010000000000000000000000000000000} CONFIG.CE {false} CONFIG.Out_Width {36}] [get_bd_cells c_addsub_0]
+
+set c_addsub_1 [ create_bd_cell -type ip -vlnv xilinx.com:ip:c_addsub:12.0 c_addsub_1 ]
+  set_property -dict [list CONFIG.A_Width.VALUE_SRC USER CONFIG.B_Width.VALUE_SRC USER CONFIG.A_Type.VALUE_SRC PROPAGATED] [get_bd_cells c_addsub_1]
+  set_property -dict [list CONFIG.A_Width {36} CONFIG.B_Width {36} CONFIG.Add_Mode {Subtract} CONFIG.Latency {0} CONFIG.B_Constant {true} CONFIG.B_Value {000010000000000000000000000000000000} CONFIG.CE {false} CONFIG.Out_Width {36}] [get_bd_cells c_addsub_1]
+
+
+  connect_bd_net [get_bd_pins c_addsub_0/A] \
+      [get_bd_pins u_role/m_axi_mem_araddr]
+  connect_bd_net [get_bd_pins c_addsub_0/S] \
+      [get_bd_pins axi_ic_ddr_mem_reg_slice_S01/S_AXI_araddr]
+
+  connect_bd_net [get_bd_pins c_addsub_1/A] \
+      [get_bd_pins u_role/m_axi_mem_awaddr]
+  connect_bd_net [get_bd_pins c_addsub_1/S] \
+      [get_bd_pins axi_ic_ddr_mem_reg_slice_S01/S_AXI_awaddr]
 #=============================================
 # AXI stream interface connection
 #=============================================
@@ -827,15 +848,15 @@ proc create_root_design { parentCell } {
   create_bd_addr_seg -range 0x1000 -offset 0x10010000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs axi_mm_base_reg/S_AXI/Reg] PCIE_EP_BAR_AXI_MM_BASE_REG
   create_bd_addr_seg -range 0x1000 -offset 0x10011000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs host_uart/S_AXI/Reg] PCIE_EP_BAR_HOST_UART
   create_bd_addr_seg -range 0x100000 -offset 0x10100000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs u_role/s_axi_ctrl/reg0] PCIE_EP_BAR_ROLE_CTRL
-  create_bd_addr_seg -range 0x100000000 -offset 0x0 [get_bd_addr_spaces xdma_ep/M_AXI_BYPASS] [get_bd_addr_segs ddr4_mig/C0_DDR4_MEMORY_MAP/C0_DDR4_ADDRESS_BLOCK] PCIE_EP_BAR_DDR
+  create_bd_addr_seg -range 0x400000000 -offset 0x0 [get_bd_addr_spaces xdma_ep/M_AXI_BYPASS] [get_bd_addr_segs ddr4_mig/C0_DDR4_MEMORY_MAP/C0_DDR4_ADDRESS_BLOCK] PCIE_EP_BAR_DDR
 
   ## Role address space
   create_bd_addr_seg -range 0x10000 -offset 0x10000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs bootrom_bram_ctrl/S_AXI/Mem0] ROLE_BOOTROM
   create_bd_addr_seg -range 0x00100000 -offset 0x50000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs xdma_rp/S_AXI_B/BAR0] PCIE_RP_S_BAR
   create_bd_addr_seg -range 0x00800000 -offset 0x60000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs xdma_rp/S_AXI_LITE/CTL0] PCIE_RP_S_LITE
-  create_bd_addr_seg -range 0x000200000000 -offset 0x80000000 [get_bd_addr_spaces xdma_rp/M_AXI_B] [get_bd_addr_segs u_role/s_axi_dma/reg0] PCIE_RP_DMA
+  create_bd_addr_seg -range 0x000200000000 -offset 0x0 [get_bd_addr_spaces xdma_rp/M_AXI_B] [get_bd_addr_segs u_role/s_axi_dma/reg0] PCIE_RP_DMA
   create_bd_addr_seg -range 0x10000 -offset 0x30000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs role_uart/S_AXI/Reg] ROLE_UART
-  create_bd_addr_seg -range 0x100000000 -offset 0x0 [get_bd_addr_spaces u_role/m_axi_mem] [get_bd_addr_segs ddr4_mig/C0_DDR4_MEMORY_MAP/C0_DDR4_ADDRESS_BLOCK] ROLE_DDR
+  create_bd_addr_seg -range 0x200000000 -offset 0x0 [get_bd_addr_spaces u_role/m_axi_mem] [get_bd_addr_segs ddr4_mig/C0_DDR4_MEMORY_MAP/C0_DDR4_ADDRESS_BLOCK] ROLE_DDR
 
 #=============================================
 # Finish BD creation 
