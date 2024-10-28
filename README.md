@@ -47,45 +47,45 @@ side where the FPGA board/card is attached
 
 ## Nanhu-G compilation
 
-`make PRJ="target:nanhu-g" FPGA_BD=vcu128 xs_gen`
+`make PRJ="target:nanhu-g" FPGA_BD=nm37_vu37p xs_gen`
 
 ## FPGA design flow
 
-### FPGA Wrapper generation   
-`make PRJ="shell:vcu128" FPGA_BD=vcu128 FPGA_ACT=prj_gen vivado_prj`    
-`make PRJ="shell:vcu128" FPGA_BD=vcu128 FPGA_ACT=run_syn vivado_prj`   
+### FPGA Wrapper generation
+`make PRJ="shell:nm37_vu37p" FPGA_BD=nm37_vu37p FPGA_ACT=prj_gen vivado_prj`    
+`make PRJ="shell:nm37_vu37p" FPGA_BD=nm37_vu37p FPGA_ACT=run_syn vivado_prj`   
 
-### Xiangshan FPGA synthesis  
-`make PRJ="target:nanhu-g:proto" FPGA_BD=vcu128 FPGA_ACT=prj_gen vivado_prj`   
-`make PRJ="target:nanhu-g:proto" FPGA_BD=vcu128 FPGA_ACT=run_syn vivado_prj`
+### Xiangshan FPGA synthesis
+`make PRJ="target:nanhu-g:proto" FPGA_BD=nm37_vu37p FPGA_ACT=prj_gen vivado_prj`   
+`make PRJ="target:nanhu-g:proto" FPGA_BD=nm37_vu37p FPGA_ACT=run_syn vivado_prj`
 
-### FPGA Bitstream generation  
-`make PRJ="target:nanhu-g:proto" FPGA_BD=vcu128 FPGA_ACT=bit_gen vivado_prj`
+### FPGA Bitstream generation
+`make PRJ="target:nanhu-g:proto" FPGA_BD=nm37_vu37p FPGA_ACT=bit_gen vivado_prj`
 
     The bitstream file is located in   
-    `nanhu-g/ready_for_download/proto_vcu128/`
+    `nanhu-g/ready_for_download/nm37_vu37p/`
     
     Log files, timing and utilization reports and 
     design checkpoint files (.dcp) generated during Xilinx Vivado design flow 
     are located in   
-    `work_farm/fpga/vivado_out/target_nanhu-g_proto_vcu128/` 
+    `work_farm/fpga/vivado_out/target_nanhu-g_nm37_vu37p/` 
     
     Generated Vivado project of the SoC wrapper and target XiangShan 
     are located in  
-    `work_farm/fpga/vivado_prj/shell_vcu128_vcu128/` and   
-    `work_farm/fpga/vivado_prj/target_nanhu-g_proto_vcu128`, respectively.   
+    `work_farm/fpga/vivado_prj/shell_nm37_vu37p_nm37_vu37p/` and   
+    `work_farm/fpga/vivado_prj/target_nanhu-g_nm37_vu37p`, respectively.   
 
 **If you want to deploy prototyping on the NM37 card, please 
-substitute the `vcu128` to `nm37_vu37p` in each command line.** 
+substitute the `nm37_vu37p` to `vcu128` in each command line.** 
 
 # RISC-V Side Software Compilation
 
 ## Compilation of ZSBL image leveraged in Boot ROM
 
-`make PRJ="target:nanhu-g:proto" FPGA_BD=vcu128 ARCH=riscv zsbl`   
+`make PRJ="target:nanhu-g:proto" FPGA_BD=nm37_vu37p ARCH=riscv zsbl`   
 
     The bootrom.bin is located in
-    `nanhu-g/ready_for_download/proto_vcu128/`
+    `nanhu-g/ready_for_download/nm37_vu37p/`
 
 ## Linux boot via OpenSBI
 
@@ -93,18 +93,18 @@ If you want to deploy prototyping on the NM37 card with NVMe SSD, please
 substitute the value of `DT_TARGET` from `XSTop` to `XSTop_pci` in the following command line.
 
 ### DTB generation
-`make PRJ="target:nanhu-g:proto" FPGA_BD=vcu128 DT_TARGET=XSTop target_dt` 
+`make PRJ="target:nanhu-g:proto" FPGA_BD=nm37_vu37p DT_TARGET=XSTop target_dt` 
 
 If you want to generate the device tree blob that specifies the PCIe root port, please substitute the `DT_TARGET` variable by `XSTop_pci`   
 
 ### Linux kernel (v5.16) compilation
-`make PRJ="target:nanhu-g:proto" FPGA_BD=vcu128 ARCH=riscv phy_os.os`   
+`make PRJ="target:nanhu-g:proto" FPGA_BD=nm37_vu37p ARCH=riscv phy_os.os`   
 
 ### OpenSBI compilation (RV_BOOT.bin generation)
-`make PRJ="target:nanhu-g:proto" FPGA_BD=vcu128 ARCH=riscv DT_TARGET=XSTop opensbi`   
+`make PRJ="target:nanhu-g:proto" FPGA_BD=nm37_vu37p ARCH=riscv DT_TARGET=XSTop opensbi`   
 
     The boot image (i.e., RV_BOOT.bin) is located in
-    `nanhu-g/ready_for_download/proto_vcu128/`
+    `nanhu-g/ready_for_download/nm37_vu37p/`
 
 # FPGA evaluation flow
 
@@ -123,7 +123,7 @@ If you want to generate the device tree blob that specifies the PCIe root port, 
 
 ### Driver compilation
 
-`make PRJ="shell:vcu128" xdma_drv`   
+`make PRJ="shell:nm37_vu37p" xdma_drv`   
 
     The kernel module (i.e., xdma.ko) is located in
     `shell/software/build/xdma_drv/`
@@ -134,7 +134,7 @@ If you want to generate the device tree blob that specifies the PCIe root port, 
   and `tools/proto` directory have been generated or located on the x86 host machine.   
 
 - Use Vivado toolset to program the FPGA with `system.bit` generated in the steps above   
-(in `nanhu-g/ready_for_download/proto_vcu128/`).
+(in `nanhu-g/ready_for_download/nm37_vu37p/`).
 
 - Restart the x86 host machine to probe the FPGA as a PCIe device.
 
