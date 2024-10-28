@@ -125,7 +125,29 @@
 					#interrupt-cells = <1>;
 				};
 			};
-
-    	};
-    };
+		};
+		axi_mcdma: dma@ {
+			#dma-cells = <1>;
+			compatible = "xlnx,axi-mcdma-1.00.a";
+			// clock-names = "s_axi_lite_aclk", "m_axi_sg_aclk", "m_axi_mm2s_aclk", "m_axi_s2mm_aclk";
+			// // clocks = ;
+			interrupt-parent = <&L4>;
+			reg = <0x0 0x40000000 0x0 0x10000>;
+			xlnx,addrwidth = <36>;
+			mm2s-channel@40000000 {
+				compatible = "xlnx,axi-dma-mm2s-channel";
+				xlnx,include-dre;
+				dma-channels = <2>;
+				xlnx,datawidth = <512>;
+				interrupts = <4 4>, <5 4>;
+			}
+			s2mm-channel@40000000 {
+				compatible = "xlnx,axi-dma-s2mm-channel";
+				xlnx,include-dre ;
+				dma-channels = <2>;
+				xlnx,datawidth = <512>;
+				interrupts = <6 4>, <7 4>;
+			};
+		}
+	};
 };
