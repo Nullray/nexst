@@ -132,9 +132,37 @@
 					#interrupt-cells = <1>;
 				};
 			};
-
-    	};
-    };
+		};
+		axi_dma: dma@40000000 {
+			#dma-cells = <1>;
+			clock-names = "s_axi_lite_aclk", "m_axi_sg_aclk", "m_axi_mm2s_aclk", "m_axi_s2mm_aclk";
+			// clocks = <&clkc 15>, <&clkc 15>, <&clkc 15>, <&clkc 15>;
+			compatible = "xlnx,axi-dma-1.00.a";
+			interrupt-parent = <&L4>;
+			interrupts = <0 29 4 0 30 4>;
+			reg = <0x40000000 0x10000>;
+			xlnx,addrwidth = <40>;
+			xlnx,include-sg ;
+			dmas = <&dma_mm2s 0>, <&dma_s2mm 1>;
+			dma-names = "tx", "rx";
+			dma_mm2s: dma-channel@40400000 {
+					compatible = "xlnx,axi-dma-mm2s-channel";
+					dma-channels = <0x1>;
+					interrupts = <0 29 4>;
+					xlnx,datawidth = <40>;
+					xlnx,device-id = <0x0>;
+					xlnx,include-dre ;
+			};
+			dma_s2mm: dma-channel@40400030 {
+					compatible = "xlnx,axi-dma-s2mm-channel";
+					dma-channels = <0x1>;
+					interrupts = <0 30 4>;
+					xlnx,datawidth = <40>;
+					xlnx,device-id = <0x0>;
+					xlnx,include-dre ;
+			};
+		};
+	};
 };
 
 
