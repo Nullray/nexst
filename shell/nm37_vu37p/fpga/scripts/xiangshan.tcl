@@ -188,20 +188,39 @@ proc create_root_design { parentCell } {
             CONFIG.BASEADDR {0x00000000} \
             CONFIG.HIGHADDR {0x007FFFFF} ] $xdma_rp
 
-      # create instance: AXI MCDMA
-      set axi_mcdma [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_mcdma:1.1 axi_mcdma]
+      # create instance: AXI DMA
+      set axi_dma [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dma:7.1 axi_dma]
       set_property -dict [ list \
-            CONFIG.c_prmry_is_aclk_async {1} \
+            CONFIG.c_single_interface.VALUE_SRC PROPAGATED \
             CONFIG.c_m_axi_s2mm_data_width.VALUE_SRC USER \
+            CONFIG.c_s_axis_s2mm_tdata_width.VALUE_SRC USER \
+            CONFIG.c_enable_multi_channel {1} \
             CONFIG.c_num_mm2s_channels {2} \
             CONFIG.c_num_s2mm_channels {2} \
+            CONFIG.c_sg_include_stscntrl_strm {0} \
             CONFIG.c_m_axi_mm2s_data_width {512} \
-            CONFIG.c_mm2s_burst_size {16} \
+            CONFIG.c_m_axis_mm2s_tdata_width {512} \
+            CONFIG.c_mm2s_burst_size {64} \
             CONFIG.c_m_axi_s2mm_data_width {512} \
-            CONFIG.c_addr_width {36} \
-            CONFIG.c_group1_mm2s {0000000000000011} \
-            CONFIG.c_group1_s2mm {0000000000000011}
-      ] $axi_mcdma
+            CONFIG.c_s_axis_s2mm_tdata_width {512} \
+            CONFIG.c_s2mm_burst_size {64} \
+            CONFIG.c_addr_width {36}
+      ] $axi_dma
+
+      # # create instance: AXI MCDMA
+      # set axi_mcdma [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_mcdma:1.1 axi_mcdma]
+      # set_property -dict [ list \
+      #       CONFIG.c_prmry_is_aclk_async {1} \
+      #       CONFIG.c_m_axi_s2mm_data_width.VALUE_SRC USER \
+      #       CONFIG.c_num_mm2s_channels {2} \
+      #       CONFIG.c_num_s2mm_channels {2} \
+      #       CONFIG.c_m_axi_mm2s_data_width {512} \
+      #       CONFIG.c_mm2s_burst_size {16} \
+      #       CONFIG.c_m_axi_s2mm_data_width {512} \
+      #       CONFIG.c_addr_width {36} \
+      #       CONFIG.c_group1_mm2s {0000000000000011} \
+      #       CONFIG.c_group1_s2mm {0000000000000011}
+      # ] $axi_mcdma
 
       set axi_dwidth_converter_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dwidth_converter:2.1 axi_dwidth_converter_0 ]
       set_property -dict [list CONFIG.ADDR_WIDTH {64} \
@@ -223,7 +242,7 @@ proc create_root_design { parentCell } {
             CONFIG.S03_HAS_DATA_FIFO {1}
       ] $axi_ic_role_xdma_rp_mcdma
       
-      set axis_ic_mcdma_xdma_ep [create_bd_cell -type ip -vlnv xilinx.com:ip:axis_interconnect:2.1 axis_ic_mcdma_xdma_ep]
+      set axis_ic_axidma_xdma_ep [create_bd_cell -type ip -vlnv xilinx.com:ip:axis_interconnect:2.1 axis_ic_axidma_xdma_ep]
             set_property -dict [ list \
             CONFIG.S00_FIFO_DEPTH {4096} \
             CONFIG.S00_FIFO_MODE {1} \
@@ -231,7 +250,7 @@ proc create_root_design { parentCell } {
             CONFIG.M01_FIFO_DEPTH {4096} \
             CONFIG.M00_FIFO_MODE {1} \
             CONFIG.M01_FIFO_MODE {1}
-      ] $axis_ic_mcdma_xdma_ep
+      ] $axis_ic_axidma_xdma_ep
 
       # create instance: AXI interconnect for XDMA EP and MCDMA
       set axis_ic_xdma_ep_mcdma [create_bd_cell -type ip -vlnv xilinx.com:ip:axis_interconnect:2.1 axis_ic_xdma_ep_mcdma]
@@ -575,14 +594,14 @@ proc create_root_design { parentCell } {
             [get_bd_pins axi_ic_role_xdma_rp_mcdma/ACLK] \
             [get_bd_pins axi_ic_role_xdma_rp_mcdma/M00_ACLK] \
             [get_bd_pins axi_ic_role_io/M03_ACLK] \
-            [get_bd_pins axi_mcdma/s_axi_lite_aclk] \
-            [get_bd_pins axi_mcdma/m_axi_sg_aclk] \
-            [get_bd_pins axi_mcdma/m_axi_mm2s_aclk] \
-            [get_bd_pins axi_mcdma/m_axi_s2mm_aclk] \
-            [get_bd_pins axis_ic_mcdma_xdma_ep/M00_AXIS_ACLK] \
-            [get_bd_pins axis_ic_mcdma_xdma_ep/M01_AXIS_ACLK] \
-            [get_bd_pins axis_ic_mcdma_xdma_ep/ACLK] \
-            [get_bd_pins axis_ic_mcdma_xdma_ep/S00_AXIS_ACLK] \
+            [get_bd_pins axi_dma/s_axi_lite_aclk] \
+            [get_bd_pins axi_dma/m_axi_sg_aclk] \
+            [get_bd_pins axi_dma/m_axi_mm2s_aclk] \
+            [get_bd_pins axi_dma/m_axi_s2mm_aclk] \
+            [get_bd_pins axis_ic_axidma_xdma_ep/M00_AXIS_ACLK] \
+            [get_bd_pins axis_ic_axidma_xdma_ep/M01_AXIS_ACLK] \
+            [get_bd_pins axis_ic_axidma_xdma_ep/ACLK] \
+            [get_bd_pins axis_ic_axidma_xdma_ep/S00_AXIS_ACLK] \
             [get_bd_pins axis_ic_xdma_ep_mcdma/M00_AXIS_ACLK] \
             [get_bd_pins axis_ic_xdma_ep_mcdma/ACLK] \
             [get_bd_pins axis_ic_xdma_ep_mcdma/S00_AXIS_ACLK] \
@@ -596,11 +615,11 @@ proc create_root_design { parentCell } {
 
       # AXI_IC_ROLE_XDMA_RP_MCDMA and MCDMA
       connect_bd_net [get_bd_pins axi_ic_role_xdma_rp_mcdma/S01_ACLK] \
-            [get_bd_pins axi_mcdma/m_axi_sg_aclk]
+            [get_bd_pins axi_dma/m_axi_sg_aclk]
       connect_bd_net [get_bd_pins axi_ic_role_xdma_rp_mcdma/S02_ACLK] \
-            [get_bd_pins axi_mcdma/m_axi_mm2s_aclk]
+            [get_bd_pins axi_dma/m_axi_mm2s_aclk]
       connect_bd_net [get_bd_pins axi_ic_role_xdma_rp_mcdma/S03_ACLK] \
-            [get_bd_pins axi_mcdma/m_axi_s2mm_aclk]
+            [get_bd_pins axi_dma/m_axi_s2mm_aclk]
 
       #=============================================
       # System reset connection
@@ -644,11 +663,11 @@ proc create_root_design { parentCell } {
             [get_bd_pins role_uart/s_axi_aresetn] \
             [get_bd_pins host_uart/s_axi_aresetn] \
             [get_bd_pins axi_dwidth_converter_0/s_axi_aresetn] \
-            [get_bd_pins axis_ic_mcdma_xdma_ep/M00_AXIS_ARESETN] \
-            [get_bd_pins axis_ic_mcdma_xdma_ep/M01_AXIS_ARESETN] \
-            [get_bd_pins axis_ic_mcdma_xdma_ep/ARESETN] \
-            [get_bd_pins axis_ic_mcdma_xdma_ep/S00_AXIS_ARESETN] \
-            [get_bd_pins axi_mcdma/axi_resetn] \
+            [get_bd_pins axis_ic_axidma_xdma_ep/M00_AXIS_ARESETN] \
+            [get_bd_pins axis_ic_axidma_xdma_ep/M01_AXIS_ARESETN] \
+            [get_bd_pins axis_ic_axidma_xdma_ep/ARESETN] \
+            [get_bd_pins axis_ic_axidma_xdma_ep/S00_AXIS_ARESETN] \
+            [get_bd_pins axi_dma/axi_resetn] \
             [get_bd_pins axis_ic_xdma_ep_mcdma/ARESETN] \
             [get_bd_pins axis_ic_xdma_ep_mcdma/M00_AXIS_ARESETN] \
             [get_bd_pins axis_ic_xdma_ep_mcdma/S00_AXIS_ARESETN] \
@@ -774,32 +793,32 @@ proc create_root_design { parentCell } {
       # PCIe RP, MCDMA and role
       connect_bd_intf_net [get_bd_intf_pins axi_dwidth_converter_0/M_AXI] \
             -boundary_type upper [get_bd_intf_pins axi_ic_role_xdma_rp_mcdma/S00_AXI]
-      connect_bd_intf_net [get_bd_intf_pins axi_mcdma/M_AXI_SG] \
+      connect_bd_intf_net [get_bd_intf_pins axi_dma/M_AXI_SG] \
             -boundary_type upper [get_bd_intf_pins axi_ic_role_xdma_rp_mcdma/S01_AXI]
-      connect_bd_intf_net [get_bd_intf_pins axi_mcdma/M_AXI_MM2S] \
+      connect_bd_intf_net [get_bd_intf_pins axi_dma/M_AXI_MM2S] \
             -boundary_type upper [get_bd_intf_pins axi_ic_role_xdma_rp_mcdma/S02_AXI]
-      connect_bd_intf_net [get_bd_intf_pins axi_mcdma/M_AXI_S2MM] \
+      connect_bd_intf_net [get_bd_intf_pins axi_dma/M_AXI_S2MM] \
             -boundary_type upper [get_bd_intf_pins axi_ic_role_xdma_rp_mcdma/S03_AXI]
       connect_bd_intf_net -boundary_type upper [get_bd_intf_pins axi_ic_role_xdma_rp_mcdma/M00_AXI] \
             [get_bd_intf_pins u_role/s_axi_dma]
 
       # PCIe EP and MCDMA
-      connect_bd_intf_net [get_bd_intf_pins axi_mcdma/M_AXIS_MM2S] \
-            -boundary_type upper [get_bd_intf_pins axis_ic_mcdma_xdma_ep/S00_AXIS]
-      connect_bd_intf_net -boundary_type upper [get_bd_intf_pins axis_ic_mcdma_xdma_ep/M00_AXIS] \
+      connect_bd_intf_net [get_bd_intf_pins axi_dma/M_AXIS_MM2S] \
+            -boundary_type upper [get_bd_intf_pins axis_ic_axidma_xdma_ep/S00_AXIS]
+      connect_bd_intf_net -boundary_type upper [get_bd_intf_pins axis_ic_axidma_xdma_ep/M00_AXIS] \
             [get_bd_intf_pins xdma_ep/S_AXIS_C2H_0]
-      connect_bd_intf_net -boundary_type upper [get_bd_intf_pins axis_ic_mcdma_xdma_ep/M01_AXIS] \
+      connect_bd_intf_net -boundary_type upper [get_bd_intf_pins axis_ic_axidma_xdma_ep/M01_AXIS] \
             [get_bd_intf_pins xdma_ep/S_AXIS_C2H_1]
       connect_bd_intf_net [get_bd_intf_pins xdma_ep/M_AXIS_H2C_0] \
             -boundary_type upper [get_bd_intf_pins axis_ic_xdma_ep_mcdma/S00_AXIS]
       connect_bd_intf_net [get_bd_intf_pins xdma_ep/M_AXIS_H2C_1] \
             -boundary_type upper [get_bd_intf_pins axis_ic_xdma_ep_mcdma/S01_AXIS]
       connect_bd_intf_net -boundary_type upper [get_bd_intf_pins axis_ic_xdma_ep_mcdma/M00_AXIS] \
-            [get_bd_intf_pins axi_mcdma/S_AXIS_S2MM]
+            [get_bd_intf_pins axi_dma/S_AXIS_S2MM]
 
       # role and MCDMA
       connect_bd_intf_net -boundary_type upper [get_bd_intf_pins axi_ic_role_io/M03_AXI] \
-            [get_bd_intf_pins axi_mcdma/S_AXI_LITE]
+            [get_bd_intf_pins axi_dma/S_AXI_LITE]
 
 
       # Address mapper for XDMA AXI MM
@@ -911,10 +930,10 @@ proc create_root_design { parentCell } {
       connect_bd_net -net xdma_rp_interrupt_out_msi_vec0to31 [get_bd_pins xdma_rp/interrupt_out_msi_vec0to31] [get_bd_pins role_intr_concat/In2]
       connect_bd_net -net xdma_rp_interrupt_out_msi_vec32to63 [get_bd_pins xdma_rp/interrupt_out_msi_vec32to63] [get_bd_pins role_intr_concat/In3]
 
-      connect_bd_net [get_bd_pins axi_mcdma/mm2s_ch1_introut] [get_bd_pins role_intr_concat/In4]
-      connect_bd_net [get_bd_pins axi_mcdma/mm2s_ch2_introut] [get_bd_pins role_intr_concat/In5]
-      connect_bd_net [get_bd_pins axi_mcdma/s2mm_ch1_introut] [get_bd_pins role_intr_concat/In6]
-      connect_bd_net [get_bd_pins axi_mcdma/s2mm_ch2_introut] [get_bd_pins role_intr_concat/In7]
+      connect_bd_net [get_bd_pins axi_dma/mm2s_introut] [get_bd_pins role_intr_concat/In4]
+      # connect_bd_net [get_bd_pins axi_mcdma/mm2s_ch2_introut] [get_bd_pins role_intr_concat/In5]
+      connect_bd_net [get_bd_pins axi_dma/s2mm_introut] [get_bd_pins role_intr_concat/In6]
+      # connect_bd_net [get_bd_pins axi_mcdma/s2mm_ch2_introut] [get_bd_pins role_intr_concat/In7]
 
 
 
@@ -960,6 +979,20 @@ proc create_root_design { parentCell } {
       connect_bd_intf_net [get_bd_intf_pins system_ila_0/SLOT_1_AXI] [get_bd_intf_pins xdma_rp/S_AXI_B]
       connect_bd_intf_net [get_bd_intf_pins system_ila_0/SLOT_2_AXI] [get_bd_intf_pins xdma_rp/S_AXI_LITE]
 
+      set system_ila_1 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_1 ]
+      set_property -dict [list \
+            CONFIG.C_NUM_MONITOR_SLOTS {8} \
+            ] $system_ila_1
+
+      connect_bd_net [get_bd_pins xdma_ep/axi_aclk] [get_bd_pins system_ila_1/clk]
+      connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] [get_bd_pins system_ila_1/resetn]
+
+      connect_bd_intf_net [get_bd_intf_pins system_ila_1/SLOT_0_AXI] [get_bd_intf_pins xdma_ep/M_AXI_BYPASS]
+      connect_bd_intf_net [get_bd_intf_pins system_ila_1/SLOT_1_AXI] [get_bd_intf_pins xdma_ep/M_AXI_LITE]
+      connect_bd_intf_net [get_bd_intf_pins system_ila_1/SLOT_2_AXI] [get_bd_intf_pins axi_dma/M_AXI_SG]
+      connect_bd_intf_net [get_bd_intf_pins system_ila_1/SLOT_3_AXI] [get_bd_intf_pins axi_dma/M_AXI_MM2S]
+      connect_bd_intf_net [get_bd_intf_pins system_ila_1/SLOT_4_AXI] [get_bd_intf_pins axi_dma/S_AXI_LITE]
+
       #=============================================
       # Address segments
       #=============================================
@@ -978,10 +1011,10 @@ proc create_root_design { parentCell } {
       create_bd_addr_seg -range 0x000200000000 -offset 0x0 [get_bd_addr_spaces xdma_rp/M_AXI_B] [get_bd_addr_segs u_role/s_axi_dma/reg0] PCIE_RP_DMA
       create_bd_addr_seg -range 0x10000 -offset 0x30000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs role_uart/S_AXI/Reg] ROLE_UART
       create_bd_addr_seg -range 0x200000000 -offset 0x0 [get_bd_addr_spaces u_role/m_axi_mem] [get_bd_addr_segs ddr4_mig/C0_DDR4_MEMORY_MAP/C0_DDR4_ADDRESS_BLOCK] ROLE_DDR
-      create_bd_addr_seg -range 0x10000 -offset 0x40000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs axi_mcdma/S_AXI_LITE/Reg] MCDMA_CONFIG
-      create_bd_addr_seg -range 0x200000000 -offset 0x0 [get_bd_addr_spaces axi_mcdma/Data_MM2S] [get_bd_addr_segs u_role/s_axi_dma/reg0] MCDMA_MM2S
-      create_bd_addr_seg -range 0x200000000 -offset 0x0 [get_bd_addr_spaces axi_mcdma/Data_S2MM] [get_bd_addr_segs u_role/s_axi_dma/reg0] MCDMA_S2MM
-      create_bd_addr_seg -range 0x200000000 -offset 0x0 [get_bd_addr_spaces axi_mcdma/Data_SG] [get_bd_addr_segs u_role/s_axi_dma/reg0] MCDMA_SG
+      create_bd_addr_seg -range 0x10000 -offset 0x40000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs axi_dma/S_AXI_LITE/Reg] AXI_DMACONFIG
+      create_bd_addr_seg -range 0x200000000 -offset 0x0 [get_bd_addr_spaces axi_dma/Data_MM2S] [get_bd_addr_segs u_role/s_axi_dma/reg0] AXI_DMAMM2S
+      create_bd_addr_seg -range 0x200000000 -offset 0x0 [get_bd_addr_spaces axi_dma/Data_S2MM] [get_bd_addr_segs u_role/s_axi_dma/reg0] AXI_DMAS2MM
+      create_bd_addr_seg -range 0x200000000 -offset 0x0 [get_bd_addr_spaces axi_dma/Data_SG] [get_bd_addr_segs u_role/s_axi_dma/reg0] AXI_DMASG
 
       #=============================================
       # Finish BD creation
