@@ -156,8 +156,10 @@ proc create_root_design { parentCell } {
     CONFIG.axilite_master_scale {Megabytes} \
     CONFIG.pciebar2axibar_axil_master {0x10000000} \
     CONFIG.axist_bypass_en {true} \
-    CONFIG.axist_bypass_size {256} \
-    CONFIG.axist_bypass_scale {Megabytes} \
+    CONFIG.axist_bypass_size {16} \
+    CONFIG.axist_bypass_scale {Gigabytes} \
+    CONFIG.axi_bypass_64bit_en {true} \
+    CONFIG.axi_bypass_prefetchable {true} \
     CONFIG.cfg_mgmt_if {false} \
     CONFIG.pf0_base_class_menu {Processing_accelerators} \
     CONFIG.pf0_sub_class_interface_menu {Unknown} \
