@@ -193,5 +193,12 @@
 				ict,device-id = <0x1>;
 			};
 		};
+
+		axidmatest_1: axidmatest@1 {
+				compatible ="xlnx,axi-dma-test-1.00.a";
+				dmas = <&axi_dma_aggregate 0
+						&axi_dma_aggregate 1>;
+				dma-names = "mm2s", "s2mm";
+		} ;
 	};
 };

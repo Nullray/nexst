@@ -982,7 +982,7 @@ proc create_root_design { parentCell } {
 
       set system_ila_1 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_1 ]
       set_property -dict [list \
-            CONFIG.C_NUM_MONITOR_SLOTS {8} \
+            CONFIG.C_NUM_MONITOR_SLOTS {12} \
             ] $system_ila_1
 
       connect_bd_net [get_bd_pins xdma_ep/axi_aclk] [get_bd_pins system_ila_1/clk]
@@ -1023,6 +1023,14 @@ proc create_root_design { parentCell } {
       create_bd_addr_seg -range 0x200000000 -offset 0x0 [get_bd_addr_spaces axi_dma_1/Data_MM2S] [get_bd_addr_segs u_role/s_axi_dma/reg0] AXI_1_DMAMM2S
       create_bd_addr_seg -range 0x200000000 -offset 0x0 [get_bd_addr_spaces axi_dma_1/Data_S2MM] [get_bd_addr_segs u_role/s_axi_dma/reg0] AXI_1_DMAS2MM
       create_bd_addr_seg -range 0x200000000 -offset 0x0 [get_bd_addr_spaces axi_dma_1/Data_SG] [get_bd_addr_segs u_role/s_axi_dma/reg0] AXI_1_DMASG
+
+      delete_bd_objs [get_bd_intf_nets axi_dma_1_M_AXIS_MM2S]
+      delete_bd_objs [get_bd_intf_nets xdma_ep_M_AXIS_H2C_0]
+      delete_bd_objs [get_bd_intf_nets axi_dma_0_M_AXIS_MM2S]
+      delete_bd_objs [get_bd_intf_nets xdma_ep_M_AXIS_H2C_1]
+
+      connect_bd_intf_net [get_bd_intf_pins axi_dma_0/S_AXIS_S2MM] [get_bd_intf_pins axi_dma_1/M_AXIS_MM2S]
+      connect_bd_intf_net [get_bd_intf_pins axi_dma_1/S_AXIS_S2MM] [get_bd_intf_pins axi_dma_0/M_AXIS_MM2S]
 
       #=============================================
       # Finish BD creation
