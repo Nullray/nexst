@@ -5,11 +5,11 @@
 	#size-cells = <2>;
 	compatible = "freechips,rocketchip-unknown-dev";
 	model = "freechips,rocketchip-unknown";
-
+	
 	// aliases {
 	// 	serial0 = &uart0;
 	// };
-
+	
 	chosen {
 		bootargs = "earlycon clock_ignore_unused console=hvc0";
 		//stdout-path = "serial0:115200n8";
@@ -18,7 +18,7 @@
 	L16: cpus {
 		#address-cells = <1>;
 		#size-cells = <0>;
-		timebase-frequency = <500000>; // clk freq / 100
+		timebase-frequency = <500000>;// clk freq / 100
 		L9: cpu@0 {
 			clock-frequency = <0>;
 			compatible = "ICT,xiangshan", "riscv";
@@ -110,10 +110,10 @@
 			ranges = <0x02000000 0x00000000 0x50000000 0x0 0x50000000 0x00000000 0x00100000>;/*Root port 0 BAR*/
 			#interrupt-cells = <1>;
 			interrupts = <2>,  /*Root port 0 INTx*/
-				   <3>,  /*Root port 0 MSI0*/
-				   <4>;  /*Root port 0 MSI1*/
+			<3>,  /*Root port 0 MSI0*/
+			<4>;  /*Root port 0 MSI1*/
 			interrupt-parent = <&L4>;
-
+			
 			pcie_rp0: pcie@0,0 {
 				device_type = "pci";
 				reg = <0x0000 0 0 0 0>;
@@ -123,18 +123,75 @@
 				#interrupt-cells = <1>;
 				interrupt-map-mask = <0 0 0 7>;
 				interrupt-map = <0 0 0 1 &pcie_intc0 1>,
-					<0 0 0 2 &pcie_intc0 2>,
-					<0 0 0 3 &pcie_intc0 3>,
-					<0 0 0 4 &pcie_intc0 4>;
+				<0 0 0 2 &pcie_intc0 2>,
+				<0 0 0 3 &pcie_intc0 3>,
+				<0 0 0 4 &pcie_intc0 4>;
 				pcie_intc0: interrupt-controller {
 					interrupt-controller;
 					#address-cells = <0>;
 					#interrupt-cells = <1>;
 				};
 			};
+		};
+		axi_dma_aggregate:axi_dma_aggregate@40000000{
+			label = "axi_dma_aggregate";
+			compatible = "xlnx,axi-dma-aggregate-1.00.a";
+			#dma-cells = <1>;
+			clock-names = "s_axi_lite_aclk", "m_axi_sg_aclk", "m_axi_mm2s_aclk", "m_axi_s2mm_aclk";
+			interrupt-parent = <&L4>;
+			#interrupt-cells = <1>;
+			interrupts = <10>, <11>, <12>, <13>;
+			reg = <0x0 0x40000000 0x0 0x20000>;
+			xlnx,addrwidth = <36>;
+			xlnx,include-sg;
+			dmas = <&axidma0_mm2s 0>, <&axidma0_s2mm 0>,
+				   <&axidma1_mm2s 0>, <&axidma1_s2mm 0>;
+			dma-names = "mm2s0", "s2mm0",
+						"mm2s1", "s2mm1";
+			
+			axidma0_mm2s: dma-channel@40000000 {
+				compatible = "xlnx,axi-dma-mm2s-channel";
+				#dma-cells = <1>;
+				dma-channels = <0x1>;
+				interrupt-parent = <&L4>;
+				interrupts = <10>;
+				xlnx,datawidth = <512>;
+				xlnx,device-id = <0x0>;
+				ict,device-id = <0x0>;
+			};
 
-    	};
-    };
+			axidma1_mm2s: dma-channel@40010000 {
+				compatible = "xlnx,axi-dma-mm2s-channel";
+				#dma-cells = <1>;
+				dma-channels = <0x1>;
+				interrupt-parent = <&L4>;
+				interrupts = <12>;
+				xlnx,datawidth = <512>;
+				xlnx,device-id = <0x1>;
+				ict,device-id = <0x1>;
+			};
+			
+			axidma0_s2mm: dma-channel@40000030 {
+				compatible = "xlnx,axi-dma-s2mm-channel";
+				#dma-cells = <1>;
+				dma-channels = <0x1>;
+				interrupt-parent = <&L4>;
+				interrupts = <11>;
+				xlnx,datawidth = <512>;
+				xlnx,device-id = <0x0>;
+				ict,device-id = <0x0>;
+			};
+			
+			axidma1_s2mm: dma-channel@40010030 {
+				compatible = "xlnx,axi-dma-s2mm-channel";
+				#dma-cells = <1>;
+				dma-channels = <0x1>;
+				interrupt-parent = <&L4>;
+				interrupts = <13>;
+				xlnx,datawidth = <512>;
+				xlnx,device-id = <0x1>;
+				ict,device-id = <0x1>;
+			};
+		};
+	};
 };
-
-
