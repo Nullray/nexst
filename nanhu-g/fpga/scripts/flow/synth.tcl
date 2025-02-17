@@ -1,5 +1,7 @@
 # synthesizing full design
-synth_design -top role_top -part ${device} -mode out_of_context
+# Use strategy optimized of routability
+synth_design -top role_top -part ${device} -mode out_of_context \
+    -directive AlternateRoutability -flatten_hierarchy rebuilt
 
 # setup output logs and reports
 report_timing_summary -file ${synth_rpt_dir}/synth_timing.rpt -delay_type max -max_paths 1000
