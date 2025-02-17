@@ -19,6 +19,15 @@ set_property IOSTANDARD DIFF_SSTL12 [get_ports ddr4_mig_sys_clk_clk_p]
 set_property PACKAGE_PIN P56 [get_ports ddr4_mig_sys_clk_clk_n]
 set_property PACKAGE_PIN P55 [get_ports ddr4_mig_sys_clk_clk_p]
 
+# DUT's RTC reference clock
+create_clock -period 100.000 -name dut_rtc_ref_clk -waveform {0.000 50.000} [get_ports dut_rtc_ref_clk_clk_p]
+
+set_property IOSTANDARD LVDS18 [get_ports dut_rtc_ref_clk_clk_n]
+set_property IOSTANDARD LVDS18 [get_ports dut_rtc_ref_clk_clk_p]
+
+set_property PACKAGE_PIN BN38 [get_ports dut_rtc_ref_clk_clk_n]
+set_property PACKAGE_PIN BM38 [get_ports dut_rtc_ref_clk_clk_p]
+
 # PCIe EP perstn physical location
 set_property PACKAGE_PIN BK34 [get_ports pcie_ep_perstn]
 set_property IOSTANDARD LVCMOS12 [get_ports pcie_ep_perstn]
@@ -152,17 +161,94 @@ set_property PACKAGE_PIN AC57 [get_ports c0_ddr4_reset_n]
 
 # SLR constraints
 
+## PCIe and DDR4 blocks
 set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/xdma_ep]
-set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_ddr_mem]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/pcie_slow_clk_gen]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/pcie_slow_clk_rst_gen]
 
-set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_reg_slice_slr_xing/inst/aw16.aw_auto/slr_auto_src]
-set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_reg_slice_slr_xing/inst/w16.w_auto/slr_auto_src]
-set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_reg_slice_slr_xing/inst/ar16.ar_auto/slr_auto_src]
-set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_reg_slice_slr_xing/inst/r16.r_auto/slr_auto_dest]
-set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_reg_slice_slr_xing/inst/b16.b_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/ddr4_mig]
+set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/ddr4_mig_sync_reset]
+set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/dut_rst_gen]
 
-set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/axi_reg_slice_slr_xing/inst/aw16.aw_auto/slr_auto_dest]
-set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/axi_reg_slice_slr_xing/inst/w16.w_auto/slr_auto_dest]
-set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/axi_reg_slice_slr_xing/inst/ar16.ar_auto/slr_auto_dest]
-set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/axi_reg_slice_slr_xing/inst/r16.r_auto/slr_auto_src]
-set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/axi_reg_slice_slr_xing/inst/b16.b_auto/slr_auto_src]
+## AXI interconnect
+set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/axi_ic_ddr_mem]
+set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/axi_ic_ddr_mem_S00_cc]
+set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/axi_ic_ddr_mem_S01_cc]
+
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ddr_mem_cross_domain]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_ddr_mem_pcie]
+
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_ep_bar_axi_lite]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ep_bar_axi_lite_cross_domain]
+
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_role_io]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_role_io_cross_domain]
+
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_bootrom]
+
+## Interrupt sync.
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/intr_sync_pcie_slow]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/intr_sync_dut]
+
+## Other blocks
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/host_uart]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/role_uart]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/bootrom_bram]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/bootrom_bram_ctrl]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_mm_base_reg]
+
+
+## Crossing SLR register slicing
+### DDR <-> PCIe: DUT clock: Master port in SLR1 to Slave port in SLR2
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ddr_mem_reg_slice/inst/aw16.aw_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ddr_mem_reg_slice/inst/w16.w_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ddr_mem_reg_slice/inst/ar16.ar_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ddr_mem_reg_slice/inst/r16.r_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ddr_mem_reg_slice/inst/b16.b_auto/slr_auto_dest]
+
+set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/axi_ic_ddr_mem_reg_slice/inst/aw16.aw_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/axi_ic_ddr_mem_reg_slice/inst/w16.w_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/axi_ic_ddr_mem_reg_slice/inst/ar16.ar_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/axi_ic_ddr_mem_reg_slice/inst/r16.r_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR2 [get_cells xiangshan_i/axi_ic_ddr_mem_reg_slice/inst/b16.b_auto/slr_auto_src]
+
+### DDR <-> PCIe: PCIe slow clock: Master port in SLR0 to Slave port in SLR1
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_ddr_mem_pcie_reg_slice/inst/aw16.aw_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_ddr_mem_pcie_reg_slice/inst/w16.w_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_ddr_mem_pcie_reg_slice/inst/ar16.ar_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_ddr_mem_pcie_reg_slice/inst/r16.r_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_ddr_mem_pcie_reg_slice/inst/b16.b_auto/slr_auto_dest]
+
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ddr_mem_pcie_reg_slice/inst/aw16.aw_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ddr_mem_pcie_reg_slice/inst/w16.w_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ddr_mem_pcie_reg_slice/inst/ar16.ar_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ddr_mem_pcie_reg_slice/inst/r16.r_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ddr_mem_pcie_reg_slice/inst/b16.b_auto/slr_auto_src]
+
+
+### Role IO: PCIe slow clock: Master port in SLR1 to Slave port in SLR0
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_role_io_reg_slice_M00/inst/aw16.aw_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_role_io_reg_slice_M00/inst/w16.w_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_role_io_reg_slice_M00/inst/ar16.ar_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_role_io_reg_slice_M00/inst/r16.r_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_role_io_reg_slice_M00/inst/b16.b_auto/slr_auto_dest]
+
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_role_io_reg_slice_M00/inst/aw16.aw_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_role_io_reg_slice_M00/inst/w16.w_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_role_io_reg_slice_M00/inst/ar16.ar_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_role_io_reg_slice_M00/inst/r16.r_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_role_io_reg_slice_M00/inst/b16.b_auto/slr_auto_src]
+
+### Role ctrl: PCIe slow clock: Master port in SLR0 to Slave port in SLR1
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_ep_bar_axi_lite_cross_domain_S00/inst/aw16.aw_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_ep_bar_axi_lite_cross_domain_S00/inst/w16.w_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_ep_bar_axi_lite_cross_domain_S00/inst/ar16.ar_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_ep_bar_axi_lite_cross_domain_S00/inst/r16.r_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR0 [get_cells xiangshan_i/axi_ic_ep_bar_axi_lite_cross_domain_S00/inst/b16.b_auto/slr_auto_dest]
+
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ep_bar_axi_lite_cross_domain_S00/inst/aw16.aw_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ep_bar_axi_lite_cross_domain_S00/inst/w16.w_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ep_bar_axi_lite_cross_domain_S00/inst/ar16.ar_auto/slr_auto_dest]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ep_bar_axi_lite_cross_domain_S00/inst/r16.r_auto/slr_auto_src]
+set_property USER_SLR_ASSIGNMENT SLR1 [get_cells xiangshan_i/axi_ic_ep_bar_axi_lite_cross_domain_S00/inst/b16.b_auto/slr_auto_src]
+
