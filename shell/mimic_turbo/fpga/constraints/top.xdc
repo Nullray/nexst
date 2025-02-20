@@ -22,11 +22,11 @@ set_property PACKAGE_PIN P55 [get_ports ddr4_mig_sys_clk_clk_p]
 # DUT's RTC reference clock
 create_clock -period 100.000 -name dut_rtc_ref_clk -waveform {0.000 50.000} [get_ports dut_rtc_ref_clk_clk_p]
 
-set_property IOSTANDARD LVDS18 [get_ports dut_rtc_ref_clk_clk_n]
-set_property IOSTANDARD LVDS18 [get_ports dut_rtc_ref_clk_clk_p]
+set_property IOSTANDARD LVCMOS18 [get_ports dut_rtc_ref_clk_clk_n]
+set_property IOSTANDARD LVCMOS18 [get_ports dut_rtc_ref_clk_clk_p]
 
-set_property PACKAGE_PIN BN38 [get_ports dut_rtc_ref_clk_clk_n]
-set_property PACKAGE_PIN BM38 [get_ports dut_rtc_ref_clk_clk_p]
+set_property PACKAGE_PIN BN38 [get_ports dut_rtc_ref_clk_clk_n[0]]
+set_property PACKAGE_PIN BM38 [get_ports dut_rtc_ref_clk_clk_p[0]]
 
 # PCIe EP perstn physical location
 set_property PACKAGE_PIN BK34 [get_ports pcie_ep_perstn]
