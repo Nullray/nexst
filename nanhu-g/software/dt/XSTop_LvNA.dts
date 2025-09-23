@@ -5,16 +5,16 @@
 	#size-cells = <2>;
 	compatible = "freechips,rocketchip-unknown-dev";
 	model = "freechips,rocketchip-unknown";
-
+	
 	// aliases {
 	// 	serial0 = &uart0;
 	// };
-
+	
 	chosen {
 		bootargs = "earlycon clock_ignore_unused console=hvc0";
 		//stdout-path = "serial0:115200n8";
 	};
-
+	
 	L20: cpus {
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -149,6 +149,74 @@
 			compatible = "xiangshan,cache_ctrl";
 			interrupt-parent = <&L4>;
 			interrupts = <67>;
+		};
+	};
+	pcie_rc0: pcie@40000000 {
+		compatible = "xlnx,xdma-host-3.00";
+		device_type = "pci";
+		reg = <0x0 0x40000000 0x0 0x00500000>; /*Root port 0 ctrl*/
+		reg-names = "rp0";
+		#address-cells = <3>;
+		#size-cells = <2>;
+		bus-range = <0 1>;
+		ranges = <0x02000000 0x00000000 0x51000000 0x0 0x51000000 0x00000000 0x01000000>;/*Root port 0 BAR*/
+		#interrupt-cells = <1>;
+		interrupts = <5>,  /*Root port 0 INTx*/
+		<6>,  /*Root port 0 MSI0*/
+		<7>;  /*Root port 0 MSI1*/
+		interrupt-parent = <&L4>;
+		
+		pcie_rp0: pcie@0,0 {
+			device_type = "pci";
+			reg = <0x0000 0 0 0 0>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges;
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 7>;
+			interrupt-map = <0 0 0 1 &pcie_intc0 1>,
+			<0 0 0 2 &pcie_intc0 2>,
+			<0 0 0 3 &pcie_intc0 3>,
+			<0 0 0 4 &pcie_intc0 4>;
+			pcie_intc0: interrupt-controller {
+				interrupt-controller;
+				#address-cells = <0>;
+				#interrupt-cells = <1>;
+			};
+		};
+	};
+	pcie_rc1: pcie@60000000 {
+		compatible = "xlnx,xdma-host-3.00";
+		device_type = "pci";
+		reg = <0x0 0x60000000 0x0 0x00500000>; /*Root port 0 ctrl*/
+		reg-names = "rp0";
+		#address-cells = <3>;
+		#size-cells = <2>;
+		bus-range = <0 1>;
+		ranges = <0x02000000 0x00000000 0x50000000 0x0 0x50000000 0x00000000 0x01000000>;/*Root port 0 BAR*/
+		#interrupt-cells = <1>;
+		interrupts = <2>,  /*Root port 0 INTx*/
+		<3>,  /*Root port 0 MSI0*/
+		<4>;  /*Root port 0 MSI1*/
+		interrupt-parent = <&L4>;
+		
+		pcie_rp1: pcie@0,0 {
+			device_type = "pci";
+			reg = <0x0000 0 0 0 0>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges;
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 7>;
+			interrupt-map = <0 0 0 1 &pcie_intc1 1>,
+			<0 0 0 2 &pcie_intc1 2>,
+			<0 0 0 3 &pcie_intc1 3>,
+			<0 0 0 4 &pcie_intc1 4>;
+			pcie_intc1: interrupt-controller {
+				interrupt-controller;
+				#address-cells = <0>;
+				#interrupt-cells = <1>;
+			};
 		};
 	};
 };
