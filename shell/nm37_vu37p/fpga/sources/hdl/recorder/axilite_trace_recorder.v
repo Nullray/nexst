@@ -9,15 +9,13 @@ module axilite_trace_recorder #(
     parameter   AXI_MODE        = 0
 ) (
     input clk,
-    // 【重要】Block Design连接的是axi_ctl_aresetn (低电平复位)
-    // 内部会取反生成高电平复位信号 internal_rst
-    input rst, 
+    input rst, // Block Design 连接的是低电平有效的 axi_ctl_aresetn
     `AXI4LITE_SLAVE_IF                  (s_axi, ADDR_WIDTH, DATA_WIDTH),
     `AXI4LITE_MASTER_IF                 (m_axi, ADDR_WIDTH, DATA_WIDTH),
     `AXI4LITE_MASTER_IF                 (m1_axi, ADDR_WIDTH, DATA_WIDTH) // 写 Log 的 Master 接口
 );
 
-    // [FIX 1] 内部生成高有效复位信号
+    // 内部生成高有效复位信号
     wire internal_rst = ~rst;
 
     // --- payload widths ---
@@ -45,137 +43,119 @@ module axilite_trace_recorder #(
     // total width per FIFO entry = header + max payload
     localparam TOTAL_ENTRY_WIDTH = HEADER_WIDTH + MAX_PAYLOAD_FORMATTED_WIDTH;
 
-    // beats per channel including header
-    localparam integer A_BEATS_HDR = (A_PAYLOAD_FORMATTED_WIDTH + HEADER_WIDTH + DATA_WIDTH - 1) / DATA_WIDTH;
-    localparam integer R_BEATS_HDR = (R_PAYLOAD_FORMATTED_WIDTH + HEADER_WIDTH + DATA_WIDTH - 1) / DATA_WIDTH;
-    localparam integer W_BEATS_HDR = (W_PAYLOAD_FORMATTED_WIDTH + HEADER_WIDTH + DATA_WIDTH - 1) / DATA_WIDTH;
-    localparam integer B_BEATS_HDR = (B_PAYLOAD_FORMATTED_WIDTH + HEADER_WIDTH + DATA_WIDTH - 1) / DATA_WIDTH;
-
     // wires from channel logger
-    wire logging_arvalid;
-    wire logging_arready;
+    wire logging_arvalid, logging_arready;
     wire [A_PAYLOAD_FORMATTED_WIDTH-1:0] logging_ar_payload;
-    wire logging_awvalid;
-    wire logging_awready;
+    wire logging_awvalid, logging_awready;
     wire [A_PAYLOAD_FORMATTED_WIDTH-1:0] logging_aw_payload;
-    wire logging_rvalid;
-    wire logging_rready;
+    wire logging_rvalid, logging_rready;
     wire [R_PAYLOAD_FORMATTED_WIDTH-1:0] logging_r_payload;
-    wire logging_wvalid;
-    wire logging_wready;
+    wire logging_wvalid, logging_wready;
     wire [W_PAYLOAD_FORMATTED_WIDTH-1:0] logging_w_payload;
-    wire logging_bvalid;
-    wire logging_bready;
+    wire logging_bvalid, logging_bready;
     wire [B_PAYLOAD_FORMATTED_WIDTH-1:0] logging_b_payload;
 
-    // ---------------------------
-    // FIFO for events
-    // ---------------------------
-    localparam FIFO_DEPTH = 8;
-    localparam FIFO_PTR_W = 3; 
-    integer i;
-    
+    // Channel IDs
     localparam CH_AR = 8'd0;
     localparam CH_AW = 8'd1;
-    localparam CH_R = 8'd2;
-    localparam CH_W = 8'd3;
-    localparam CH_B = 8'd4;
+    localparam CH_R  = 8'd2;
+    localparam CH_W  = 8'd3;
+    localparam CH_B  = 8'd4;
 
-    reg [FIFO_PTR_W-1:0] fifo_wr_ptr;
-    reg [FIFO_PTR_W-1:0] fifo_rd_ptr;
-    reg [4:0] fifo_count; 
-    reg [7:0] fifo_beats [0:FIFO_DEPTH-1];
-    reg [TOTAL_ENTRY_WIDTH-1:0] fifo_payload [0:FIFO_DEPTH-1];
-    reg [7:0] fifo_chanid [0:FIFO_DEPTH-1];
+    // ---------------------------------------------------------
+    // 双 FIFO 架构：分离 W 通道以支持并发握手
+    // ---------------------------------------------------------
+    localparam FIFO_DEPTH = 8;
+    localparam FIFO_PTR_W = 3; 
 
-    assign logging_arready = (fifo_count < FIFO_DEPTH-1);
-    assign logging_awready = (fifo_count < FIFO_DEPTH-1);
-    assign logging_wready  = (fifo_count < FIFO_DEPTH-1);
-    assign logging_rready  = (fifo_count < FIFO_DEPTH-1);
-    assign logging_bready  = (fifo_count < FIFO_DEPTH-1);
+    // 1. MAIN FIFO (复用处理 AR, AW, R, B 通道)
+    reg [TOTAL_ENTRY_WIDTH-1:0] main_fifo [0:FIFO_DEPTH-1];
+    reg [FIFO_PTR_W-1:0] main_wr_ptr, main_rd_ptr;
+    reg [4:0] main_count;
 
-    // timestamp counter
+    // 2. W 专属 FIFO (专门处理 W 通道)
+    reg [TOTAL_ENTRY_WIDTH-1:0] w_fifo [0:FIFO_DEPTH-1];
+    reg [FIFO_PTR_W-1:0] w_wr_ptr, w_rd_ptr;
+    reg [4:0] w_count;
+
+    // 独立判定能否入队
+    wire can_push_main = (main_count < FIFO_DEPTH-1) && !internal_rst;
+    wire can_push_w    = (w_count < FIFO_DEPTH-1)    && !internal_rst;
+
+    // Ready 信号优先级反压分配 (W独立，MAIN内部分级)
+    assign logging_wready  = can_push_w;
+    assign logging_arready = can_push_main;
+    assign logging_awready = can_push_main && !logging_arvalid;
+    assign logging_rready  = can_push_main && !logging_arvalid && !logging_awvalid;
+    assign logging_bready  = can_push_main && !logging_arvalid && !logging_awvalid && !logging_rvalid;
+
+    // 时间戳计数器
     reg [HEADER_TS_WIDTH-1:0] ts_cnt;
     always @(posedge clk) begin
         if (internal_rst) ts_cnt <= {HEADER_TS_WIDTH{1'b0}};
         else ts_cnt <= ts_cnt + 1;
     end
 
-    reg pop_req; 
-    reg pop_ack; 
-    integer count_delta;
+    // 由仲裁状态机控制的出队脉冲
+    reg main_pop, w_pop; 
 
-    // FIFO Management
+    // ---------------------------------------------------------
+    // [绝对关键的修复] 
+    // 将线网型变量 (wire) 的声明强制放在 always 块外部！
+    // ---------------------------------------------------------
+    wire main_push = (logging_arvalid && logging_arready) || 
+                     (logging_awvalid && logging_awready) || 
+                     (logging_rvalid  && logging_rready)  || 
+                     (logging_bvalid  && logging_bready);
+                     
+    wire w_push = (logging_wvalid && logging_wready);
+
+    // 双 FIFO 并发写入与出队逻辑
     always @(posedge clk) begin
         if (internal_rst) begin
-            fifo_wr_ptr <= {FIFO_PTR_W{1'b0}};
-            fifo_rd_ptr <= {FIFO_PTR_W{1'b0}};
-            fifo_count <= 0;
-            pop_ack <= 1'b0;
-            for (i = 0; i < FIFO_DEPTH; i = i + 1) begin
-                fifo_beats[i] <= 0;
-                fifo_payload[i] <= {TOTAL_ENTRY_WIDTH{1'b0}};
-                fifo_chanid[i] <= 0;
-            end
+            main_wr_ptr <= 0; main_rd_ptr <= 0; main_count <= 0;
+            w_wr_ptr <= 0; w_rd_ptr <= 0; w_count <= 0;
         end else begin
-            pop_ack <= 1'b0;
-            count_delta = 0;
-
-            // Pop Logic
-            if (pop_req && (fifo_count > 0)) begin
-                fifo_rd_ptr <= fifo_rd_ptr + 1;
-                count_delta = count_delta - 1;
-                pop_ack <= 1'b1;
+            // ---- [动作 A]：MAIN FIFO 写入 (内部互斥) ----
+            
+            // 利用 Verilog 隐式高位补 0 机制进行拼接，安全可靠
+            if (logging_arvalid && logging_arready) begin
+                main_fifo[main_wr_ptr] <= {logging_ar_payload, ts_cnt, CH_AR};
+                main_wr_ptr <= main_wr_ptr + 1;
+            end else if (logging_awvalid && logging_awready) begin
+                main_fifo[main_wr_ptr] <= {logging_aw_payload, ts_cnt, CH_AW};
+                main_wr_ptr <= main_wr_ptr + 1;
+            end else if (logging_rvalid && logging_rready) begin
+                main_fifo[main_wr_ptr] <= {logging_r_payload, ts_cnt, CH_R};
+                main_wr_ptr <= main_wr_ptr + 1;
+            end else if (logging_bvalid && logging_bready) begin
+                main_fifo[main_wr_ptr] <= {logging_b_payload, ts_cnt, CH_B};
+                main_wr_ptr <= main_wr_ptr + 1;
             end
+            
+            // 无延迟 FWFT 出队：收到 pop 脉冲直接挪动读指针
+            if (main_pop && main_count > 0) main_rd_ptr <= main_rd_ptr + 1;
+            main_count <= main_count + main_push - (main_pop && main_count > 0);
 
-            // Push Logic
-            if (fifo_count < FIFO_DEPTH) begin
-                if (logging_arvalid && logging_arready) begin
-                    fifo_payload[fifo_wr_ptr] <= { {{(MAX_PAYLOAD_FORMATTED_WIDTH - A_PAYLOAD_FORMATTED_WIDTH){1'b0}}, logging_ar_payload}, {ts_cnt, CH_AR} };
-                    fifo_beats[fifo_wr_ptr] <= A_BEATS_HDR;
-                    fifo_chanid[fifo_wr_ptr] <= CH_AR;
-                    fifo_wr_ptr <= fifo_wr_ptr + 1;
-                    count_delta = count_delta + 1;
-                end else if (logging_awvalid && logging_awready) begin
-                    fifo_payload[fifo_wr_ptr] <= { {{(MAX_PAYLOAD_FORMATTED_WIDTH - A_PAYLOAD_FORMATTED_WIDTH){1'b0}}, logging_aw_payload}, {ts_cnt, CH_AW} };
-                    fifo_beats[fifo_wr_ptr] <= A_BEATS_HDR;
-                    fifo_chanid[fifo_wr_ptr] <= CH_AW;
-                    fifo_wr_ptr <= fifo_wr_ptr + 1;
-                    count_delta = count_delta + 1;
-                end else if (logging_wvalid && logging_wready) begin
-                    fifo_payload[fifo_wr_ptr] <= { {{(MAX_PAYLOAD_FORMATTED_WIDTH - W_PAYLOAD_FORMATTED_WIDTH){1'b0}}, logging_w_payload}, {ts_cnt, CH_W} };
-                    fifo_beats[fifo_wr_ptr] <= W_BEATS_HDR;
-                    fifo_chanid[fifo_wr_ptr] <= CH_W;
-                    fifo_wr_ptr <= fifo_wr_ptr + 1;
-                    count_delta = count_delta + 1;
-                end else if (logging_rvalid && logging_rready) begin
-                    fifo_payload[fifo_wr_ptr] <= { {{(MAX_PAYLOAD_FORMATTED_WIDTH - R_PAYLOAD_FORMATTED_WIDTH){1'b0}}, logging_r_payload}, {ts_cnt, CH_R} };
-                    fifo_beats[fifo_wr_ptr] <= R_BEATS_HDR;
-                    fifo_chanid[fifo_wr_ptr] <= CH_R;
-                    fifo_wr_ptr <= fifo_wr_ptr + 1;
-                    count_delta = count_delta + 1;
-                end else if (logging_bvalid && logging_bready) begin
-                    fifo_payload[fifo_wr_ptr] <= { {{(MAX_PAYLOAD_FORMATTED_WIDTH - B_PAYLOAD_FORMATTED_WIDTH){1'b0}}, logging_b_payload}, {ts_cnt, CH_B} };
-                    fifo_beats[fifo_wr_ptr] <= B_BEATS_HDR;
-                    fifo_chanid[fifo_wr_ptr] <= CH_B;
-                    fifo_wr_ptr <= fifo_wr_ptr + 1;
-                    count_delta = count_delta + 1;
-                end
+            // ---- [动作 B]：W FIFO 写入 (独立并行) ----
+            
+            if (w_push) begin
+                w_fifo[w_wr_ptr] <= {logging_w_payload, ts_cnt, CH_W};
+                w_wr_ptr <= w_wr_ptr + 1;
             end
-            fifo_count <= fifo_count + count_delta;
+            
+            if (w_pop && w_count > 0) w_rd_ptr <= w_rd_ptr + 1;
+            w_count <= w_count + w_push - (w_pop && w_count > 0);
         end
     end
 
-    // FIFO Head Views
-    wire [TOTAL_ENTRY_WIDTH-1:0] fifo_head_payload = fifo_payload[fifo_rd_ptr];
-    wire [7:0] fifo_head_beats = fifo_beats[fifo_rd_ptr];
-    wire [7:0] fifo_head_chanid = fifo_chanid[fifo_rd_ptr];
-
-    // ---------------------------
-    // Log-to-AXI Write Engine
-    // ---------------------------
+    // ---------------------------------------------------------
+    // Log-to-AXI Write Engine (仲裁与环形写入)
+    // ---------------------------------------------------------
     localparam integer DATA_BYTES = DATA_WIDTH/8;
-    localparam [ADDR_WIDTH-1:0] TRACE_BASE_ADDR = {ADDR_WIDTH{1'b0}} + 32'h1100_0000; 
+    localparam [ADDR_WIDTH-1:0] TRACE_BASE_ADDR  = {ADDR_WIDTH{1'b0}} + 32'h1100_0000; 
+    localparam [ADDR_WIDTH-1:0] TRACE_SIZE_BYTES = 32'h20000; // BRAM 大小 128KB
+    localparam [ADDR_WIDTH-1:0] TRACE_END_ADDR   = TRACE_BASE_ADDR + TRACE_SIZE_BYTES;
 
     reg m1_awvalid_r;
     reg [ADDR_WIDTH-1:0] m1_awaddr_r;
@@ -189,21 +169,23 @@ module axilite_trace_recorder #(
     assign m1_axi_wdata   = m1_wdata_r;
     assign m1_axi_bready  = m1_bready_r;
     
-    // [FIX 4] 添加缺失的 WSTRB 信号，始终全为 1
+    // WSTRB 修复，统一全 F 避免数据无效
     assign m1_axi_wstrb   = {(DATA_WIDTH/8){1'b1}}; 
 
-    // 状态机
-    localparam [2:0]
-        S_IDLE     = 3'd0,
-        S_POP_WAIT = 3'd1,
-        S_AW       = 3'd2,
-        S_W        = 3'd3,
-        S_WAIT_B   = 3'd4;
+    localparam [1:0]
+        S_IDLE     = 2'd0,
+        S_AW       = 2'd1,
+        S_W        = 2'd2,
+        S_WAIT_B   = 2'd3;
         
-    reg [2:0] state;
+    reg [1:0] state;
     reg [TOTAL_ENTRY_WIDTH-1:0] cur_payload;
     reg [7:0] cur_beats;
     reg [ADDR_WIDTH-1:0] next_trace_addr;
+
+    // BRAM 环形地址计算辅助逻辑
+    wire [ADDR_WIDTH-1:0] addr_plus_4 = next_trace_addr + 4;
+    wire [ADDR_WIDTH-1:0] updated_addr = (addr_plus_4 >= TRACE_END_ADDR) ? TRACE_BASE_ADDR : addr_plus_4;
 
     always @(posedge clk) begin
         if (internal_rst) begin
@@ -216,25 +198,30 @@ module axilite_trace_recorder #(
             m1_wvalid_r <= 1'b0;
             m1_wdata_r <= {DATA_WIDTH{1'b0}};
             m1_bready_r <= 1'b0;
-            pop_req <= 1'b0;
+            main_pop <= 1'b0;
+            w_pop <= 1'b0;
         end else begin
-            // 默认拉低 Pulse 信号
-            pop_req <= 1'b0;
+            // 默认拉低，形成单周期出队脉冲
+            main_pop <= 1'b0;
+            w_pop <= 1'b0;
             
             case (state)
                 S_IDLE: begin
-                    if (fifo_count > 0) begin
-                        pop_req <= 1'b1;
-                        state <= S_POP_WAIT;
-                    end
-                end
-
-                S_POP_WAIT: begin
-                    if (pop_ack) begin
-                        cur_payload <= fifo_head_payload;
-                        cur_beats   <= fifo_head_beats;
+                    // 2选1仲裁，无延迟 FWFT 抓取数据
+                    if (main_count > 0) begin
+                        main_pop <= 1'b1; 
+                        cur_payload <= main_fifo[main_rd_ptr];
+                        cur_beats   <= 8'd4; // 强制统一 16 字节定长
                         
-                        // 准备第一个地址
+                        m1_awvalid_r <= 1'b1;
+                        m1_awaddr_r  <= next_trace_addr;
+                        state <= S_AW;
+                    end 
+                    else if (w_count > 0) begin
+                        w_pop <= 1'b1;
+                        cur_payload <= w_fifo[w_rd_ptr];
+                        cur_beats   <= 8'd4; // 强制统一 16 字节定长
+                        
                         m1_awvalid_r <= 1'b1;
                         m1_awaddr_r  <= next_trace_addr;
                         state <= S_AW;
@@ -245,8 +232,6 @@ module axilite_trace_recorder #(
                     m1_awvalid_r <= 1'b1; 
                     if (m1_axi_awready) begin
                         m1_awvalid_r <= 1'b0; 
-                        
-                        // 准备数据
                         m1_wvalid_r <= 1'b1;
                         m1_wdata_r <= cur_payload[DATA_WIDTH-1:0];
                         state <= S_W;
@@ -257,7 +242,7 @@ module axilite_trace_recorder #(
                     m1_wvalid_r <= 1'b1; 
                     if (m1_axi_wready) begin
                         m1_wvalid_r <= 1'b0;
-                        m1_bready_r <= 1'b1; // Wait for B
+                        m1_bready_r <= 1'b1; 
                         state <= S_WAIT_B;
                     end
                 end
@@ -266,16 +251,15 @@ module axilite_trace_recorder #(
                     m1_bready_r <= 1'b1;
                     if (m1_axi_bvalid) begin
                         m1_bready_r <= 1'b0;
-                        
-                        // 数据移位，地址递增
                         cur_payload <= cur_payload >> DATA_WIDTH;
-                        next_trace_addr <= next_trace_addr + 4; 
+                        
+                        // 环形缓冲回绕，防止卡死或越界触发 DECERR
+                        next_trace_addr <= updated_addr;
                         
                         if (cur_beats > 1) begin
                             cur_beats <= cur_beats - 1;
-                            // 循环回 AW 发送下一个字
                             m1_awvalid_r <= 1'b1;
-                            m1_awaddr_r <= next_trace_addr + 4; 
+                            m1_awaddr_r  <= updated_addr; // 使用下一跳地址
                             state <= S_AW;
                         end else begin
                             state <= S_IDLE;
@@ -288,7 +272,9 @@ module axilite_trace_recorder #(
         end
     end
 
+    // ---------------------------
     // 子模块实例化 (保持不变)
+    // ---------------------------
     axilite_channel_logger #(
         .A_PAYLOAD_FORMANTTED_WIDTH(A_PAYLOAD_FORMATTED_WIDTH),
         .R_PAYLOAD_FORMANTTED_WIDTH(R_PAYLOAD_FORMATTED_WIDTH),
@@ -298,7 +284,7 @@ module axilite_trace_recorder #(
         .DATA_WIDTH(DATA_WIDTH)
     ) axilite_channel_logger (
         .clk(clk),
-        .rst(internal_rst), // 传入修正后的内部高电平复位
+        .rst(internal_rst), // 传入修正后的内部高有效复位
         .logging_arvalid(logging_arvalid),
         .logging_arready(logging_arready),
         .logging_ar_payload(logging_ar_payload),
