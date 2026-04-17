@@ -2,7 +2,8 @@
 
 module axilite_active_proxy #(
     parameter ADDR_WIDTH = 32,
-    parameter DATA_WIDTH = 32
+    parameter DATA_WIDTH = 32,
+    parameter AXIS_DATA_WIDTH = 512
 ) (
     input wire clk,
     input wire rst, // 物理连线接 aresetn (低电平有效)
@@ -100,7 +101,16 @@ module axilite_active_proxy #(
     output wire                  s_mbx_axi_wready,
     output reg  [1:0]            s_mbx_axi_bresp,
     output reg                   s_mbx_axi_bvalid,
-    input  wire                  s_mbx_axi_bready
+    input  wire                  s_mbx_axi_bready,
+
+    // ===================================================================
+    // 5. M_AXIS_C2H (Master): 经 C2H_1 发送通知包到 Host
+    // ===================================================================
+    output reg                   m_axis_c2h_tvalid,
+    input  wire                  m_axis_c2h_tready,
+    output reg  [AXIS_DATA_WIDTH-1:0] m_axis_c2h_tdata,
+    output reg  [AXIS_DATA_WIDTH/8-1:0] m_axis_c2h_tkeep,
+    output reg                   m_axis_c2h_tlast
 );
 
     // ===================================================================
@@ -120,8 +130,22 @@ module axilite_active_proxy #(
     reg [31:0] mbx_status;   
     reg [31:0] mbx_awaddr;   
     reg [31:0] mbx_wdata;    
-    reg [31:0] mbx_wstrb;    
-    reg        host_ack_pulse;
+    reg [31:0] mbx_wstrb;
+    reg [31:0] mbx_ack_seq;
+    reg        mbx_ack_toggle;
+
+    localparam [31:0] AXIS_NOTIFY_MAGIC = 32'h5844_504b;
+    localparam [31:0] AXIS_NOTIFY_TYPE  = 32'd1;
+    localparam [31:0] AXIS_NOTIFY_CH_AW = 32'd1;
+    localparam [31:0] AXIS_NOTIFY_LEN   = 32'd32;
+
+    reg [31:0] axis_seq;
+    reg [31:0] inflight_seq;
+    reg        pkt_pending;
+    reg [AXIS_DATA_WIDTH-1:0] pkt_data;
+    reg [AXIS_DATA_WIDTH/8-1:0] pkt_keep;
+    reg        mbx_ack_toggle_seen;
+    reg [31:0] mbx_status_next;
 
     assign s_mbx_axi_arready = !s_mbx_axi_rvalid;
     always @(posedge clk) begin
@@ -152,14 +176,15 @@ module axilite_active_proxy #(
         if (!rst) begin
             s_mbx_axi_bvalid <= 0;
             s_mbx_axi_bresp  <= 0;
-            host_ack_pulse   <= 0;
+            mbx_ack_seq <= 32'd0;
+            mbx_ack_toggle <= 1'b0;
         end else begin
-            host_ack_pulse <= 1'b0; 
             if (s_mbx_axi_awready) begin
                 s_mbx_axi_bvalid <= 1'b1;
                 s_mbx_axi_bresp  <= 2'b00;
                 if (s_mbx_axi_awaddr[11:0] == 12'h010) begin
-                    host_ack_pulse <= 1'b1;
+                    mbx_ack_seq <= s_mbx_axi_wdata;
+                    mbx_ack_toggle <= ~mbx_ack_toggle;
                 end
             end else if (s_mbx_axi_bready && s_mbx_axi_bvalid) begin
                 s_mbx_axi_bvalid <= 1'b0;
@@ -177,27 +202,63 @@ module axilite_active_proxy #(
     // ===================================================================
     // 模块 2：DUT Write 拦截通道 (接管 AW/W/B)
     // ===================================================================
-    reg  write_in_flight;
-    localparam W_IDLE = 0, W_MBX_WAIT_ACK = 1, W_PASS_WAIT_READY = 2, W_PASS_WAIT_B = 3;
-    reg [1:0] w_state;
+    localparam W_IDLE = 0,
+               W_PASS_WAIT_READY = 1,
+               W_PASS_WAIT_B = 2,
+               W_WAIT_ACK = 3;
+    reg [2:0] w_state;
 
     assign s_axi_awready = (w_state == W_IDLE) && s_axi_awvalid && s_axi_wvalid && !s_axi_bvalid;
     assign s_axi_wready  = s_axi_awready;
 
+    always @(*) begin
+        mbx_status_next = mbx_status;
+
+        if ((w_state == W_IDLE) && s_axi_awready && is_vconf_aw) begin
+            mbx_status_next = 32'h0000_0001;
+        end
+
+        if ((w_state == W_WAIT_ACK) && (mbx_ack_toggle_seen != mbx_ack_toggle)) begin
+            if (mbx_ack_seq == inflight_seq) begin
+                mbx_status_next = 32'd0;
+            end else begin
+                mbx_status_next = 32'h8000_0001;
+            end
+        end
+    end
+
     always @(posedge clk) begin
         if (!rst) begin 
             w_state <= W_IDLE;
-            write_in_flight <= 0;
             mbx_status <= 0;
             s_axi_bvalid <= 0;
             s_axi_bresp  <= 0;
             m_axi_awvalid <= 0;
             m_axi_wvalid <= 0;
             m_axi_bready <= 0;
+            m_axis_c2h_tvalid <= 1'b0;
+            m_axis_c2h_tdata  <= {AXIS_DATA_WIDTH{1'b0}};
+            m_axis_c2h_tkeep  <= {AXIS_DATA_WIDTH/8{1'b0}};
+            m_axis_c2h_tlast  <= 1'b0;
+            axis_seq          <= 32'd0;
+            inflight_seq      <= 32'd0;
+            pkt_pending       <= 1'b0;
+            pkt_data          <= {AXIS_DATA_WIDTH{1'b0}};
+            pkt_keep          <= {AXIS_DATA_WIDTH/8{1'b0}};
+            mbx_ack_toggle_seen <= 1'b0;
         end else begin
-            if (host_ack_pulse) begin
-                mbx_status <= 0;
-                write_in_flight <= 0;
+            mbx_status <= mbx_status_next;
+
+            if (m_axis_c2h_tvalid && m_axis_c2h_tready) begin
+                m_axis_c2h_tvalid <= 1'b0;
+            end
+
+            if (!m_axis_c2h_tvalid && pkt_pending) begin
+                m_axis_c2h_tvalid <= 1'b1;
+                m_axis_c2h_tkeep  <= pkt_keep;
+                m_axis_c2h_tlast  <= 1'b1;
+                m_axis_c2h_tdata  <= pkt_data;
+                pkt_pending <= 1'b0;
             end
 
             case (w_state)
@@ -206,26 +267,32 @@ module axilite_active_proxy #(
 
                     if (s_axi_awready) begin 
                         if (is_vconf_aw) begin
-                            mbx_status <= 32'd1;
                             mbx_awaddr <= {20'd0, s_axi_awaddr[11:0]};
                             mbx_wdata  <= s_axi_wdata;
                             mbx_wstrb  <= { {(32-DATA_WIDTH/8){1'b0}}, s_axi_wstrb };
-                            write_in_flight <= 1'b1;
-                            w_state <= W_MBX_WAIT_ACK; 
+
+                            inflight_seq <= axis_seq + 32'd1;
+                            axis_seq <= axis_seq + 32'd1;
+                            pkt_data <= {AXIS_DATA_WIDTH{1'b0}};
+                            pkt_data[31:0]    <= AXIS_NOTIFY_MAGIC;
+                            pkt_data[63:32]   <= AXIS_NOTIFY_TYPE;
+                            pkt_data[95:64]   <= AXIS_NOTIFY_CH_AW;
+                            pkt_data[127:96]  <= AXIS_NOTIFY_LEN;
+                            pkt_data[159:128] <= axis_seq + 32'd1;
+                            pkt_data[191:160] <= {20'd0, s_axi_awaddr[11:0]};
+                            pkt_data[223:192] <= s_axi_wdata;
+                            pkt_data[255:224] <= {{(25-DATA_WIDTH/8){1'b0}}, s_axi_awprot, s_axi_wstrb};
+                            pkt_keep <= 64'h0000_0000_FFFF_FFFF;
+                            pkt_pending <= 1'b1;
+                            // Snapshot current ACK toggle so stale historical ACKs are ignored.
+                            mbx_ack_toggle_seen <= mbx_ack_toggle;
+                            w_state <= W_WAIT_ACK;
                         end else begin
                             // 透传给物理 XDMA (如配置 Root Port 本身 0x60000000 或其他空间)
                             m_axi_awvalid <= 1; m_axi_awaddr <= s_axi_awaddr; m_axi_awprot <= s_axi_awprot;
                             m_axi_wvalid  <= 1; m_axi_wdata  <= s_axi_wdata;  m_axi_wstrb  <= s_axi_wstrb;
                             w_state <= W_PASS_WAIT_READY;
                         end
-                    end
-                end
-
-                W_MBX_WAIT_ACK: begin
-                    if (!write_in_flight) begin
-                        s_axi_bvalid <= 1'b1;
-                        s_axi_bresp  <= 2'b00; 
-                        w_state <= W_IDLE;
                     end
                 end
 
@@ -246,6 +313,17 @@ module axilite_active_proxy #(
                         w_state <= W_IDLE;
                     end
                 end
+
+                W_WAIT_ACK: begin
+                    if (mbx_ack_toggle_seen != mbx_ack_toggle) begin
+                        mbx_ack_toggle_seen <= mbx_ack_toggle;
+                        if (mbx_ack_seq == inflight_seq) begin
+                            s_axi_bvalid <= 1'b1;
+                            s_axi_bresp  <= 2'b00;
+                            w_state <= W_IDLE;
+                        end
+                    end
+                end
             endcase
         end
     end
@@ -256,7 +334,7 @@ module axilite_active_proxy #(
     reg [ADDR_WIDTH-1:0] pending_araddr;
     reg [2:0]            pending_arprot;
     
-    localparam R_IDLE = 0, R_WAIT_IN_FLIGHT = 1, R_VCONF_WAIT_READY = 2, R_VCONF_WAIT_R = 3, R_PASS_WAIT_READY = 4, R_PASS_WAIT_R = 5;
+    localparam R_IDLE = 0, R_VCONF_WAIT_READY = 1, R_VCONF_WAIT_R = 2, R_PASS_WAIT_READY = 3, R_PASS_WAIT_R = 4;
     reg [2:0] r_state;
 
     assign s_axi_arready = (r_state == R_IDLE) && !s_axi_rvalid;
@@ -280,7 +358,10 @@ module axilite_active_proxy #(
                         pending_arprot <= s_axi_arprot;
 
                         if (is_vconf_ar) begin
-                            r_state <= R_WAIT_IN_FLIGHT; 
+                            m_vconf_axi_arvalid <= 1;
+                            m_vconf_axi_araddr  <= {20'd0, s_axi_araddr[11:0]};
+                            m_vconf_axi_arprot  <= s_axi_arprot;
+                            r_state <= R_VCONF_WAIT_READY;
                         end else begin
                             // 透传给物理 XDMA
                             m_axi_arvalid <= 1'b1;
@@ -288,15 +369,6 @@ module axilite_active_proxy #(
                             m_axi_arprot  <= s_axi_arprot;
                             r_state <= R_PASS_WAIT_READY; 
                         end
-                    end
-                end
-
-                R_WAIT_IN_FLIGHT: begin
-                    if (!write_in_flight) begin
-                        m_vconf_axi_arvalid <= 1;
-                        m_vconf_axi_araddr  <= {20'd0, pending_araddr[11:0]};
-                        m_vconf_axi_arprot  <= pending_arprot;
-                        r_state <= R_VCONF_WAIT_READY;
                     end
                 end
 

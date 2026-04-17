@@ -163,10 +163,12 @@ proc create_root_design { parentCell } {
     CONFIG.pl_link_cap_max_link_speed {8.0_GT/s} \
     CONFIG.xdma_axi_intf_mm {AXI_Stream} \
     CONFIG.axilite_master_en {true} \
+      CONFIG.xdma_axilite_slave {true} \
     CONFIG.axilite_master_size {32} \
     CONFIG.axilite_master_scale {Megabytes} \
     CONFIG.pciebar2axibar_axil_master {0x10000000} \
     CONFIG.axist_bypass_en {true} \
+      CONFIG.xdma_wnum_chnl {2} \
     CONFIG.axist_bypass_size {16} \
     CONFIG.axist_bypass_scale {Gigabytes} \
     CONFIG.axi_bypass_64bit_en {true} \
@@ -557,7 +559,7 @@ proc create_root_design { parentCell } {
       [get_bd_pins axi_ic_pcie_rp_mmio/M*_ACLK] \
       [get_bd_pins axilite_active_proxy_0/clk] \
       [get_bd_pins vconf_bram_ctrl_a/s_axi_aclk] \
-      [get_bd_pins axi_ic_host_vconf/M01_ACLK]
+      [get_bd_pins axi_ic_host_vconf/M01_ACLK] 
 
 #=============================================
 # System reset connection
@@ -631,7 +633,7 @@ proc create_root_design { parentCell } {
       [get_bd_pins axi_ic_pcie_rp_mmio/M01_ARESETN] \
       [get_bd_pins axilite_active_proxy_0/rst] \
       [get_bd_pins vconf_bram_ctrl_a/s_axi_aresetn] \
-      [get_bd_pins axi_ic_host_vconf/M01_ARESETN]
+      [get_bd_pins axi_ic_host_vconf/M01_ARESETN] 
 
   # Reset signals for DDR4 MIG related AXI interfaces in MIG ui clock domain
   connect_bd_net -net mig_calib_done [get_bd_pins ddr4_mig/c0_init_calib_complete] \
@@ -777,8 +779,35 @@ proc create_root_design { parentCell } {
   connect_bd_intf_net [get_bd_intf_pins u_role/m_axis_trace] \
       [get_bd_intf_pins xdma_ep/S_AXIS_C2H_0]
 
+  # AXIS CDC bridge for proxy notify packets
+  set axis_cc_proxy_c2h1 [ create_bd_cell -type ip -vlnv xilinx.com:ip:axis_clock_converter:1.1 axis_cc_proxy_c2h1 ]
+
+  set_property -dict [list CONFIG.HAS_TKEEP.VALUE_SRC USER CONFIG.HAS_TLAST.VALUE_SRC USER CONFIG.TDATA_NUM_BYTES.VALUE_SRC PROPAGATED] [get_bd_cells axis_cc_proxy_c2h1]
+  set_property -dict [list CONFIG.HAS_TKEEP {1} CONFIG.HAS_TLAST {1}] [get_bd_cells axis_cc_proxy_c2h1]
+  
+  connect_bd_net [get_bd_pins xdma_rp/axi_aclk] [get_bd_pins axis_cc_proxy_c2h1/s_axis_aclk]
+  connect_bd_net [get_bd_pins xdma_rp/axi_aresetn] [get_bd_pins axis_cc_proxy_c2h1/s_axis_aresetn]
+  connect_bd_net [get_bd_pins xdma_ep/axi_aclk] [get_bd_pins axis_cc_proxy_c2h1/m_axis_aclk]
+  connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] [get_bd_pins axis_cc_proxy_c2h1/m_axis_aresetn]
+
+  connect_bd_intf_net [get_bd_intf_pins axilite_active_proxy_0/m_axis_c2h] [get_bd_intf_pins axis_cc_proxy_c2h1/S_AXIS]
+  connect_bd_intf_net [get_bd_intf_pins axis_cc_proxy_c2h1/M_AXIS] [get_bd_intf_pins xdma_ep/S_AXIS_C2H_1]
+
+  # Add ILA for the stream interface
+  set system_ila_2 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_2 ]
+  set_property -dict [ list \
+    CONFIG.C_NUM_MONITOR_SLOTS {1} \
+    CONFIG.C_MON_TYPE {INTERFACE} \
+    CONFIG.C_SLOT_0_INTF_TYPE {xilinx.com:interface:axis_rtl:1.0} \
+  ] $system_ila_2
+
+  connect_bd_net [get_bd_pins xdma_rp/axi_aclk] [get_bd_pins system_ila_2/clk]
+  connect_bd_net [get_bd_pins xdma_rp/axi_aresetn] [get_bd_pins system_ila_2/resetn]
+  connect_bd_intf_net [get_bd_intf_pins axilite_active_proxy_0/m_axis_c2h] [get_bd_intf_pins system_ila_2/SLOT_0_AXIS]
+
   connect_bd_net [get_bd_pins const_vcc/dout] \
       [get_bd_pins xdma_ep/m_axis_h2c_tready_0] \
+        [get_bd_pins xdma_ep/m_axis_h2c_tready_1] \
       [get_bd_pins pcie_rp_role_sync_reset/dcm_locked] \
       [get_bd_pins ddr4_mig_sync_reset/dcm_locked]
 
