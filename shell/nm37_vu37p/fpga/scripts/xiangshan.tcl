@@ -768,11 +768,20 @@ proc create_root_design { parentCell } {
   connect_bd_net [get_bd_pins xdma_rp/axi_aresetn] [get_bd_pins system_ila_2/resetn]
   connect_bd_intf_net [get_bd_intf_pins axilite_active_proxy_0/m_axis_c2h] [get_bd_intf_pins system_ila_2/SLOT_0_AXIS]
 
-  connect_bd_net [get_bd_pins const_vcc/dout] \
-      [get_bd_pins xdma_ep/m_axis_h2c_tready_0] \
-        [get_bd_pins xdma_ep/m_axis_h2c_tready_1] \
-      [get_bd_pins pcie_rp_role_sync_reset/dcm_locked] \
-      [get_bd_pins ddr4_mig_sync_reset/dcm_locked]
+  set const_vcc_sinks [list]
+  foreach pin_name {
+      xdma_ep/m_axis_h2c_tready_0
+      xdma_ep/m_axis_h2c_tready_1
+      pcie_rp_role_sync_reset/dcm_locked
+  } {
+      set pin [get_bd_pins -quiet $pin_name]
+      if {$pin ne ""} {
+          lappend const_vcc_sinks $pin
+      }
+  }
+  if {[llength $const_vcc_sinks] > 0} {
+      connect_bd_net [get_bd_pins const_vcc/dout] {*}$const_vcc_sinks
+  }
 
 #==============================================
 # GT Port connection
@@ -892,6 +901,19 @@ proc create_root_design { parentCell } {
   connect_bd_net [get_bd_pins xdma_rp/axi_aclk] [get_bd_pins system_ila_3/clk]
   connect_bd_net [get_bd_pins xdma_rp/axi_ctl_aresetn] [get_bd_pins system_ila_3/resetn]
   connect_bd_intf_net [get_bd_intf_pins system_ila_3/SLOT_0_AXI] [get_bd_intf_pins axi_ic_host_vconf/M01_AXI]
+
+  # [新增] 抓取 FPGA XDMA EP bypass BAR 到 DDR 的 AXI-MM P2P 访问。
+  # 这条路径用于确认真实 NVMe 是否真的向 0x20b8... BAR 地址发起了 P2P DMA。
+  set system_ila_4 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_4 ]
+  set_property -dict [ list \
+    CONFIG.C_NUM_MONITOR_SLOTS {1} \
+    CONFIG.C_BRAM_CNT {128} \
+    CONFIG.C_DATA_DEPTH {4096}
+   ] $system_ila_4
+
+  connect_bd_net [get_bd_pins xdma_ep/axi_aclk] [get_bd_pins system_ila_4/clk]
+  connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] [get_bd_pins system_ila_4/resetn]
+  connect_bd_intf_net [get_bd_intf_pins system_ila_4/SLOT_0_AXI] [get_bd_intf_pins xdma_ep/M_AXI_BYPASS]
 
 
 #=============================================
