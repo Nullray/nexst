@@ -258,6 +258,7 @@ module axilite_active_proxy #(
     localparam [31:0] AXIS_NOTIFY_TYPE_CFG_WR  = 32'd1;
     localparam [31:0] AXIS_NOTIFY_TYPE_BAR_WR  = 32'd2;
     localparam [31:0] AXIS_NOTIFY_TYPE_BAR_RD  = 32'd3;
+    localparam [31:0] AXIS_NOTIFY_TYPE_BAR_WR_DONE = 32'd4;
     localparam [31:0] AXIS_NOTIFY_LEN          = 32'd32;
     localparam [31:0] AXIS_NOTIFY_CH_AW        = 32'd1;
     localparam [1:0]  AXI_RESP_OKAY            = 2'b00;
@@ -285,7 +286,6 @@ module axilite_active_proxy #(
     localparam [11:0] MBX_REG_RP_INTX_CTRL     = 12'h050;
     localparam [11:0] MBX_REG_RP_INTX_STATUS   = 12'h054;
     localparam [11:0] MBX_REG_RP_INTX_COUNT    = 12'h058;
-
     localparam [11:0] RP_REG_IDR               = 12'h138;
     localparam [11:0] RP_REG_IMR               = 12'h13C;
     localparam [11:0] RP_REG_IDRN              = 12'h160;
@@ -313,16 +313,20 @@ module axilite_active_proxy #(
     reg [31:0] stat_bar_rd_hit;
     reg [31:0] stat_bar_err;
     reg [31:0] rp_intx_ctrl;
-    reg [31:0] rp_intr_mask;
-    reg [31:0] rp_idrn_mask;
+    reg        rp_intr_mask_intx;
+    reg        rp_idrn_mask_intx;
     reg [31:0] rp_intx_count;
-
     reg [31:0] cfg_seq_counter;
     reg [31:0] cfg_inflight_seq;
 
     reg [31:0] bar_seq_counter;
     reg [31:0] bar_wr_inflight_seq;
+    reg [31:0] bar_wr_inflight_offset;
     reg        bar_wr_resp_toggle_seen;
+    reg        bar_wr_proxy_bvalid;
+    reg        bar_wr_done_valid;
+    reg [31:0] bar_wr_done_seq;
+    reg [31:0] bar_wr_done_offset;
     reg [31:0] bar_rd_inflight_seq;
     reg        bar_rd_resp_toggle_seen;
     reg [BAR_QWORD_INDEX_BITS-1:0] bar_read_qword_idx;
@@ -365,7 +369,7 @@ module axilite_active_proxy #(
                            (s_axi_araddr[11:0] == RP_REG_IDRN) ||
                            (s_axi_araddr[11:0] == RP_REG_IDRN_MASK));
     wire rp_intx_level = rp_intx_ctrl[0];
-    wire rp_intx_irq = rp_intx_level && rp_intr_mask[16] && rp_idrn_mask[16];
+    wire rp_intx_irq = rp_intx_level && rp_intr_mask_intx && rp_idrn_mask_intx;
 
     wire [31:0] bar_aw_size_bytes = size_bytes_from_axsize(s_bar_axi_awsize);
     wire [31:0] bar_ar_size_bytes = size_bytes_from_axsize(s_bar_axi_arsize);
@@ -396,6 +400,10 @@ module axilite_active_proxy #(
     wire [7:0]  bar_aw_req_wstrb = bar_extract_wstrb8(s_bar_axi_wstrb, bar_aw_qword_idx);
     wire        packet_engine_ready = !m_axis_c2h_tvalid;
     wire [31:0] rp_intx_ctrl_next = apply_wstrb32(rp_intx_ctrl, s_mbx_axi_wdata, s_mbx_axi_wstrb);
+    wire [31:0] rp_intr_mask_next = apply_wstrb32(rp_intr_mask_intx ? RP_INTX_BIT : 32'd0,
+                                                  s_axi_wdata, s_axi_wstrb);
+    wire [31:0] rp_idrn_mask_next = apply_wstrb32(rp_idrn_mask_intx ? RP_INTX_BIT : 32'd0,
+                                                  s_axi_wdata, s_axi_wstrb);
     wire        cfg_pkt_candidate = (w_state == W_IDLE) &&
                                     s_axi_awvalid &&
                                     s_axi_wvalid &&
@@ -406,12 +414,16 @@ module axilite_active_proxy #(
     wire        bar_write_base_grant = (bar_w_state == BW_IDLE) &&
                                        (bar_r_state == BR_IDLE) &&
                                        !s_bar_axi_bvalid &&
+                                       !bar_wr_done_valid &&
                                        s_bar_axi_awvalid &&
                                        s_bar_axi_wvalid;
     wire        bar_write_supported = (s_bar_axi_awlen == 8'd0) &&
                                       (bar_aw_size_bytes != 32'd0) &&
                                       s_bar_axi_wlast;
     wire [31:0] bar_next_seq = bar_seq_counter + 32'd1;
+    wire        bar_wr_done_pkt_issue = bar_wr_done_valid &&
+                                        packet_engine_ready &&
+                                        !cfg_pkt_candidate;
     wire        bar_wr_pkt_issue = bar_write_base_grant &&
                                    bar_aw_hit &&
                                    bar_write_supported &&
@@ -425,6 +437,7 @@ module axilite_active_proxy #(
     wire        bar_read_base_grant = (bar_r_state == BR_IDLE) &&
                                       (bar_w_state == BW_IDLE) &&
                                       !s_bar_axi_rvalid &&
+                                      !bar_wr_done_valid &&
                                       !bar_write_pending_same_cycle &&
                                       s_bar_axi_arvalid;
     wire        bar_read_supported = (s_bar_axi_arlen == 8'd0) &&
@@ -439,7 +452,42 @@ module axilite_active_proxy #(
                                      bar_ar_hit &&
                                      !bar_read_supported;
 
+    wire        stat_bar_wr_err_unsupported = bar_wr_error_grant;
+    wire        stat_bar_wr_hit_event = (bar_w_state == BW_WAIT_RESP) &&
+                                        (bar_wr_resp_toggle_seen != bar_resp_ctrl[2]) &&
+                                        (bar_resp_seq == bar_wr_inflight_seq);
+    wire        stat_bar_wr_err_resp = (bar_w_state == BW_WAIT_RESP) &&
+                                       (bar_wr_resp_toggle_seen != bar_resp_ctrl[2]) &&
+                                       (bar_resp_seq != bar_wr_inflight_seq);
+    wire        stat_bar_rd_err_unsupported = bar_rd_error_grant;
+    wire        stat_bar_rd_hit_event = (bar_r_state == BR_WAIT_RESP) &&
+                                        (bar_rd_resp_toggle_seen != bar_resp_ctrl[2]) &&
+                                        (bar_resp_seq == bar_rd_inflight_seq);
+    wire        stat_bar_rd_err_resp = (bar_r_state == BR_WAIT_RESP) &&
+                                       (bar_rd_resp_toggle_seen != bar_resp_ctrl[2]) &&
+                                       (bar_resp_seq != bar_rd_inflight_seq);
+
     assign interrupt_out = rst && rp_intx_irq;
+
+    always @(posedge clk) begin
+        if (!rst) begin
+            stat_bar_wr_hit <= 32'd0;
+            stat_bar_rd_hit <= 32'd0;
+            stat_bar_err    <= 32'd0;
+        end else begin
+            if (stat_bar_wr_hit_event) begin
+                stat_bar_wr_hit <= stat_bar_wr_hit + 32'd1;
+            end
+            if (stat_bar_rd_hit_event) begin
+                stat_bar_rd_hit <= stat_bar_rd_hit + 32'd1;
+            end
+            stat_bar_err <= stat_bar_err +
+                            {31'd0, stat_bar_wr_err_unsupported} +
+                            {31'd0, stat_bar_wr_err_resp} +
+                            {31'd0, stat_bar_rd_err_unsupported} +
+                            {31'd0, stat_bar_rd_err_resp};
+        end
+    end
 
     assign s_mbx_axi_arready = !s_mbx_axi_rvalid;
     assign s_mbx_axi_awready = !s_mbx_axi_bvalid && s_mbx_axi_awvalid && s_mbx_axi_wvalid;
@@ -497,12 +545,7 @@ module axilite_active_proxy #(
             bar_resp_data_hi <= 32'd0;
             bar_resp_seq     <= 32'd0;
             bar_resp_ctrl    <= 32'd0;
-            stat_bar_wr_hit  <= 32'd0;
-            stat_bar_rd_hit  <= 32'd0;
-            stat_bar_err     <= 32'd0;
             rp_intx_ctrl     <= 32'd0;
-            rp_intr_mask     <= 32'd0;
-            rp_idrn_mask     <= 32'd0;
             rp_intx_count    <= 32'd0;
         end else begin
             if (s_mbx_axi_awready) begin
@@ -565,6 +608,19 @@ module axilite_active_proxy #(
                     m_axis_c2h_tdata[223:192] <= s_axi_wdata;
                     m_axis_c2h_tdata[255:224] <= {{(25-DATA_WIDTH/8){1'b0}}, s_axi_awprot, s_axi_wstrb};
                     cfg_seq_counter           <= cfg_next_seq;
+                end else if (bar_wr_done_pkt_issue) begin
+                    m_axis_c2h_tvalid <= 1'b1;
+                    m_axis_c2h_tkeep  <= AXIS_PKT_KEEP;
+                    m_axis_c2h_tlast  <= 1'b1;
+                    m_axis_c2h_tdata  <= {AXIS_DATA_WIDTH{1'b0}};
+                    m_axis_c2h_tdata[31:0]    <= AXIS_NOTIFY_MAGIC;
+                    m_axis_c2h_tdata[63:32]   <= AXIS_NOTIFY_TYPE_BAR_WR_DONE;
+                    m_axis_c2h_tdata[95:64]   <= 32'd0;
+                    m_axis_c2h_tdata[127:96]  <= AXIS_NOTIFY_LEN;
+                    m_axis_c2h_tdata[159:128] <= bar_wr_done_seq;
+                    m_axis_c2h_tdata[191:160] <= bar_wr_done_offset;
+                    m_axis_c2h_tdata[223:192] <= 32'd0;
+                    m_axis_c2h_tdata[255:224] <= 32'd0;
                 end else if (bar_wr_pkt_issue) begin
                     m_axis_c2h_tvalid <= 1'b1;
                     m_axis_c2h_tkeep  <= AXIS_PKT_KEEP;
@@ -610,6 +666,8 @@ module axilite_active_proxy #(
             w_state              <= W_IDLE;
             mbx_status           <= 32'd0;
             cfg_inflight_seq     <= 32'd0;
+            rp_intr_mask_intx    <= 1'b0;
+            rp_idrn_mask_intx    <= 1'b0;
             mbx_ack_toggle_seen  <= 1'b0;
             s_axi_bvalid         <= 1'b0;
             s_axi_bresp          <= AXI_RESP_OKAY;
@@ -642,14 +700,10 @@ module axilite_active_proxy #(
                         end else if (is_rp_local_aw) begin
                             case (s_axi_awaddr[11:0])
                                 RP_REG_IMR: begin
-                                    rp_intr_mask <= apply_wstrb32(rp_intr_mask,
-                                                                   s_axi_wdata,
-                                                                   s_axi_wstrb);
+                                    rp_intr_mask_intx <= rp_intr_mask_next[16];
                                 end
                                 RP_REG_IDRN_MASK: begin
-                                    rp_idrn_mask <= apply_wstrb32(rp_idrn_mask,
-                                                                   s_axi_wdata,
-                                                                   s_axi_wstrb);
+                                    rp_idrn_mask_intx <= rp_idrn_mask_next[16];
                                 end
                                 default: begin
                                 end
@@ -741,9 +795,9 @@ module axilite_active_proxy #(
                             s_axi_rresp  <= AXI_RESP_OKAY;
                             case (s_axi_araddr[11:0])
                                 RP_REG_IDR:       s_axi_rdata <= rp_intx_level ? RP_INTX_BIT : 32'd0;
-                                RP_REG_IMR:       s_axi_rdata <= rp_intr_mask;
+                                RP_REG_IMR:       s_axi_rdata <= rp_intr_mask_intx ? RP_INTX_BIT : 32'd0;
                                 RP_REG_IDRN:      s_axi_rdata <= rp_intx_level ? RP_INTX_BIT : 32'd0;
-                                RP_REG_IDRN_MASK: s_axi_rdata <= rp_idrn_mask;
+                                RP_REG_IDRN_MASK: s_axi_rdata <= rp_idrn_mask_intx ? RP_INTX_BIT : 32'd0;
                                 default:          s_axi_rdata <= 32'd0;
                             endcase
                         end else begin
@@ -803,7 +857,12 @@ module axilite_active_proxy #(
             s_bar_axi_bvalid        <= 1'b0;
             s_bar_axi_bresp         <= AXI_RESP_OKAY;
             bar_wr_inflight_seq     <= 32'd0;
+            bar_wr_inflight_offset  <= 32'd0;
             bar_wr_resp_toggle_seen <= 1'b0;
+            bar_wr_proxy_bvalid     <= 1'b0;
+            bar_wr_done_valid       <= 1'b0;
+            bar_wr_done_seq         <= 32'd0;
+            bar_wr_done_offset      <= 32'd0;
             m_bar_axi_awvalid       <= 1'b0;
             m_bar_axi_awaddr        <= {BAR_ADDR_WIDTH{1'b0}};
             m_bar_axi_awburst       <= 2'd0;
@@ -819,8 +878,18 @@ module axilite_active_proxy #(
             m_bar_axi_wstrb         <= {BAR_DATA_WIDTH/8{1'b0}};
             m_bar_axi_bready        <= 1'b0;
         end else begin
+            if (bar_wr_done_pkt_issue) begin
+                bar_wr_done_valid <= 1'b0;
+            end
+
             if (s_bar_axi_bready && s_bar_axi_bvalid) begin
                 s_bar_axi_bvalid <= 1'b0;
+                if (bar_wr_proxy_bvalid) begin
+                    bar_wr_done_valid  <= 1'b1;
+                    bar_wr_done_seq    <= bar_wr_inflight_seq;
+                    bar_wr_done_offset <= bar_wr_inflight_offset;
+                    bar_wr_proxy_bvalid <= 1'b0;
+                end
             end
 
             case (bar_w_state)
@@ -828,11 +897,12 @@ module axilite_active_proxy #(
                     if (s_bar_axi_awready && s_bar_axi_awvalid && s_bar_axi_wvalid) begin
                         if (bar_aw_hit) begin
                             if (!bar_write_supported) begin
-                                stat_bar_err    <= stat_bar_err + 32'd1;
                                 s_bar_axi_bvalid <= 1'b1;
                                 s_bar_axi_bresp  <= AXI_RESP_SLVERR;
+                                bar_wr_proxy_bvalid <= 1'b0;
                             end else begin
                                 bar_wr_inflight_seq     <= bar_next_seq;
+                                bar_wr_inflight_offset  <= bar_aw_offset;
                                 bar_wr_resp_toggle_seen <= bar_resp_ctrl[2];
                                 bar_w_state             <= BW_WAIT_RESP;
                             end
@@ -873,6 +943,7 @@ module axilite_active_proxy #(
                         m_bar_axi_bready <= 1'b0;
                         s_bar_axi_bvalid <= 1'b1;
                         s_bar_axi_bresp  <= m_bar_axi_bresp;
+                        bar_wr_proxy_bvalid <= 1'b0;
                         bar_w_state      <= BW_IDLE;
                     end
                 end
@@ -881,14 +952,14 @@ module axilite_active_proxy #(
                     if (bar_wr_resp_toggle_seen != bar_resp_ctrl[2]) begin
                         bar_wr_resp_toggle_seen <= bar_resp_ctrl[2];
                         if (bar_resp_seq == bar_wr_inflight_seq) begin
-                            stat_bar_wr_hit  <= stat_bar_wr_hit + 32'd1;
                             s_bar_axi_bresp  <= bar_resp_ctrl[1:0];
+                            bar_wr_proxy_bvalid <= bar_resp_ctrl[3];
                         end else begin
-                            stat_bar_err     <= stat_bar_err + 32'd1;
                             s_bar_axi_bresp  <= AXI_RESP_SLVERR;
+                            bar_wr_proxy_bvalid <= 1'b0;
                         end
-                        s_bar_axi_bvalid <= 1'b1;
-                        bar_w_state <= BW_IDLE;
+                        s_bar_axi_bvalid    <= 1'b1;
+                        bar_w_state         <= BW_IDLE;
                     end
                 end
             endcase
@@ -927,7 +998,6 @@ module axilite_active_proxy #(
                     if (s_bar_axi_arready && s_bar_axi_arvalid) begin
                         if (bar_ar_hit) begin
                             if (!bar_read_supported) begin
-                                stat_bar_err    <= stat_bar_err + 32'd1;
                                 s_bar_axi_rvalid <= 1'b1;
                                 s_bar_axi_rdata  <= {BAR_DATA_WIDTH{1'b0}};
                                 s_bar_axi_rresp  <= AXI_RESP_SLVERR;
@@ -976,12 +1046,10 @@ module axilite_active_proxy #(
                     if (bar_rd_resp_toggle_seen != bar_resp_ctrl[2]) begin
                         bar_rd_resp_toggle_seen <= bar_resp_ctrl[2];
                         if (bar_resp_seq == bar_rd_inflight_seq) begin
-                            stat_bar_rd_hit  <= stat_bar_rd_hit + 32'd1;
                             s_bar_axi_rdata  <= bar_scatter_qword64({bar_resp_data_hi, bar_resp_data_lo},
                                                                      bar_read_qword_idx);
                             s_bar_axi_rresp  <= bar_resp_ctrl[1:0];
                         end else begin
-                            stat_bar_err     <= stat_bar_err + 32'd1;
                             s_bar_axi_rdata  <= {BAR_DATA_WIDTH{1'b0}};
                             s_bar_axi_rresp  <= AXI_RESP_SLVERR;
                         end

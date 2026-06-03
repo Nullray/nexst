@@ -233,7 +233,7 @@ proc create_root_design { parentCell } {
 
   # [修改] 移除旧的 trace_bram AXI IC，新增供 QEMU 宿主机访问 VCONF 的 AXI IC
   set axi_ic_host_vconf [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_ic_host_vconf ]
-  set_property -dict [ list CONFIG.NUM_MI {2} \
+  set_property -dict [ list CONFIG.NUM_MI {3} \
                 CONFIG.NUM_SI {1} \
   ] $axi_ic_host_vconf
 
@@ -525,6 +525,7 @@ proc create_root_design { parentCell } {
       [get_bd_pins axi_ic_host_vconf/ACLK] \
       [get_bd_pins axi_ic_host_vconf/S00_ACLK] \
       [get_bd_pins axi_ic_host_vconf/M00_ACLK] \
+      [get_bd_pins axi_ic_host_vconf/M02_ACLK] \
       [get_bd_pins vconf_bram_ctrl_b/s_axi_aclk] \
       [get_bd_pins axi_ic_role_io/*ACLK] \
       [get_bd_pins axi_ic_role_io_reg_slice_S00/aclk] \
@@ -583,6 +584,7 @@ proc create_root_design { parentCell } {
       [get_bd_pins axi_ic_host_vconf/ARESETN] \
       [get_bd_pins axi_ic_host_vconf/S00_ARESETN] \
       [get_bd_pins axi_ic_host_vconf/M00_ARESETN] \
+      [get_bd_pins axi_ic_host_vconf/M02_ARESETN] \
       [get_bd_pins vconf_bram_ctrl_b/s_axi_aresetn] \
       [get_bd_pins axi_ic_role_io/ARESETN] \
       [get_bd_pins axi_ic_role_io/S00_ARESETN] \
@@ -643,10 +645,24 @@ proc create_root_design { parentCell } {
   connect_bd_intf_net [get_bd_intf_pins xdma_ep/M_AXI_BYPASS] \
         [get_bd_intf_pins axi_ic_ddr_mem/S00_AXI]
 
-  # Role to DDR4
+  # Role to DDR4.  The SQE write-done monitor is a transparent AXI
+  # pass-through inserted at the DDR-side register-slice output, so the
+  # original path remains intact while the monitor observes real AW/B handshakes.
+  set block_name sqe_write_done_monitor
+  set block_cell_name sqe_write_done_monitor_0
+  if { [catch {set u_sqe_write_done_monitor [create_bd_cell -type module -reference $block_name $block_cell_name] } errmsg] } {
+     catch {common::send_msg_id "BD_TCL-105" "ERROR" "Unable to add referenced block <$block_name>. Please add the files for ${block_name}'s definition into the project."}
+     return 1
+  } elseif { $u_sqe_write_done_monitor eq "" } {
+     catch {common::send_msg_id "BD_TCL-106" "ERROR" "Unable to referenced block <$block_name>. Please add the files for ${block_name}'s definition into the project."}
+     return 1
+  }
+
   connect_bd_intf_net [get_bd_intf_pins u_role/m_axi_mem] \
         [get_bd_intf_pins axi_ic_ddr_mem_reg_slice_S01/S_AXI]
   connect_bd_intf_net [get_bd_intf_pins axi_ic_ddr_mem_reg_slice_S01/M_AXI] \
+        [get_bd_intf_pins sqe_write_done_monitor_0/s_mon_axi]
+  connect_bd_intf_net [get_bd_intf_pins sqe_write_done_monitor_0/m_mon_axi] \
         [get_bd_intf_pins axi_ic_ddr_mem/S01_AXI]
 
   # AXI-IC of PCIe EP AXI Lite
@@ -747,26 +763,74 @@ proc create_root_design { parentCell } {
 
   set_property -dict [list CONFIG.HAS_TKEEP.VALUE_SRC USER CONFIG.HAS_TLAST.VALUE_SRC USER CONFIG.TDATA_NUM_BYTES.VALUE_SRC PROPAGATED] [get_bd_cells axis_cc_proxy_c2h1]
   set_property -dict [list CONFIG.HAS_TKEEP {1} CONFIG.HAS_TLAST {1}] [get_bd_cells axis_cc_proxy_c2h1]
+
+  # Short register slices around the proxy/SQE C2H merge reduce timing pressure
+  # from the active proxy packet engine, monitor packet engine, and final XDMA sink.
+  set axis_rs_active_proxy_c2h [ create_bd_cell -type ip -vlnv xilinx.com:ip:axis_register_slice:1.1 axis_rs_active_proxy_c2h ]
+  set_property -dict [list CONFIG.HAS_TKEEP.VALUE_SRC USER CONFIG.HAS_TLAST.VALUE_SRC USER CONFIG.TDATA_NUM_BYTES.VALUE_SRC USER] [get_bd_cells axis_rs_active_proxy_c2h]
+  set_property -dict [list CONFIG.HAS_TKEEP {1} CONFIG.HAS_TLAST {1} CONFIG.TDATA_NUM_BYTES {64}] [get_bd_cells axis_rs_active_proxy_c2h]
+
+  set axis_rs_sqe_done_c2h [ create_bd_cell -type ip -vlnv xilinx.com:ip:axis_register_slice:1.1 axis_rs_sqe_done_c2h ]
+  set_property -dict [list CONFIG.HAS_TKEEP.VALUE_SRC USER CONFIG.HAS_TLAST.VALUE_SRC USER CONFIG.TDATA_NUM_BYTES.VALUE_SRC USER] [get_bd_cells axis_rs_sqe_done_c2h]
+  set_property -dict [list CONFIG.HAS_TKEEP {1} CONFIG.HAS_TLAST {1} CONFIG.TDATA_NUM_BYTES {64}] [get_bd_cells axis_rs_sqe_done_c2h]
+
+  set axis_rs_proxy_c2h_out [ create_bd_cell -type ip -vlnv xilinx.com:ip:axis_register_slice:1.1 axis_rs_proxy_c2h_out ]
+  set_property -dict [list CONFIG.HAS_TKEEP.VALUE_SRC USER CONFIG.HAS_TLAST.VALUE_SRC USER CONFIG.TDATA_NUM_BYTES.VALUE_SRC USER] [get_bd_cells axis_rs_proxy_c2h_out]
+  set_property -dict [list CONFIG.HAS_TKEEP {1} CONFIG.HAS_TLAST {1} CONFIG.TDATA_NUM_BYTES {64}] [get_bd_cells axis_rs_proxy_c2h_out]
+
+  # Merge active-proxy packets with SQE write-complete packets before XDMA C2H_1.
+  set axis_ic_proxy_c2h1 [ create_bd_cell -type ip -vlnv xilinx.com:ip:axis_interconnect:2.1 axis_ic_proxy_c2h1 ]
+  set_property -dict [ list CONFIG.NUM_SI {2} \
+        CONFIG.NUM_MI {1} \
+        CONFIG.ENABLE_ADVANCED_OPTIONS {1} \
+        CONFIG.XBAR_TDATA_NUM_BYTES.VALUE_SRC {USER} \
+        CONFIG.XBAR_TDATA_NUM_BYTES {64} \
+        CONFIG.ARB_ON_TLAST {1} \
+        CONFIG.ARB_ON_MAX_XFERS {0} \
+        CONFIG.S00_FIFO_MODE {1} \
+        CONFIG.S00_FIFO_DEPTH {64} \
+        CONFIG.S01_FIFO_MODE {1} \
+        CONFIG.S01_FIFO_DEPTH {64} \
+        CONFIG.M00_FIFO_MODE {1} \
+        CONFIG.M00_FIFO_DEPTH {64} ] $axis_ic_proxy_c2h1
+
+  # [新增] QEMU 直接配置 SQE write-done monitor，配置口和 DDR monitor
+  # 位于同一个 xdma_ep/axi_aclk 时钟域，避免 queue-window CDC。
+  connect_bd_intf_net [get_bd_intf_pins axi_ic_host_vconf/M02_AXI] \
+        [get_bd_intf_pins sqe_write_done_monitor_0/s_cfg_axi]
   
-  connect_bd_net [get_bd_pins xdma_rp/axi_aclk] [get_bd_pins axis_cc_proxy_c2h1/s_axis_aclk]
-  connect_bd_net [get_bd_pins xdma_rp/axi_aresetn] [get_bd_pins axis_cc_proxy_c2h1/s_axis_aresetn]
+  connect_bd_net [get_bd_pins xdma_rp/axi_aclk] \
+      [get_bd_pins axis_rs_active_proxy_c2h/aclk] \
+      [get_bd_pins axis_cc_proxy_c2h1/s_axis_aclk]
+  connect_bd_net [get_bd_pins xdma_rp/axi_aresetn] \
+      [get_bd_pins axis_rs_active_proxy_c2h/aresetn] \
+      [get_bd_pins axis_cc_proxy_c2h1/s_axis_aresetn]
   connect_bd_net [get_bd_pins xdma_ep/axi_aclk] [get_bd_pins axis_cc_proxy_c2h1/m_axis_aclk]
   connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] [get_bd_pins axis_cc_proxy_c2h1/m_axis_aresetn]
+  connect_bd_net [get_bd_pins xdma_ep/axi_aclk] \
+      [get_bd_pins axis_ic_proxy_c2h1/ACLK] \
+      [get_bd_pins axis_ic_proxy_c2h1/S00_AXIS_ACLK] \
+      [get_bd_pins axis_ic_proxy_c2h1/S01_AXIS_ACLK] \
+      [get_bd_pins axis_ic_proxy_c2h1/M00_AXIS_ACLK] \
+      [get_bd_pins axis_rs_sqe_done_c2h/aclk] \
+      [get_bd_pins axis_rs_proxy_c2h_out/aclk] \
+      [get_bd_pins sqe_write_done_monitor_0/clk]
+  connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] \
+      [get_bd_pins axis_ic_proxy_c2h1/ARESETN] \
+      [get_bd_pins axis_ic_proxy_c2h1/S00_AXIS_ARESETN] \
+      [get_bd_pins axis_ic_proxy_c2h1/S01_AXIS_ARESETN] \
+      [get_bd_pins axis_ic_proxy_c2h1/M00_AXIS_ARESETN] \
+      [get_bd_pins axis_rs_sqe_done_c2h/aresetn] \
+      [get_bd_pins axis_rs_proxy_c2h_out/aresetn] \
+      [get_bd_pins sqe_write_done_monitor_0/rstn]
 
-  connect_bd_intf_net [get_bd_intf_pins axilite_active_proxy_0/m_axis_c2h] [get_bd_intf_pins axis_cc_proxy_c2h1/S_AXIS]
-  connect_bd_intf_net [get_bd_intf_pins axis_cc_proxy_c2h1/M_AXIS] [get_bd_intf_pins xdma_ep/S_AXIS_C2H_1]
-
-  # Add ILA for the stream interface
-  set system_ila_2 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_2 ]
-  set_property -dict [ list \
-    CONFIG.C_NUM_MONITOR_SLOTS {1} \
-    CONFIG.C_MON_TYPE {INTERFACE} \
-    CONFIG.C_SLOT_0_INTF_TYPE {xilinx.com:interface:axis_rtl:1.0} \
-  ] $system_ila_2
-
-  connect_bd_net [get_bd_pins xdma_rp/axi_aclk] [get_bd_pins system_ila_2/clk]
-  connect_bd_net [get_bd_pins xdma_rp/axi_aresetn] [get_bd_pins system_ila_2/resetn]
-  connect_bd_intf_net [get_bd_intf_pins axilite_active_proxy_0/m_axis_c2h] [get_bd_intf_pins system_ila_2/SLOT_0_AXIS]
+  connect_bd_intf_net [get_bd_intf_pins axilite_active_proxy_0/m_axis_c2h] [get_bd_intf_pins axis_rs_active_proxy_c2h/S_AXIS]
+  connect_bd_intf_net [get_bd_intf_pins axis_rs_active_proxy_c2h/M_AXIS] [get_bd_intf_pins axis_cc_proxy_c2h1/S_AXIS]
+  connect_bd_intf_net [get_bd_intf_pins axis_cc_proxy_c2h1/M_AXIS] [get_bd_intf_pins axis_ic_proxy_c2h1/S00_AXIS]
+  connect_bd_intf_net [get_bd_intf_pins sqe_write_done_monitor_0/m_axis_c2h] [get_bd_intf_pins axis_rs_sqe_done_c2h/S_AXIS]
+  connect_bd_intf_net [get_bd_intf_pins axis_rs_sqe_done_c2h/M_AXIS] [get_bd_intf_pins axis_ic_proxy_c2h1/S01_AXIS]
+  connect_bd_intf_net [get_bd_intf_pins axis_ic_proxy_c2h1/M00_AXIS] [get_bd_intf_pins axis_rs_proxy_c2h_out/S_AXIS]
+  connect_bd_intf_net [get_bd_intf_pins axis_rs_proxy_c2h_out/M_AXIS] [get_bd_intf_pins xdma_ep/S_AXIS_C2H_1]
 
   set const_vcc_sinks [list]
   foreach pin_name {
@@ -859,61 +923,39 @@ proc create_root_design { parentCell } {
 # ILA
 #=============================================
 
-  set system_ila_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_0 ]
-  set_property -dict [ list \
-    CONFIG.C_NUM_MONITOR_SLOTS {4} \
-    CONFIG.C_BRAM_CNT {192} \
-    CONFIG.C_DATA_DEPTH {8192}
-   ] $system_ila_0
-
-  connect_bd_net [get_bd_pins xdma_rp/axi_aclk] [get_bd_pins system_ila_0/clk]
-  connect_bd_net [get_bd_pins xdma_rp/axi_aresetn] [get_bd_pins system_ila_0/resetn]
-  connect_bd_intf_net [get_bd_intf_pins system_ila_0/SLOT_0_AXI] [get_bd_intf_pins xdma_rp/S_AXI_LITE]
-  # [新增] 抓取 proxy 收到的原始 BAR 请求
-  connect_bd_intf_net [get_bd_intf_pins system_ila_0/SLOT_1_AXI] [get_bd_intf_pins axilite_active_proxy_0/s_bar_axi]
-  # [修改] 抓取 proxy 透传到 XDMA RP S_AXI_B 的 BAR 请求
-  connect_bd_intf_net [get_bd_intf_pins system_ila_0/SLOT_2_AXI] [get_bd_intf_pins axilite_active_proxy_0/m_bar_axi]
-  # [保留] 抓取发往虚拟配置空间 BRAM 的流量
-  connect_bd_intf_net [get_bd_intf_pins system_ila_0/SLOT_3_AXI] [get_bd_intf_pins axilite_active_proxy_0/m_vconf_axi]
-  
-  set system_ila_1 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_1 ]
-  set_property -dict [ list \
-    CONFIG.C_NUM_MONITOR_SLOTS {2} \
-    CONFIG.C_BRAM_CNT {24} \
-    CONFIG.C_DATA_DEPTH {4096}
-   ] $system_ila_1
-
-  connect_bd_net [get_bd_pins xdma_ep/axi_aclk] [get_bd_pins system_ila_1/clk]
-  connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] [get_bd_pins system_ila_1/resetn]
-  # [保留] 抓取 Host 发起的总 AXI-Lite 访问入口
-  connect_bd_intf_net [get_bd_intf_pins system_ila_1/SLOT_0_AXI] [get_bd_intf_pins axi_ic_ep_bar_axi_lite/M03_AXI]
-  # [新增] 抓取 Host 回刷 VCONF BRAM 的事务
-  connect_bd_intf_net [get_bd_intf_pins system_ila_1/SLOT_1_AXI] [get_bd_intf_pins axi_ic_host_vconf/M00_AXI]
-
-  # [新增] 单独在 RP AXI 时钟域抓 Host 写入 proxy mailbox / BAR shadow / BAR response 寄存器
-  set system_ila_3 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_3 ]
-  set_property -dict [ list \
-    CONFIG.C_NUM_MONITOR_SLOTS {1} \
-    CONFIG.C_BRAM_CNT {24} \
-    CONFIG.C_DATA_DEPTH {4096}
-   ] $system_ila_3
-
-  connect_bd_net [get_bd_pins xdma_rp/axi_aclk] [get_bd_pins system_ila_3/clk]
-  connect_bd_net [get_bd_pins xdma_rp/axi_ctl_aresetn] [get_bd_pins system_ila_3/resetn]
-  connect_bd_intf_net [get_bd_intf_pins system_ila_3/SLOT_0_AXI] [get_bd_intf_pins axi_ic_host_vconf/M01_AXI]
-
-  # [新增] 抓取 FPGA XDMA EP bypass BAR 到 DDR 的 AXI-MM P2P 访问。
-  # 这条路径用于确认真实 NVMe 是否真的向 0x20b8... BAR 地址发起了 P2P DMA。
+  # [新增] 抓取 FPGA XDMA EP bypass BAR 到 DDR 的 AXI-MM P2P 访问，
+  # 同时抓取 guest/role 写 DDR 的 m_axi_mem 路径。两个 slot 在同一个
+  # xdma_ep/axi_aclk 时钟域内，便于对齐 SQE 写入和 QEMU/真实 NVMe bypass 读取。
   set system_ila_4 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_4 ]
   set_property -dict [ list \
-    CONFIG.C_NUM_MONITOR_SLOTS {1} \
-    CONFIG.C_BRAM_CNT {128} \
+    CONFIG.C_NUM_MONITOR_SLOTS {2} \
+    CONFIG.C_BRAM_CNT {192} \
     CONFIG.C_DATA_DEPTH {4096}
    ] $system_ila_4
 
   connect_bd_net [get_bd_pins xdma_ep/axi_aclk] [get_bd_pins system_ila_4/clk]
   connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] [get_bd_pins system_ila_4/resetn]
+  # SLOT_0_AXI: x86/QEMU/真实 NVMe 通过 XDMA EP bypass BAR 访问 DDR。
   connect_bd_intf_net [get_bd_intf_pins system_ila_4/SLOT_0_AXI] [get_bd_intf_pins xdma_ep/M_AXI_BYPASS]
+  # SLOT_1_AXI: monitor 看到并用于生成 SQE_WRITE_DONE 的 DDR-side AXI 事务。
+  connect_bd_intf_net [get_bd_intf_pins system_ila_4/SLOT_1_AXI] [get_bd_intf_pins sqe_write_done_monitor_0/m_mon_axi]
+
+  # SQE write-done packet stream visibility. SLOT_0 catches the raw monitor
+  # event; SLOT_1 catches the merged C2H stream after active-proxy arbitration.
+  set system_ila_5 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_5 ]
+  set_property -dict [ list \
+    CONFIG.C_NUM_MONITOR_SLOTS {2} \
+    CONFIG.C_MON_TYPE {INTERFACE} \
+    CONFIG.C_SLOT_0_INTF_TYPE {xilinx.com:interface:axis_rtl:1.0} \
+    CONFIG.C_SLOT_1_INTF_TYPE {xilinx.com:interface:axis_rtl:1.0} \
+    CONFIG.C_DATA_DEPTH {2048}
+   ] $system_ila_5
+
+  connect_bd_net [get_bd_pins xdma_ep/axi_aclk] [get_bd_pins system_ila_5/clk]
+  connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] [get_bd_pins system_ila_5/resetn]
+  connect_bd_intf_net [get_bd_intf_pins system_ila_5/SLOT_0_AXIS] [get_bd_intf_pins sqe_write_done_monitor_0/m_axis_c2h]
+  connect_bd_intf_net [get_bd_intf_pins system_ila_5/SLOT_1_AXIS] [get_bd_intf_pins axis_rs_proxy_c2h_out/M_AXIS]
+
 
 
 #=============================================
@@ -927,6 +969,7 @@ proc create_root_design { parentCell } {
   
   # [新增] QEMU 宿主机访问的 Mailbox 和 VCONF BRAM 地址映射
   create_bd_addr_seg -range 0x1000 -offset 0x11000000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs axilite_active_proxy_0/s_mbx_axi/reg0] HOST_MBX_REG
+  create_bd_addr_seg -range 0x1000 -offset 0x11001000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs sqe_write_done_monitor_0/s_cfg_axi/reg0] HOST_SQE_MONITOR_CFG
   create_bd_addr_seg -range 0x1000 -offset 0x11010000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs vconf_bram_ctrl_b/S_AXI/Mem0] HOST_VCONF_BRAM
   
   create_bd_addr_seg -range 0x100000000 -offset 0x0 [get_bd_addr_spaces xdma_ep/M_AXI_BYPASS] [get_bd_addr_segs ddr4_mig/C0_DDR4_MEMORY_MAP/C0_DDR4_ADDRESS_BLOCK] PCIE_EP_BAR_DDR
@@ -943,7 +986,19 @@ proc create_root_design { parentCell } {
   
   create_bd_addr_seg -range 0x000080000000 -offset 0x80000000 [get_bd_addr_spaces xdma_rp/M_AXI_B] [get_bd_addr_segs u_role/s_axi_dma/reg0] PCIE_RP_DMA
   create_bd_addr_seg -range 0x10000 -offset 0x30000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs role_uart/S_AXI/Reg] ROLE_UART
-  create_bd_addr_seg -range 0x100000000 -offset 0x0 [get_bd_addr_spaces u_role/m_axi_mem] [get_bd_addr_segs ddr4_mig/C0_DDR4_MEMORY_MAP/C0_DDR4_ADDRESS_BLOCK] ROLE_DDR
+  # The SQE monitor is an RTL pass-through, not a BD address-transparent interconnect.
+  # Model the role DDR path as two address segments: role -> monitor slave, then
+  # monitor master -> DDR.  This keeps Address Editor paths valid after insertion.
+  set sqe_mon_s_seg [get_bd_addr_segs -quiet sqe_write_done_monitor_0/s_mon_axi/reg0]
+  if {$sqe_mon_s_seg eq ""} {
+      set sqe_mon_s_seg [lindex [get_bd_addr_segs -quiet sqe_write_done_monitor_0/s_mon_axi/*] 0]
+  }
+  if {$sqe_mon_s_seg eq ""} {
+      catch {common::send_msg_id "BD_TCL-107" "ERROR" "Unable to find address segment for sqe_write_done_monitor_0/s_mon_axi"}
+      return 1
+  }
+  create_bd_addr_seg -range 0x100000000 -offset 0x0 [get_bd_addr_spaces u_role/m_axi_mem] $sqe_mon_s_seg ROLE_DDR_MONITOR
+  create_bd_addr_seg -range 0x100000000 -offset 0x0 [get_bd_addr_spaces sqe_write_done_monitor_0/m_mon_axi] [get_bd_addr_segs ddr4_mig/C0_DDR4_MEMORY_MAP/C0_DDR4_ADDRESS_BLOCK] ROLE_DDR
 
 #=============================================
 # Finish BD creation 
