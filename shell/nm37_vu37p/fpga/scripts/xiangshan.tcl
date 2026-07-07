@@ -211,6 +211,14 @@ proc create_root_design { parentCell } {
     CONFIG.NUM_SI {2} \
   ] $axi_ic_ddr_mem
 
+  # Split host-side XDMA EP bypass traffic into the legacy raw DDR window and
+  # an alias window that enters XiangShan through the role DMA port.
+  set axi_ic_ep_bypass_split [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_ic_ep_bypass_split ]
+  set_property -dict [ list \
+    CONFIG.NUM_MI {2} \
+    CONFIG.NUM_SI {1} \
+  ] $axi_ic_ep_bypass_split
+
   set i 1
   while {$i < 1} {
         set axi_reg_slice_name axi_ic_ddr_mem_reg_slice_M0$i
@@ -315,10 +323,25 @@ proc create_root_design { parentCell } {
   set axi_ic_pcie_rp_dma [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_ic_pcie_rp_dma ]
   set_property -dict [ list \
     CONFIG.NUM_MI {1} \
-    CONFIG.NUM_SI {1} \
-    CONFIG.SI_DATA_WIDTH {128} \
-    CONFIG.MI_DATA_WIDTH {64} \
+    CONFIG.NUM_SI {2} \
   ] $axi_ic_pcie_rp_dma
+
+  set block_name axi_alias_attr_bridge
+  set block_cell_name axi_alias_attr_bridge_0
+  if { [catch {set u_axi_alias_attr_bridge [create_bd_cell -type module -reference $block_name $block_cell_name] } errmsg] } {
+     catch {common::send_msg_id "BD_TCL-105" "ERROR" "Unable to add referenced block <$block_name>. Please add the files for ${block_name}'s definition into the project."}
+     return 1
+  } elseif { $u_axi_alias_attr_bridge eq "" } {
+     catch {common::send_msg_id "BD_TCL-106" "ERROR" "Unable to referenced block <$block_name>. Please add the files for ${block_name}'s definition into the project."}
+     return 1
+  }
+  set_property -dict [ list \
+    CONFIG.ADDR_WIDTH {64} \
+    CONFIG.DATA_WIDTH {512} \
+    CONFIG.ID_WIDTH {4} \
+    CONFIG.ADDR_SUBTRACT {64'h0000000100000000} \
+    CONFIG.CACHE_VALUE {4'hf} \
+  ] $u_axi_alias_attr_bridge
 
   set i 0
   while {$i < 1} {
@@ -511,6 +534,11 @@ proc create_root_design { parentCell } {
 
   # PCIe EP BAR interfaces (250MHz)
   connect_bd_net [get_bd_pins xdma_ep/axi_aclk] \
+      [get_bd_pins axi_ic_ep_bypass_split/ACLK] \
+      [get_bd_pins axi_ic_ep_bypass_split/S00_ACLK] \
+      [get_bd_pins axi_ic_ep_bypass_split/M00_ACLK] \
+      [get_bd_pins axi_ic_ep_bypass_split/M01_ACLK] \
+      [get_bd_pins axi_alias_attr_bridge_0/clk] \
       [get_bd_pins axi_ic_ddr_mem/ACLK] \
       [get_bd_pins axi_ic_ddr_mem/S00_ACLK] \
       [get_bd_pins axi_ic_ddr_mem/S01_ACLK] \
@@ -532,6 +560,7 @@ proc create_root_design { parentCell } {
       [get_bd_pins axi_ic_pcie_rp_mmio/ACLK] \
       [get_bd_pins axi_ic_pcie_rp_mmio/S00_ACLK] \
       [get_bd_pins axi_ic_pcie_rp_dma/ACLK] \
+      [get_bd_pins axi_ic_pcie_rp_dma/S01_ACLK] \
       [get_bd_pins axi_ic_pcie_rp_dma/M00_ACLK] \
       [get_bd_pins axi_ic_pcie_rp_dma_reg_slice_M00/aclk] \
       [get_bd_pins axi_ic_bootrom/*ACLK] \
@@ -570,6 +599,11 @@ proc create_root_design { parentCell } {
 
   # PCIe EP AXI interface reset
   connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] \
+      [get_bd_pins axi_ic_ep_bypass_split/ARESETN] \
+      [get_bd_pins axi_ic_ep_bypass_split/S00_ARESETN] \
+      [get_bd_pins axi_ic_ep_bypass_split/M00_ARESETN] \
+      [get_bd_pins axi_ic_ep_bypass_split/M01_ARESETN] \
+      [get_bd_pins axi_alias_attr_bridge_0/rstn] \
       [get_bd_pins axi_ic_ddr_mem/ARESETN] \
       [get_bd_pins axi_ic_ddr_mem/S00_ARESETN] \
       [get_bd_pins axi_ic_ddr_mem/S01_ARESETN] \
@@ -596,7 +630,8 @@ proc create_root_design { parentCell } {
       [get_bd_pins u_role/aresetn] \
       [get_bd_pins role_uart/s_axi_aresetn] \
       [get_bd_pins host_uart/s_axi_aresetn] \
-      [get_bd_pins axi_dwidth_converter_0/s_axi_aresetn] 
+      [get_bd_pins axi_dwidth_converter_0/s_axi_aresetn] \
+      [get_bd_pins axi_ic_pcie_rp_dma/S01_ARESETN]
 
   connect_bd_net [get_bd_pins pcie_rp_role_sync_reset/peripheral_aresetn] \
       [get_bd_pins axi_ic_role_io/M02_ARESETN] \
@@ -641,9 +676,16 @@ proc create_root_design { parentCell } {
   connect_bd_intf_net [get_bd_intf_pins ddr4_mig/C0_DDR4_S_AXI] \
         [get_bd_intf_pins axi_ic_ddr_mem/M00_AXI]
 
-  # PCIe EP AXI Bridge to DDR4
+  # PCIe EP AXI bypass split:
+  # M00 keeps the legacy raw DDR window; M01 is the coherent alias window.
   connect_bd_intf_net [get_bd_intf_pins xdma_ep/M_AXI_BYPASS] \
+        [get_bd_intf_pins axi_ic_ep_bypass_split/S00_AXI]
+  connect_bd_intf_net [get_bd_intf_pins axi_ic_ep_bypass_split/M00_AXI] \
         [get_bd_intf_pins axi_ic_ddr_mem/S00_AXI]
+  connect_bd_intf_net [get_bd_intf_pins axi_ic_ep_bypass_split/M01_AXI] \
+        [get_bd_intf_pins axi_alias_attr_bridge_0/S_AXI]
+  connect_bd_intf_net [get_bd_intf_pins axi_alias_attr_bridge_0/M_AXI] \
+        [get_bd_intf_pins axi_ic_pcie_rp_dma/S01_AXI]
 
   # Role to DDR4.  The SQE write-done monitor is a transparent AXI
   # pass-through inserted at the DDR-side register-slice output, so the
@@ -923,13 +965,10 @@ proc create_root_design { parentCell } {
 # ILA
 #=============================================
 
-  # [新增] 抓取 FPGA XDMA EP bypass BAR 到 DDR 的 AXI-MM P2P 访问，
-  # 同时抓取 guest/role 写 DDR 的 m_axi_mem 路径。两个 slot 在同一个
-  # xdma_ep/axi_aclk 时钟域内，便于对齐 SQE 写入和 QEMU/真实 NVMe bypass 读取。
+  # FPGA XDMA EP bypass BAR 到 DDR 的 AXI-MM P2P 访问。
   set system_ila_4 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_4 ]
   set_property -dict [ list \
-    CONFIG.C_NUM_MONITOR_SLOTS {2} \
-    CONFIG.C_BRAM_CNT {192} \
+    CONFIG.C_NUM_MONITOR_SLOTS {1} \
     CONFIG.C_DATA_DEPTH {4096}
    ] $system_ila_4
 
@@ -937,8 +976,25 @@ proc create_root_design { parentCell } {
   connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] [get_bd_pins system_ila_4/resetn]
   # SLOT_0_AXI: x86/QEMU/真实 NVMe 通过 XDMA EP bypass BAR 访问 DDR。
   connect_bd_intf_net [get_bd_intf_pins system_ila_4/SLOT_0_AXI] [get_bd_intf_pins xdma_ep/M_AXI_BYPASS]
-  # SLOT_1_AXI: monitor 看到并用于生成 SQE_WRITE_DONE 的 DDR-side AXI 事务。
-  connect_bd_intf_net [get_bd_intf_pins system_ila_4/SLOT_1_AXI] [get_bd_intf_pins sqe_write_done_monitor_0/m_mon_axi]
+
+  # Role DDR/MMIO visibility.  All slots use xdma_ep/axi_aclk so the
+  # mem path and role IO path can be compared in the same capture.
+  set system_ila_6 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_6 ]
+  set_property -dict [ list \
+    CONFIG.C_NUM_MONITOR_SLOTS {4} \
+    CONFIG.C_DATA_DEPTH {2048}
+   ] $system_ila_6
+
+  connect_bd_net [get_bd_pins xdma_ep/axi_aclk] [get_bd_pins system_ila_6/clk]
+  connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] [get_bd_pins system_ila_6/resetn]
+  # SLOT_0_AXI: role transaction before axi_ic_ddr_mem_reg_slice_S01.
+  connect_bd_intf_net [get_bd_intf_pins system_ila_6/SLOT_0_AXI] [get_bd_intf_pins axi_ic_ddr_mem_reg_slice_S01/S_AXI]
+  # SLOT_1_AXI: transaction released by axi_ic_ddr_mem_reg_slice_S01.
+  connect_bd_intf_net [get_bd_intf_pins system_ila_6/SLOT_1_AXI] [get_bd_intf_pins axi_ic_ddr_mem_reg_slice_S01/M_AXI]
+  # SLOT_2_AXI: transaction forwarded by the SQE monitor toward DDR.
+  connect_bd_intf_net [get_bd_intf_pins system_ila_6/SLOT_2_AXI] [get_bd_intf_pins sqe_write_done_monitor_0/m_mon_axi]
+  # SLOT_3_AXI: role MMIO/IO master before axi_ic_role_io_reg_slice_S00.
+  connect_bd_intf_net [get_bd_intf_pins system_ila_6/SLOT_3_AXI] [get_bd_intf_pins axi_ic_role_io_reg_slice_S00/S_AXI]
 
   # SQE write-done packet stream visibility. SLOT_0 catches the raw monitor
   # event; SLOT_1 catches the merged C2H stream after active-proxy arbitration.
@@ -972,7 +1028,19 @@ proc create_root_design { parentCell } {
   create_bd_addr_seg -range 0x1000 -offset 0x11001000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs sqe_write_done_monitor_0/s_cfg_axi/reg0] HOST_SQE_MONITOR_CFG
   create_bd_addr_seg -range 0x1000 -offset 0x11010000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs vconf_bram_ctrl_b/S_AXI/Mem0] HOST_VCONF_BRAM
   
-  create_bd_addr_seg -range 0x100000000 -offset 0x0 [get_bd_addr_spaces xdma_ep/M_AXI_BYPASS] [get_bd_addr_segs ddr4_mig/C0_DDR4_MEMORY_MAP/C0_DDR4_ADDRESS_BLOCK] PCIE_EP_BAR_DDR
+  create_bd_addr_seg -range 0x100000000 -offset 0x0 [get_bd_addr_spaces xdma_ep/M_AXI_BYPASS] [get_bd_addr_segs ddr4_mig/C0_DDR4_MEMORY_MAP/C0_DDR4_ADDRESS_BLOCK] PCIE_EP_BYPASS_RAW_DDR
+  # The alias bridge is an RTL address-transforming bridge, not a BD address-transparent interconnect.
+  # Model the coherent alias path as two address segments: EP BYPASS -> bridge slave,
+  # then bridge master -> role DMA.  The RTL bridge subtracts 0x100000000 internally.
+  create_bd_addr_seg -range 0x100000000 -offset 0x100000000 \
+    [get_bd_addr_spaces xdma_ep/M_AXI_BYPASS] \
+    [get_bd_addr_segs axi_alias_attr_bridge_0/S_AXI/reg0] \
+    PCIE_EP_BYPASS_ALIAS_BRIDGE
+
+  create_bd_addr_seg -range 0x100000000 -offset 0x0 \
+    [get_bd_addr_spaces axi_alias_attr_bridge_0/M_AXI] \
+    [get_bd_addr_segs u_role/s_axi_dma/reg0] \
+    PCIE_ALIAS_BRIDGE_ROLE_DMA
 
   ## Role address space
   create_bd_addr_seg -range 0x10000 -offset 0x10000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs bootrom_bram_ctrl/S_AXI/Mem0] ROLE_BOOTROM
