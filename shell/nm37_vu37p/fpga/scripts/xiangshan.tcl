@@ -114,13 +114,13 @@ proc create_root_design { parentCell } {
 # Create IP blocks
 #=============================================
 
-  # [修改] 例化主动拦截网关 Proxy
-  set block_name axilite_active_proxy 
-  set block_cell_name axilite_active_proxy_0
-  if { [catch {set u_role [create_bd_cell -type module -reference $block_name $block_cell_name] } errmsg] } {
+  # Virtual PCIe switch + single NVMe endpoint proxy.
+  set block_name virtual_pcie_switch_proxy
+  set block_cell_name virtual_pcie_switch_proxy_0
+  if { [catch {set u_vpcie_switch [create_bd_cell -type module -reference $block_name $block_cell_name] } errmsg] } {
      catch {common::send_msg_id "BD_TCL-105" "ERROR" "Unable to add referenced block <$block_name>. Please add the files for ${block_name}'s definition into the project."}
      return 1
-  } elseif { $u_role eq "" } {
+  } elseif { $u_vpcie_switch eq "" } {
      catch {common::send_msg_id "BD_TCL-106" "ERROR" "Unable to referenced block <$block_name>. Please add the files for ${block_name}'s definition into the project."}
      return 1
   }
@@ -177,27 +177,6 @@ proc create_root_design { parentCell } {
     CONFIG.pf0_base_class_menu {Processing_accelerators} \
     CONFIG.pf0_sub_class_interface_menu {Unknown} \
   ] $xdma_ep
-
-  # Create instance: PCIe Root Port
-  set xdma_rp [ create_bd_cell -type ip -vlnv xilinx.com:ip:xdma:4.1 xdma_rp ]
-  set_property -dict [ list \
-        CONFIG.mode_selection {Advanced} \
-        CONFIG.device_port_type {Root_Port_of_PCI_Express_Root_Complex} \
-        CONFIG.functional_mode {AXI Bridge} \
-        CONFIG.dma_reset_source_sel {Phy_Ready} \
-        CONFIG.en_gt_selection {true} \
-        CONFIG.pl_link_cap_max_link_width {X4} \
-        CONFIG.pl_link_cap_max_link_speed {8.0_GT/s} \
-        CONFIG.axi_addr_width {64} \
-        CONFIG.pf0_class_code_sub {04} \
-        CONFIG.pf0_bar0_enabled {false} \
-        CONFIG.axibar2pciebar_0 {0x0000000050000000} \
-        CONFIG.plltype {QPLL1} \
-        CONFIG.msi_rx_pin_en {true} \
-        CONFIG.select_quad {GTY_Quad_127} \
-        CONFIG.pcie_blk_locn {PCIE4C_X0Y1} \
-        CONFIG.BASEADDR {0x00000000} \
-        CONFIG.HIGHADDR {0x007FFFFF} ] $xdma_rp
 
   set axi_dwidth_converter_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dwidth_converter:2.1 axi_dwidth_converter_0 ]
   set_property -dict [list CONFIG.ADDR_WIDTH {64} \
@@ -272,7 +251,7 @@ proc create_root_design { parentCell } {
   # Create instance: AXI interconnect for Role MMIO
   set axi_ic_role_io [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_ic_role_io ]
   set_property -dict [ list \
-    CONFIG.NUM_MI {3} \
+    CONFIG.NUM_MI {4} \
     CONFIG.NUM_SI {1} \
   ] $axi_ic_role_io
 
@@ -323,7 +302,7 @@ proc create_root_design { parentCell } {
   set axi_ic_pcie_rp_dma [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_ic_pcie_rp_dma ]
   set_property -dict [ list \
     CONFIG.NUM_MI {1} \
-    CONFIG.NUM_SI {2} \
+    CONFIG.NUM_SI {1} \
   ] $axi_ic_pcie_rp_dma
 
   set block_name axi_alias_attr_bridge
@@ -361,31 +340,6 @@ proc create_root_design { parentCell } {
         incr i
   }
 
-  # Create instance: AXI interconnect for PCIe RP MMIO 
-  set axi_ic_pcie_rp_mmio [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_ic_pcie_rp_mmio ]
-  set_property -dict [ list \
-    CONFIG.NUM_MI {2} \
-    CONFIG.NUM_SI {1} \
-  ] $axi_ic_pcie_rp_mmio
-
-  set i 2
-  while {$i < 2} {
-        set axi_reg_slice_name axi_ic_pcie_rp_mmio_reg_slice_M0$i
-        set axi_reg_slice_util [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_register_slice:2.1 $axi_reg_slice_name ]
-        set_property -dict [ list CONFIG.USE_AUTOPIPELINING {1} \
-                CONFIG.REG_AW {15} CONFIG.REG_AR {15} CONFIG.REG_W {15} CONFIG.REG_R {15} CONFIG.REG_B {15} ] $axi_reg_slice_util
-        incr i
-  }
-
-  set i 1
-  while {$i < 1} {
-        set axi_reg_slice_name axi_ic_pcie_rp_mmio_reg_slice_S0$i
-        set axi_reg_slice_util [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_register_slice:2.1 $axi_reg_slice_name ]
-        set_property -dict [ list CONFIG.USE_AUTOPIPELINING {1} \
-                CONFIG.REG_AW {15} CONFIG.REG_AR {15} CONFIG.REG_W {15} CONFIG.REG_R {15} CONFIG.REG_B {15} ] $axi_reg_slice_util
-        incr i
-  }
-
   # Create instance: AXI UART Lite over PCIe for Host-side
   set host_uart [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_uartlite:2.0 host_uart ]
   set_property -dict [ list CONFIG.C_BAUDRATE {115200} ] $host_uart
@@ -415,11 +369,6 @@ proc create_root_design { parentCell } {
   set pcie_ep_ref_clk_buf [ create_bd_cell -type ip -vlnv xilinx.com:ip:util_ds_buf:2.1 pcie_ep_ref_clk_buf ]
   set_property CONFIG.C_BUF_TYPE {IBUFDSGTE} $pcie_ep_ref_clk_buf
 
-  # Create instance: IBUFDS_GTE for PCIe RP reference clock
-  set pcie_rp_ref_clk_buf [ create_bd_cell -type ip -vlnv xilinx.com:ip:util_ds_buf:2.1 pcie_rp_ref_clk_buf ]
-  set_property CONFIG.C_BUF_TYPE {IBUFDSGTE} $pcie_rp_ref_clk_buf
-
-  catch {common::send_msg_id "BD_TCL-000" "INFO" "rp_clk ip read"}
   # constant for ready signal
   set const_vcc [ create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 const_vcc ]
   set_property -dict [list CONFIG.CONST_WIDTH {1} \
@@ -437,10 +386,6 @@ proc create_root_design { parentCell } {
   set pcie_ep_gt_ref_clk [ create_bd_intf_port -mode slave -vlnv xilinx.com:interface:diff_clock_rtl:1.0 pcie_ep_gt_ref_clk ]
   set_property -dict [ list config.freq_hz {100000000} ] $pcie_ep_gt_ref_clk
 
-  # gt differential reference clock for pcie rp
-  set pcie_rp_gt_ref_clk [ create_bd_intf_port -mode slave -vlnv xilinx.com:interface:diff_clock_rtl:1.0 pcie_rp_gt_ref_clk ]
-  set_property -dict [ list config.freq_hz {100000000} ] $pcie_rp_gt_ref_clk
-
   # Differential system clock for DDR4 MIG
   set ddr4_mig_sys_clk [ create_bd_intf_port -mode Slave -vlnv xilinx.com:interface:diff_clock_rtl:1.0 ddr4_mig_sys_clk ]
   set_property -dict [ list CONFIG.FREQ_HZ {100000000} ] $ddr4_mig_sys_clk
@@ -453,9 +398,6 @@ proc create_root_design { parentCell } {
   # PCIe EP perst
   create_bd_port -dir I -type rst pcie_ep_perstn
 
-  # PCIe RP perst
-  create_bd_port -dir O -type rst pcie_rp_perstn
-
   # Create instance: inverter of perstn from PCIe EP
   set ep_perst_gen [ create_bd_cell -type ip -vlnv xilinx.com:ip:util_vector_logic:2.0 ep_perst_gen ]
   set_property -dict [ list CONFIG.C_OPERATION {not} \
@@ -463,12 +405,6 @@ proc create_root_design { parentCell } {
 
   # Create instance: DDR MIG AXI sync. reset generation
   create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 ddr4_mig_sync_reset
-
-  # Create instance: PCIe RP AXI sync. reset generation for the PERSTN signal
-  create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 pcie_rp_sync_reset
-
-  # Create instance: PCIe RP AXI sync. reset generation for the ROLE clock region
-  create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 pcie_rp_role_sync_reset
 
 #=============================================
 # GT ports
@@ -479,12 +415,6 @@ proc create_root_design { parentCell } {
   create_bd_port -dir I -from 15 -to 0 pcie_ep_rxp
   create_bd_port -dir O -from 15 -to 0 pcie_ep_txn
   create_bd_port -dir O -from 15 -to 0 pcie_ep_txp
-
-  # PCIe RP Slot
-  create_bd_port -dir I -from 3 -to 0 pcie_rp_rxn
-  create_bd_port -dir I -from 3 -to 0 pcie_rp_rxp
-  create_bd_port -dir O -from 3 -to 0 pcie_rp_txn
-  create_bd_port -dir O -from 3 -to 0 pcie_rp_txp
 
 #=============================================
 # DDR4 pins
@@ -508,19 +438,6 @@ proc create_root_design { parentCell } {
   connect_bd_net -net pcie_ep_sys_clk_gt \
       [get_bd_pins pcie_ep_ref_clk_buf/IBUF_OUT] \
       [get_bd_pins xdma_ep/sys_clk_gt]
-
-  # PCIe RP reference clock (100MHz)
-  connect_bd_intf_net -intf_net pcie_rp_gt_ref_clk \
-      [get_bd_intf_pins pcie_rp_gt_ref_clk] \
-      [get_bd_intf_pins pcie_rp_ref_clk_buf/CLK_IN_D]
-
-  connect_bd_net -net pcie_rp_ref_clk \
-      [get_bd_pins pcie_rp_ref_clk_buf/IBUF_DS_ODIV2] \
-      [get_bd_pins xdma_rp/sys_clk]
-
-  connect_bd_net -net pcie_rp_sys_clk \
-      [get_bd_pins pcie_rp_ref_clk_buf/IBUF_OUT] \
-      [get_bd_pins xdma_rp/sys_clk_gt]
 
   # DDR4 memory controller reference clock (100MHz)
   connect_bd_intf_net -intf_net ddr4_mig_sys_clk_in \
@@ -557,28 +474,21 @@ proc create_root_design { parentCell } {
       [get_bd_pins vconf_bram_ctrl_b/s_axi_aclk] \
       [get_bd_pins axi_ic_role_io/*ACLK] \
       [get_bd_pins axi_ic_role_io_reg_slice_S00/aclk] \
-      [get_bd_pins axi_ic_pcie_rp_mmio/ACLK] \
-      [get_bd_pins axi_ic_pcie_rp_mmio/S00_ACLK] \
       [get_bd_pins axi_ic_pcie_rp_dma/ACLK] \
-      [get_bd_pins axi_ic_pcie_rp_dma/S01_ACLK] \
+      [get_bd_pins axi_ic_pcie_rp_dma/S00_ACLK] \
       [get_bd_pins axi_ic_pcie_rp_dma/M00_ACLK] \
       [get_bd_pins axi_ic_pcie_rp_dma_reg_slice_M00/aclk] \
+      [get_bd_pins virtual_pcie_switch_proxy_0/clk] \
+      [get_bd_pins vconf_bram_ctrl_a/s_axi_aclk] \
       [get_bd_pins axi_ic_bootrom/*ACLK] \
       [get_bd_pins bootrom_bram_ctrl/s_axi_aclk] \
       [get_bd_pins u_role/aclk] \
-      [get_bd_pins pcie_rp_role_sync_reset/slowest_sync_clk] \
       [get_bd_pins role_uart/s_axi_aclk] \
       [get_bd_pins host_uart/s_axi_aclk] \
       [get_bd_pins axi_dwidth_converter_0/s_axi_aclk] 
 
-  # PCIe RP AXI clock (250MHz)
-  connect_bd_net [get_bd_pins xdma_rp/axi_aclk] \
-      [get_bd_pins pcie_rp_sync_reset/slowest_sync_clk] \
-      [get_bd_pins axi_ic_pcie_rp_dma/S00_ACLK] \
-      [get_bd_pins axi_ic_pcie_rp_mmio/M*_ACLK] \
-      [get_bd_pins axilite_active_proxy_0/clk] \
-      [get_bd_pins vconf_bram_ctrl_a/s_axi_aclk] \
-      [get_bd_pins axi_ic_host_vconf/M01_ACLK] 
+  connect_bd_net [get_bd_pins xdma_ep/axi_aclk] \
+      [get_bd_pins axi_ic_host_vconf/M01_ACLK]
 
 #=============================================
 # System reset connection
@@ -587,15 +497,14 @@ proc create_root_design { parentCell } {
   # perstn input for AXI PCIe EP (used as system reset)
   connect_bd_net -net pcie_ep_perstn [get_bd_ports pcie_ep_perstn] \
       [get_bd_pins xdma_ep/sys_rst_n] \
-      [get_bd_pins xdma_rp/sys_rst_n] \
-      [get_bd_pins pcie_rp_sync_reset/ext_reset_in] \
       [get_bd_pins ddr4_mig_sync_reset/ext_reset_in]
 
   # System reset for PL DDR4 MIG (opposite polarity of PCIe EP perstn, active high)
   connect_bd_net -net pcie_ep_perstn [get_bd_pins ep_perst_gen/Op1]
 
   connect_bd_net -net pcie_ep_perst [get_bd_pins ep_perst_gen/Res] \
-      [get_bd_pins ddr4_mig/sys_rst]
+      [get_bd_pins ddr4_mig/sys_rst] \
+      [get_bd_pins virtual_pcie_switch_proxy_0/rst]
 
   # PCIe EP AXI interface reset
   connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] \
@@ -625,37 +534,18 @@ proc create_root_design { parentCell } {
       [get_bd_pins axi_ic_role_io_reg_slice_S00/aresetn] \
       [get_bd_pins axi_ic_role_io/M00_ARESETN] \
       [get_bd_pins axi_ic_role_io/M01_ARESETN] \
+      [get_bd_pins axi_ic_role_io/M02_ARESETN] \
+      [get_bd_pins axi_ic_role_io/M03_ARESETN] \
       [get_bd_pins axi_ic_bootrom/*ARESETN] \
       [get_bd_pins bootrom_bram_ctrl/s_axi_aresetn] \
       [get_bd_pins u_role/aresetn] \
       [get_bd_pins role_uart/s_axi_aresetn] \
       [get_bd_pins host_uart/s_axi_aresetn] \
       [get_bd_pins axi_dwidth_converter_0/s_axi_aresetn] \
-      [get_bd_pins axi_ic_pcie_rp_dma/S01_ARESETN]
-
-  connect_bd_net [get_bd_pins pcie_rp_role_sync_reset/peripheral_aresetn] \
-      [get_bd_pins axi_ic_role_io/M02_ARESETN] \
-      [get_bd_pins axi_ic_pcie_rp_mmio/S00_ARESETN] \
-      [get_bd_pins axi_ic_pcie_rp_dma/M00_ARESETN] \
-      [get_bd_pins axi_ic_pcie_rp_dma_reg_slice_M00/aresetn]
-
-  connect_bd_net [get_bd_pins pcie_rp_sync_reset/peripheral_aresetn] \
-      [get_bd_ports pcie_rp_perstn]
-
-  connect_bd_net [get_bd_pins pcie_rp_role_sync_reset/interconnect_aresetn] \
-      [get_bd_pins axi_ic_pcie_rp_mmio/ARESETN] \
-      [get_bd_pins axi_ic_pcie_rp_dma/ARESETN]
-
-  # Reset for AXI interface of PCIe RP 
-  connect_bd_net [get_bd_pins xdma_rp/axi_aresetn] \
+      [get_bd_pins axi_ic_pcie_rp_dma/ARESETN] \
       [get_bd_pins axi_ic_pcie_rp_dma/S00_ARESETN] \
-      [get_bd_pins axi_ic_pcie_rp_mmio/M00_ARESETN]
-
-  connect_bd_net [get_bd_pins xdma_rp/axi_ctl_aresetn] \
-      [get_bd_pins pcie_rp_sync_reset/dcm_locked] \
-      [get_bd_pins pcie_rp_role_sync_reset/ext_reset_in] \
-      [get_bd_pins axi_ic_pcie_rp_mmio/M01_ARESETN] \
-      [get_bd_pins axilite_active_proxy_0/rst] \
+      [get_bd_pins axi_ic_pcie_rp_dma/M00_ARESETN] \
+      [get_bd_pins axi_ic_pcie_rp_dma_reg_slice_M00/aresetn] \
       [get_bd_pins vconf_bram_ctrl_a/s_axi_aresetn] \
       [get_bd_pins axi_ic_host_vconf/M01_ARESETN] 
 
@@ -685,7 +575,7 @@ proc create_root_design { parentCell } {
   connect_bd_intf_net [get_bd_intf_pins axi_ic_ep_bypass_split/M01_AXI] \
         [get_bd_intf_pins axi_alias_attr_bridge_0/S_AXI]
   connect_bd_intf_net [get_bd_intf_pins axi_alias_attr_bridge_0/M_AXI] \
-        [get_bd_intf_pins axi_ic_pcie_rp_dma/S01_AXI]
+        [get_bd_intf_pins axi_ic_pcie_rp_dma/S00_AXI]
 
   # Role to DDR4.  The SQE write-done monitor is a transparent AXI
   # pass-through inserted at the DDR-side register-slice output, so the
@@ -743,10 +633,6 @@ proc create_root_design { parentCell } {
   connect_bd_intf_net [get_bd_intf_pins bootrom_bram_ctrl/S_AXI] \
         [get_bd_intf_pins axi_ic_bootrom/M00_AXI]
 
-  # PCIe RP DMA port to ROLE DMA interface
-  connect_bd_intf_net [get_bd_intf_pins xdma_rp/M_AXI_B] \
-        [get_bd_intf_pins axi_ic_pcie_rp_dma/S00_AXI]
-
   connect_bd_intf_net [get_bd_intf_pins axi_ic_pcie_rp_dma/M00_AXI] \
         [get_bd_intf_pins axi_ic_pcie_rp_dma_reg_slice_M00/S_AXI]
   connect_bd_intf_net [get_bd_intf_pins axi_ic_pcie_rp_dma_reg_slice_M00/M_AXI] \
@@ -755,39 +641,28 @@ proc create_root_design { parentCell } {
   connect_bd_intf_net [get_bd_intf_pins u_role/s_axi_dma] \
         [get_bd_intf_pins axi_dwidth_converter_0/M_AXI]
 
-  #PCIe RP ctrl/BAR port to ROLE MMIO interface
-  connect_bd_intf_net [get_bd_intf_pins axi_ic_pcie_rp_mmio/S00_AXI] \
+  # Virtual PCIe switch windows: ECAM at 0x60000000 and PCI MEM at 0x50000000.
+  connect_bd_intf_net [get_bd_intf_pins virtual_pcie_switch_proxy_0/s_mmio_axi] \
         [get_bd_intf_pins axi_ic_role_io/M02_AXI]
 
-  # [修改] 代理网关 Proxy 到 RP 的连线
-  connect_bd_intf_net [get_bd_intf_pins axilite_active_proxy_0/s_axi] \
-        [get_bd_intf_pins axi_ic_pcie_rp_mmio/M01_AXI]
+  connect_bd_intf_net [get_bd_intf_pins virtual_pcie_switch_proxy_0/s_ecam_axi] \
+        [get_bd_intf_pins axi_ic_role_io/M03_AXI]
 
-  # [修改] BAR 代理直接插在 XDMA RP S_AXI_B 前
-  connect_bd_intf_net [get_bd_intf_pins axilite_active_proxy_0/s_bar_axi] \
-        [get_bd_intf_pins axi_ic_pcie_rp_mmio/M00_AXI]
-
-  connect_bd_intf_net [get_bd_intf_pins axilite_active_proxy_0/m_bar_axi] \
-        [get_bd_intf_pins xdma_rp/S_AXI_B]
-        
-  connect_bd_intf_net [get_bd_intf_pins axilite_active_proxy_0/m_axi] \
-        [get_bd_intf_pins xdma_rp/S_AXI_LITE]
-
-  # [修改] 代理网关 Proxy 到 虚拟配置空间 BRAM (Port A)
-  connect_bd_intf_net [get_bd_intf_pins axilite_active_proxy_0/m_vconf_axi] \
+  # Virtual ECAM shadow read path.  FPGA reads Port A; QEMU updates Port B.
+  connect_bd_intf_net [get_bd_intf_pins virtual_pcie_switch_proxy_0/m_ecam_shadow_axi] \
         [get_bd_intf_pins vconf_bram_ctrl_a/S_AXI]
 
-  # [修改] QEMU 宿主机 (EP) 到 VCONF Interconnect 的连线
+  # QEMU host-side path to the ECAM shadow BRAM and proxy mailbox.
   connect_bd_intf_net [get_bd_intf_pins axi_ic_ep_bar_axi_lite/M03_AXI] \
         [get_bd_intf_pins axi_ic_host_vconf/S00_AXI]
 
-  # [修改] VCONF Interconnect 到 BRAM (Port B)
+  # Host writes the ECAM shadow through BRAM Port B.
   connect_bd_intf_net [get_bd_intf_pins axi_ic_host_vconf/M00_AXI] \
         [get_bd_intf_pins vconf_bram_ctrl_b/S_AXI]
 
-  # [修改] VCONF Interconnect 到 Proxy 内部的 Mailbox
+  # Host mailbox/control path to the virtual PCIe switch proxy.
   connect_bd_intf_net [get_bd_intf_pins axi_ic_host_vconf/M01_AXI] \
-        [get_bd_intf_pins axilite_active_proxy_0/s_mbx_axi]
+        [get_bd_intf_pins virtual_pcie_switch_proxy_0/s_mbx_axi]
 
   # Flat DDR map for PCIe EP bypass: keep the raw XDMA bypass
   # address as the DDR address instead of windowing low 28 bits
@@ -841,10 +716,10 @@ proc create_root_design { parentCell } {
   connect_bd_intf_net [get_bd_intf_pins axi_ic_host_vconf/M02_AXI] \
         [get_bd_intf_pins sqe_write_done_monitor_0/s_cfg_axi]
   
-  connect_bd_net [get_bd_pins xdma_rp/axi_aclk] \
+  connect_bd_net [get_bd_pins xdma_ep/axi_aclk] \
       [get_bd_pins axis_rs_active_proxy_c2h/aclk] \
       [get_bd_pins axis_cc_proxy_c2h1/s_axis_aclk]
-  connect_bd_net [get_bd_pins xdma_rp/axi_aresetn] \
+  connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] \
       [get_bd_pins axis_rs_active_proxy_c2h/aresetn] \
       [get_bd_pins axis_cc_proxy_c2h1/s_axis_aresetn]
   connect_bd_net [get_bd_pins xdma_ep/axi_aclk] [get_bd_pins axis_cc_proxy_c2h1/m_axis_aclk]
@@ -866,7 +741,7 @@ proc create_root_design { parentCell } {
       [get_bd_pins axis_rs_proxy_c2h_out/aresetn] \
       [get_bd_pins sqe_write_done_monitor_0/rstn]
 
-  connect_bd_intf_net [get_bd_intf_pins axilite_active_proxy_0/m_axis_c2h] [get_bd_intf_pins axis_rs_active_proxy_c2h/S_AXIS]
+  connect_bd_intf_net [get_bd_intf_pins virtual_pcie_switch_proxy_0/m_axis_c2h] [get_bd_intf_pins axis_rs_active_proxy_c2h/S_AXIS]
   connect_bd_intf_net [get_bd_intf_pins axis_rs_active_proxy_c2h/M_AXIS] [get_bd_intf_pins axis_cc_proxy_c2h1/S_AXIS]
   connect_bd_intf_net [get_bd_intf_pins axis_cc_proxy_c2h1/M_AXIS] [get_bd_intf_pins axis_ic_proxy_c2h1/S00_AXIS]
   connect_bd_intf_net [get_bd_intf_pins sqe_write_done_monitor_0/m_axis_c2h] [get_bd_intf_pins axis_rs_sqe_done_c2h/S_AXIS]
@@ -878,7 +753,6 @@ proc create_root_design { parentCell } {
   foreach pin_name {
       xdma_ep/m_axis_h2c_tready_0
       xdma_ep/m_axis_h2c_tready_1
-      pcie_rp_role_sync_reset/dcm_locked
   } {
       set pin [get_bd_pins -quiet $pin_name]
       if {$pin ne ""} {
@@ -899,12 +773,6 @@ proc create_root_design { parentCell } {
   connect_bd_net [get_bd_ports pcie_ep_txn] [get_bd_pins xdma_ep/pci_exp_txn]
   connect_bd_net [get_bd_ports pcie_ep_txp] [get_bd_pins xdma_ep/pci_exp_txp]
 
-  # PCIe RP slot
-  connect_bd_net [get_bd_ports pcie_rp_rxn] [get_bd_pins xdma_rp/pci_exp_rxn]
-  connect_bd_net [get_bd_ports pcie_rp_rxp] [get_bd_pins xdma_rp/pci_exp_rxp]
-  connect_bd_net [get_bd_ports pcie_rp_txn] [get_bd_pins xdma_rp/pci_exp_txn]
-  connect_bd_net [get_bd_ports pcie_rp_txp] [get_bd_pins xdma_rp/pci_exp_txp]
-
 #==============================================
 # DDR4 memory connection
 #==============================================
@@ -924,7 +792,7 @@ proc create_root_design { parentCell } {
   connect_bd_intf_net [get_bd_intf_pins bootrom_bram_ctrl/BRAM_PORTA] \
       [get_bd_intf_pins bootrom_bram/BRAM_PORTA]
 
-  # [修改] 虚拟配置空间 BRAM 的双端连接
+  # ECAM shadow BRAM dual-port storage.
   connect_bd_intf_net [get_bd_intf_pins vconf_bram_ctrl_a/BRAM_PORTA] \
       [get_bd_intf_pins vconf_bram/BRAM_PORTA]
 
@@ -941,11 +809,11 @@ proc create_root_design { parentCell } {
   connect_bd_net [get_bd_pins role_uart/interrupt] [get_bd_pins role_intr_concat/In0]
   connect_bd_net [get_bd_pins host_uart/interrupt] [get_bd_pins xdma_ep/usr_irq_req]
 
-  connect_bd_net -net proxy_interrupt_out [get_bd_pins axilite_active_proxy_0/interrupt_out] [get_bd_pins role_intr_concat/In1]
-  connect_bd_net -net xdma_rp_interrupt_out_msi_vec0to31 [get_bd_pins xdma_rp/interrupt_out_msi_vec0to31] [get_bd_pins role_intr_concat/In2]
-  connect_bd_net -net xdma_rp_interrupt_out_msi_vec32to63 [get_bd_pins xdma_rp/interrupt_out_msi_vec32to63] [get_bd_pins role_intr_concat/In3]
+  connect_bd_net -net proxy_interrupt_out [get_bd_pins virtual_pcie_switch_proxy_0/interrupt_out] [get_bd_pins role_intr_concat/In1]
   
   connect_bd_net [get_bd_pins const_gnd/dout] \
+    [get_bd_pins role_intr_concat/In2] \
+    [get_bd_pins role_intr_concat/In3] \
     [get_bd_pins role_intr_concat/In4] \
     [get_bd_pins role_intr_concat/In5] \
     [get_bd_pins role_intr_concat/In6] \
@@ -1023,10 +891,10 @@ proc create_root_design { parentCell } {
   create_bd_addr_seg -range 0x1000 -offset 0x10011000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs host_uart/S_AXI/Reg] PCIE_EP_BAR_HOST_UART
   create_bd_addr_seg -range 0x100000 -offset 0x10100000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs u_role/s_axi_ctrl/reg0] PCIE_EP_BAR_ROLE_CTRL
   
-  # [新增] QEMU 宿主机访问的 Mailbox 和 VCONF BRAM 地址映射
-  create_bd_addr_seg -range 0x1000 -offset 0x11000000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs axilite_active_proxy_0/s_mbx_axi/reg0] HOST_MBX_REG
+  # QEMU host-side mailbox and 16KB compact ECAM shadow BRAM.
+  create_bd_addr_seg -range 0x1000 -offset 0x11000000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs virtual_pcie_switch_proxy_0/s_mbx_axi/reg0] HOST_MBX_REG
   create_bd_addr_seg -range 0x1000 -offset 0x11001000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs sqe_write_done_monitor_0/s_cfg_axi/reg0] HOST_SQE_MONITOR_CFG
-  create_bd_addr_seg -range 0x1000 -offset 0x11010000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs vconf_bram_ctrl_b/S_AXI/Mem0] HOST_VCONF_BRAM
+  create_bd_addr_seg -range 0x4000 -offset 0x11010000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs vconf_bram_ctrl_b/S_AXI/Mem0] HOST_ECAM_SHADOW_BRAM
   
   create_bd_addr_seg -range 0x100000000 -offset 0x0 [get_bd_addr_spaces xdma_ep/M_AXI_BYPASS] [get_bd_addr_segs ddr4_mig/C0_DDR4_MEMORY_MAP/C0_DDR4_ADDRESS_BLOCK] PCIE_EP_BYPASS_RAW_DDR
   # The alias bridge is an RTL address-transforming bridge, not a BD address-transparent interconnect.
@@ -1042,17 +910,16 @@ proc create_root_design { parentCell } {
     [get_bd_addr_segs u_role/s_axi_dma/reg0] \
     PCIE_ALIAS_BRIDGE_ROLE_DMA
 
+  create_bd_addr_seg -range 0x4000 -offset 0x0 \
+    [get_bd_addr_spaces virtual_pcie_switch_proxy_0/m_ecam_shadow_axi] \
+    [get_bd_addr_segs vconf_bram_ctrl_a/S_AXI/Mem0] \
+    VPCIE_ECAM_SHADOW_READ
+
   ## Role address space
   create_bd_addr_seg -range 0x10000 -offset 0x10000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs bootrom_bram_ctrl/S_AXI/Mem0] ROLE_BOOTROM
-  create_bd_addr_seg -range 0x00100000 -offset 0x50000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs axilite_active_proxy_0/s_bar_axi/reg0] PCIE_RP_S_BAR
-  
-  # [修改] 香山 DUT 经由 Proxy 访问的透传段和虚拟配置空间段
-  create_bd_addr_seg -range 0x00800000 -offset 0x60000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs axilite_active_proxy_0/s_axi/reg0] TRACE_RP_REG
-  create_bd_addr_seg -range 0x00800000 -offset 0x60000000 [get_bd_addr_spaces axilite_active_proxy_0/m_axi] [get_bd_addr_segs xdma_rp/S_AXI_LITE/CTL0] PCIE_RP_S_LITE
-  create_bd_addr_seg -range 0x00100000 -offset 0x50000000 [get_bd_addr_spaces axilite_active_proxy_0/m_bar_axi] [get_bd_addr_segs xdma_rp/S_AXI_B/BAR0] PROXY_RP_S_BAR
-  create_bd_addr_seg -range 0x1000 -offset 0x0 [get_bd_addr_spaces axilite_active_proxy_0/m_vconf_axi] [get_bd_addr_segs vconf_bram_ctrl_a/S_AXI/Mem0] DUT_VCONF_BRAM
-  
-  create_bd_addr_seg -range 0x000080000000 -offset 0x80000000 [get_bd_addr_spaces xdma_rp/M_AXI_B] [get_bd_addr_segs u_role/s_axi_dma/reg0] PCIE_RP_DMA
+  create_bd_addr_seg -range 0x01000000 -offset 0x50000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs virtual_pcie_switch_proxy_0/s_mmio_axi/reg0] VPCIE_MMIO_WINDOW
+  create_bd_addr_seg -range 0x01000000 -offset 0x60000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs virtual_pcie_switch_proxy_0/s_ecam_axi/reg0] VPCIE_ECAM_WINDOW
+
   create_bd_addr_seg -range 0x10000 -offset 0x30000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs role_uart/S_AXI/Reg] ROLE_UART
   # The SQE monitor is an RTL pass-through, not a BD address-transparent interconnect.
   # Model the role DDR path as two address segments: role -> monitor slave, then

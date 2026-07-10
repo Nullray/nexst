@@ -10,11 +10,6 @@ create_clock -period 10.000 -name pcie_ep_ref_clk -waveform {0.000 5.000} [get_p
 
 set_property PACKAGE_PIN AR15 [get_ports {pcie_ep_gt_ref_clk_clk_p[0]}]
 
-# PCIe RP GT reference clock
-create_clock -period 10.000 -name pcie_rp_ref_clk -waveform {0.000 5.000} [get_ports pcie_rp_gt_ref_clk_clk_p]
-
-set_property PACKAGE_PIN AK42 [get_ports {pcie_rp_gt_ref_clk_clk_p[0]}]
-
 # PL DDR reference clock
 create_clock -period 10.000 -name ddr4_mig_sys_clk -waveform {0.000 5.000} [get_ports ddr4_mig_sys_clk_clk_p]
 
@@ -27,11 +22,6 @@ set_property PACKAGE_PIN BJ42 [get_ports ddr4_mig_sys_clk_clk_n]
 # PCIe EP perstn physical location
 set_property PACKAGE_PIN BF5 [get_ports pcie_ep_perstn]
 set_property IOSTANDARD LVCMOS18 [get_ports pcie_ep_perstn]
-
-# PCIe RP perstn physical location
-# NM37 M.2
-set_property PACKAGE_PIN J16 [get_ports {pcie_rp_perstn[0]}]
-set_property IOSTANDARD LVCMOS18 [get_ports {pcie_rp_perstn[0]}]
 
 # DDR
 set_property PACKAGE_PIN BP44 [get_ports c0_ddr4_act_n]
@@ -156,34 +146,6 @@ set_property PACKAGE_PIN BF41 [get_ports {c0_ddr4_odt[0]}]
 set_property PACKAGE_PIN BH45 [get_ports {c0_ddr4_odt[1]}]
 set_property PACKAGE_PIN BL47 [get_ports c0_ddr4_reset_n]
 
-#create_debug_core u_ila_0 ila
-#set_property ALL_PROBE_SAME_MU true [get_debug_cores u_ila_0]
-#set_property ALL_PROBE_SAME_MU_CNT 4 [get_debug_cores u_ila_0]
-#set_property C_ADV_TRIGGER true [get_debug_cores u_ila_0]
-#set_property C_DATA_DEPTH 4096 [get_debug_cores u_ila_0]
-#set_property C_EN_STRG_QUAL true [get_debug_cores u_ila_0]
-#set_property C_INPUT_PIPE_STAGES 0 [get_debug_cores u_ila_0]
-#set_property C_TRIGIN_EN false [get_debug_cores u_ila_0]
-#set_property C_TRIGOUT_EN false [get_debug_cores u_ila_0]
-#set_property port_width 1 [get_debug_ports u_ila_0/clk]
-#connect_debug_port u_ila_0/clk [get_nets [list xiangshan_i/xdma_rp/inst/pcie4c_ip_i/inst/xiangshan_xdma_rp_0_pcie4c_ip_gt_top_i/diablo_gt.diablo_gt_phy_wrapper/phy_clk_i/CLK_PCLK2_GT]]
-#set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe0]
-#set_property port_width 1 [get_debug_ports u_ila_0/probe0]
-#connect_debug_port u_ila_0/probe0 [get_nets [list xiangshan_i/xdma_rp/axi_ctl_aresetn]]
-#create_debug_core u_ila_1 ila
-#set_property ALL_PROBE_SAME_MU true [get_debug_cores u_ila_1]
-#set_property ALL_PROBE_SAME_MU_CNT 4 [get_debug_cores u_ila_1]
-#set_property C_ADV_TRIGGER true [get_debug_cores u_ila_1]
-#set_property C_DATA_DEPTH 4096 [get_debug_cores u_ila_1]
-#set_property C_EN_STRG_QUAL true [get_debug_cores u_ila_1]
-#set_property C_INPUT_PIPE_STAGES 0 [get_debug_cores u_ila_1]
-#set_property C_TRIGIN_EN false [get_debug_cores u_ila_1]
-#set_property C_TRIGOUT_EN false [get_debug_cores u_ila_1]
-#set_property port_width 1 [get_debug_ports u_ila_1/clk]
-#connect_debug_port u_ila_1/clk [get_nets [list xiangshan_i/xdma_rp/inst/pcie4c_ip_i/inst/xiangshan_xdma_rp_0_pcie4c_ip_gt_top_i/diablo_gt.diablo_gt_phy_wrapper/phy_clk_i/CLK_CORECLK]]
-#set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_1/probe0]
-#set_property port_width 1 [get_debug_ports u_ila_1/probe0]
-#connect_debug_port u_ila_1/probe0 [get_nets [list xiangshan_i/xdma_rp/inst/pcie4c_ip_i/user_lnk_up]]
 #set_property C_CLK_INPUT_FREQ_HZ 300000000 [get_debug_cores dbg_hub]
 #set_property C_ENABLE_CLK_DIVIDER false [get_debug_cores dbg_hub]
 #set_property C_USER_SCAN_CHAIN 1 [get_debug_cores dbg_hub]
