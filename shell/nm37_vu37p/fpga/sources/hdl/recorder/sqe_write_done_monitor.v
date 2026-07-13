@@ -110,12 +110,13 @@ module sqe_write_done_monitor #(
     localparam [31:0] AXIS_NOTIFY_TYPE_SQE_WRITE_DONE = 32'd5;
     localparam [31:0] AXIS_NOTIFY_LEN = 32'd32;
     localparam [1:0]  AXI_RESP_OKAY = 2'b00;
+    localparam MAX_BACKENDS = 13;
+    localparam [11:0] MON_REG_STATUS = 12'h3F0;
 
     localparam [11:0] MON_REG_ADMIN_SQ_BASE_LO = 12'h000;
     localparam [11:0] MON_REG_ADMIN_SQ_BASE_HI = 12'h004;
     localparam [11:0] MON_REG_ADMIN_SQ_BYTES   = 12'h008;
     localparam [11:0] MON_REG_ADMIN_SQ_CTRL    = 12'h00C;
-    localparam [11:0] MON_REG_STATUS           = 12'h010;
 
     localparam [AXIS_DATA_WIDTH/8-1:0] AXIS_PKT_KEEP =
         { {(AXIS_DATA_WIDTH/8-32){1'b0}}, 32'hFFFF_FFFF };
@@ -138,16 +139,19 @@ module sqe_write_done_monitor #(
         end
     endfunction
 
-    reg [31:0] admin_sq_base_lo;
-    reg [31:0] admin_sq_base_hi;
-    reg [31:0] admin_sq_bytes_reg;
-    reg [31:0] admin_sq_ctrl;
+    reg [31:0] admin_sq_base_lo [0:MAX_BACKENDS-1];
+    reg [31:0] admin_sq_base_hi [0:MAX_BACKENDS-1];
+    reg [31:0] admin_sq_bytes_reg [0:MAX_BACKENDS-1];
+    reg [31:0] admin_sq_ctrl [0:MAX_BACKENDS-1];
+    reg [7:0] config_generation [0:MAX_BACKENDS-1];
+    integer cfg_i;
 
     reg [FIFO_INDEX_WIDTH:0] meta_count;
     reg [FIFO_INDEX_WIDTH-1:0] meta_wr_ptr;
     reg [FIFO_INDEX_WIDTH-1:0] meta_rd_ptr;
     reg meta_hit_fifo [0:FIFO_DEPTH-1];
-    reg meta_generation_fifo [0:FIFO_DEPTH-1];
+    reg [7:0] meta_generation_fifo [0:FIFO_DEPTH-1];
+    reg [3:0] meta_backend_fifo [0:FIFO_DEPTH-1];
     reg [15:0] meta_first_slot_fifo [0:FIFO_DEPTH-1];
     reg [15:0] meta_last_slot_fifo  [0:FIFO_DEPTH-1];
     reg [ADDR_WIDTH-1:0] meta_first_addr_fifo [0:FIFO_DEPTH-1];
@@ -163,6 +167,7 @@ module sqe_write_done_monitor #(
     reg [31:0] job_bytes_fifo [0:FIFO_DEPTH-1];
     reg [1:0] job_bresp_fifo [0:FIFO_DEPTH-1];
     reg job_overflow_fifo [0:FIFO_DEPTH-1];
+    reg [3:0] job_backend_fifo [0:FIFO_DEPTH-1];
 
     reg        emit_active;
     reg [15:0] emit_slot;
@@ -171,20 +176,22 @@ module sqe_write_done_monitor #(
     reg [31:0] emit_bytes;
     reg [1:0]  emit_bresp;
     reg        emit_overflow;
+    reg [3:0]  emit_backend;
 
     reg [31:0] sqe_done_seq;
     reg        overflow_sticky;
-    reg        config_generation;
     reg        meta_desync;
     reg [15:0] outstanding_count;
 
-    wire [ADDR_WIDTH-1:0] admin_sq_base = {admin_sq_base_hi[3:0], admin_sq_base_lo};
-    wire [31:0] admin_sq_bytes = admin_sq_bytes_reg;
-    wire admin_sq_valid = admin_sq_ctrl[0];
-    wire monitor_enabled = admin_sq_valid && (admin_sq_bytes != 32'd0);
-
     wire cfg_wr_fire = s_cfg_axi_awvalid && s_cfg_axi_awready;
     wire cfg_rd_fire = s_cfg_axi_arvalid && s_cfg_axi_arready;
+    wire [3:0] cfg_index = s_cfg_axi_awaddr[8:5];
+    wire [3:0] cfg_read_index = s_cfg_axi_araddr[8:5];
+    wire cfg_index_valid = (cfg_index < MAX_BACKENDS);
+    wire cfg_read_index_valid = (cfg_read_index < MAX_BACKENDS);
+    wire [3:0] cfg_safe_index = cfg_index_valid ? cfg_index : 4'd0;
+    wire [4:0] cfg_field = s_cfg_axi_awaddr[4:0];
+    wire [4:0] cfg_read_field = s_cfg_axi_araddr[4:0];
 
     wire aw_fire = s_mon_axi_awvalid && s_mon_axi_awready;
     wire b_fire  = s_mon_axi_bvalid  && s_mon_axi_bready;
@@ -195,53 +202,71 @@ module sqe_write_done_monitor #(
     wire job_empty  = (job_count == {(FIFO_INDEX_WIDTH+1){1'b0}});
 
     wire [31:0] cfg_next_base_lo =
-        apply_wstrb32(admin_sq_base_lo, s_cfg_axi_wdata, s_cfg_axi_wstrb);
+        apply_wstrb32(admin_sq_base_lo[cfg_safe_index], s_cfg_axi_wdata, s_cfg_axi_wstrb);
     wire [31:0] cfg_next_base_hi =
-        apply_wstrb32(admin_sq_base_hi, s_cfg_axi_wdata, s_cfg_axi_wstrb);
+        apply_wstrb32(admin_sq_base_hi[cfg_safe_index], s_cfg_axi_wdata, s_cfg_axi_wstrb);
     wire [31:0] cfg_next_bytes =
-        apply_wstrb32(admin_sq_bytes_reg, s_cfg_axi_wdata, s_cfg_axi_wstrb);
+        apply_wstrb32(admin_sq_bytes_reg[cfg_safe_index], s_cfg_axi_wdata, s_cfg_axi_wstrb);
     wire [31:0] cfg_next_ctrl =
-        apply_wstrb32(admin_sq_ctrl, s_cfg_axi_wdata, s_cfg_axi_wstrb);
+        apply_wstrb32(admin_sq_ctrl[cfg_safe_index], s_cfg_axi_wdata, s_cfg_axi_wstrb);
 
-    wire cfg_wr_base_lo = cfg_wr_fire && (s_cfg_axi_awaddr[11:0] == MON_REG_ADMIN_SQ_BASE_LO);
-    wire cfg_wr_base_hi = cfg_wr_fire && (s_cfg_axi_awaddr[11:0] == MON_REG_ADMIN_SQ_BASE_HI);
-    wire cfg_wr_bytes   = cfg_wr_fire && (s_cfg_axi_awaddr[11:0] == MON_REG_ADMIN_SQ_BYTES);
-    wire cfg_wr_ctrl    = cfg_wr_fire && (s_cfg_axi_awaddr[11:0] == MON_REG_ADMIN_SQ_CTRL);
+    wire cfg_wr_base_lo = cfg_wr_fire && cfg_index_valid && (cfg_field == MON_REG_ADMIN_SQ_BASE_LO[4:0]);
+    wire cfg_wr_base_hi = cfg_wr_fire && cfg_index_valid && (cfg_field == MON_REG_ADMIN_SQ_BASE_HI[4:0]);
+    wire cfg_wr_bytes   = cfg_wr_fire && cfg_index_valid && (cfg_field == MON_REG_ADMIN_SQ_BYTES[4:0]);
+    wire cfg_wr_ctrl    = cfg_wr_fire && cfg_index_valid && (cfg_field == MON_REG_ADMIN_SQ_CTRL[4:0]);
 
     wire cfg_window_changed =
-        (cfg_wr_base_lo && (cfg_next_base_lo != admin_sq_base_lo)) ||
-        (cfg_wr_base_hi && (cfg_next_base_hi != admin_sq_base_hi)) ||
-        (cfg_wr_bytes   && (cfg_next_bytes   != admin_sq_bytes_reg)) ||
-        (cfg_wr_ctrl    && (cfg_next_ctrl    != admin_sq_ctrl));
+        (cfg_wr_base_lo && (cfg_next_base_lo != admin_sq_base_lo[cfg_safe_index])) ||
+        (cfg_wr_base_hi && (cfg_next_base_hi != admin_sq_base_hi[cfg_safe_index])) ||
+        (cfg_wr_bytes   && (cfg_next_bytes   != admin_sq_bytes_reg[cfg_safe_index])) ||
+        (cfg_wr_ctrl    && (cfg_next_ctrl    != admin_sq_ctrl[cfg_safe_index]));
 
     wire [31:0] aw_bytes = ({24'd0, s_mon_axi_awlen} + 32'd1) << s_mon_axi_awsize;
 
-    wire [ADDR_WIDTH:0] aw_start_ext = {1'b0, s_mon_axi_awaddr};
-    wire [ADDR_WIDTH:0] aw_end_ext   = aw_start_ext + {1'b0, aw_bytes};
-    wire [ADDR_WIDTH:0] sq_start_ext = {1'b0, admin_sq_base};
-    wire [ADDR_WIDTH:0] sq_end_ext   = sq_start_ext + {1'b0, admin_sq_bytes};
-
-    wire aw_hit_sq = monitor_enabled &&
-                     (aw_start_ext < sq_end_ext) &&
-                     (aw_end_ext   > sq_start_ext);
-
-    wire [ADDR_WIDTH:0] overlap_start_ext =
-        (aw_start_ext < sq_start_ext) ? sq_start_ext : aw_start_ext;
-
-    wire [ADDR_WIDTH:0] overlap_end_ext =
-        (aw_end_ext > sq_end_ext) ? sq_end_ext : aw_end_ext;
-
-    wire [ADDR_WIDTH-1:0] overlap_start_addr = overlap_start_ext[ADDR_WIDTH-1:0];
-    wire [ADDR_WIDTH:0] overlap_end_minus1_ext =
-        overlap_end_ext - {{ADDR_WIDTH{1'b0}}, 1'b1};
-    wire [ADDR_WIDTH-1:0] overlap_end_minus1_addr =
-        overlap_end_minus1_ext[ADDR_WIDTH-1:0];
-
-    wire [ADDR_WIDTH-1:0] first_slot_delta = overlap_start_addr - admin_sq_base;
-    wire [ADDR_WIDTH-1:0] last_slot_delta  = overlap_end_minus1_addr - admin_sq_base;
-
-    wire [15:0] aw_first_slot = first_slot_delta[21:6];
-    wire [15:0] aw_last_slot  = last_slot_delta[21:6];
+    reg aw_hit_sq;
+    reg aw_multi_hit;
+    reg [3:0] aw_backend;
+    reg [15:0] aw_first_slot;
+    reg [15:0] aw_last_slot;
+    reg [ADDR_WIDTH-1:0] overlap_start_addr;
+    reg [31:0] overlap_bytes;
+    reg [ADDR_WIDTH:0] match_aw_start, match_aw_end, match_sq_start, match_sq_end;
+    reg [ADDR_WIDTH:0] match_overlap_start, match_overlap_end;
+    integer match_i;
+    always @* begin
+        aw_hit_sq = 1'b0;
+        aw_multi_hit = 1'b0;
+        aw_backend = 4'd0;
+        aw_first_slot = 16'd0;
+        aw_last_slot = 16'd0;
+        overlap_start_addr = {ADDR_WIDTH{1'b0}};
+        overlap_bytes = 32'd0;
+        match_aw_start = {1'b0, s_mon_axi_awaddr};
+        match_aw_end = match_aw_start + {1'b0, aw_bytes};
+        match_sq_start = {(ADDR_WIDTH+1){1'b0}};
+        match_sq_end = {(ADDR_WIDTH+1){1'b0}};
+        match_overlap_start = {(ADDR_WIDTH+1){1'b0}};
+        match_overlap_end = {(ADDR_WIDTH+1){1'b0}};
+        for (match_i = 0; match_i < MAX_BACKENDS; match_i = match_i + 1) begin
+            match_sq_start = {1'b0, admin_sq_base_hi[match_i][3:0], admin_sq_base_lo[match_i]};
+            match_sq_end = match_sq_start + {1'b0, admin_sq_bytes_reg[match_i]};
+            if (admin_sq_ctrl[match_i][0] && (admin_sq_bytes_reg[match_i] != 0) &&
+                (match_aw_start < match_sq_end) && (match_aw_end > match_sq_start)) begin
+                if (aw_hit_sq) begin
+                    aw_multi_hit = 1'b1;
+                end else begin
+                    aw_hit_sq = 1'b1;
+                    aw_backend = match_i[3:0];
+                    match_overlap_start = (match_aw_start < match_sq_start) ? match_sq_start : match_aw_start;
+                    match_overlap_end = (match_aw_end > match_sq_end) ? match_sq_end : match_aw_end;
+                    overlap_start_addr = match_overlap_start[ADDR_WIDTH-1:0];
+                    overlap_bytes = match_overlap_end - match_overlap_start;
+                    aw_first_slot = ((match_overlap_start - match_sq_start) >> 6);
+                    aw_last_slot = (((match_overlap_end - 1'b1) - match_sq_start) >> 6);
+                end
+            end
+        end
+    end
 
     wire meta_pop = b_fire && !meta_empty && !meta_desync;
     wire meta_push_space = !meta_full || meta_pop;
@@ -249,20 +274,21 @@ module sqe_write_done_monitor #(
     wire meta_overflow = aw_fire && !meta_desync && !meta_push_space;
 
     wire meta_pop_hit = meta_hit_fifo[meta_rd_ptr];
-    wire meta_pop_generation = meta_generation_fifo[meta_rd_ptr];
+    wire [7:0] meta_pop_generation = meta_generation_fifo[meta_rd_ptr];
+    wire [3:0] meta_pop_backend = meta_backend_fifo[meta_rd_ptr];
     wire [15:0] meta_pop_first_slot = meta_first_slot_fifo[meta_rd_ptr];
     wire [15:0] meta_pop_last_slot  = meta_last_slot_fifo[meta_rd_ptr];
     wire [ADDR_WIDTH-1:0] meta_pop_first_addr = meta_first_addr_fifo[meta_rd_ptr];
     wire [31:0] meta_pop_bytes = meta_bytes_fifo[meta_rd_ptr];
 
-    wire meta_pop_current_generation = (meta_pop_generation == config_generation);
+    wire meta_pop_current_generation =
+        (meta_pop_generation == config_generation[meta_pop_backend]);
 
     wire axis_can_advance = !m_axis_c2h_tvalid || m_axis_c2h_tready;
     wire job_load = axis_can_advance && !emit_active && !job_empty;
     wire job_push_space = !job_full || job_load;
 
-    wire job_candidate = !cfg_window_changed &&
-                         !meta_desync &&
+    wire job_candidate = !meta_desync &&
                          meta_pop &&
                          meta_pop_hit &&
                          meta_pop_current_generation;
@@ -282,23 +308,33 @@ module sqe_write_done_monitor #(
     wire [ADDR_WIDTH-1:0] pkt_addr =
         pkt_from_emit ? emit_addr : job_first_addr_fifo[job_rd_ptr];
 
-    wire [31:0] pkt_bytes =
+    wire [31:0] pkt_remaining =
         pkt_from_emit ? emit_bytes : job_bytes_fifo[job_rd_ptr];
+
+    wire [31:0] pkt_slot_capacity =
+        32'd64 - {26'd0, pkt_addr[5:0]};
+
+    wire [31:0] pkt_bytes =
+        (pkt_remaining < pkt_slot_capacity) ? pkt_remaining : pkt_slot_capacity;
 
     wire [1:0] pkt_bresp =
         pkt_from_emit ? emit_bresp : job_bresp_fifo[job_rd_ptr];
 
     wire pkt_overflow =
         pkt_from_emit ? emit_overflow : job_overflow_fifo[job_rd_ptr];
+    wire [3:0] pkt_backend =
+        pkt_from_emit ? emit_backend : job_backend_fifo[job_rd_ptr];
 
     wire pkt_emit = axis_can_advance && (emit_active || job_load);
 
     wire [31:0] pkt_seq = sqe_done_seq + 32'd1;
     wire [31:0] pkt_flags =
-        {pkt_overflow | overflow_sticky, 5'd0, pkt_bresp, 8'd0, pkt_slot};
+        {pkt_overflow | overflow_sticky, 1'd0, pkt_backend, pkt_bresp, 8'd0, pkt_slot};
 
     wire [ADDR_WIDTH-1:0] pkt_next_addr =
-        pkt_addr + {{(ADDR_WIDTH-7){1'b0}}, 7'd64};
+        pkt_addr + {{(ADDR_WIDTH-32){1'b0}}, pkt_bytes};
+
+    wire [31:0] pkt_next_remaining = pkt_remaining - pkt_bytes;
 
     wire outstanding_inc_only = aw_fire && !b_fire;
     wire outstanding_dec_only = b_fire && !aw_fire;
@@ -367,10 +403,13 @@ module sqe_write_done_monitor #(
             s_cfg_axi_bvalid <= 1'b0;
             s_cfg_axi_bresp  <= AXI_RESP_OKAY;
 
-            admin_sq_base_lo   <= 32'd0;
-            admin_sq_base_hi   <= 32'd0;
-            admin_sq_bytes_reg <= 32'd0;
-            admin_sq_ctrl      <= 32'd0;
+            for (cfg_i = 0; cfg_i < MAX_BACKENDS; cfg_i = cfg_i + 1) begin
+                admin_sq_base_lo[cfg_i] <= 32'd0;
+                admin_sq_base_hi[cfg_i] <= 32'd0;
+                admin_sq_bytes_reg[cfg_i] <= 32'd0;
+                admin_sq_ctrl[cfg_i] <= 32'd0;
+                config_generation[cfg_i] <= 8'd0;
+            end
 
             meta_count  <= {(FIFO_INDEX_WIDTH+1){1'b0}};
             meta_wr_ptr <= {FIFO_INDEX_WIDTH{1'b0}};
@@ -387,10 +426,10 @@ module sqe_write_done_monitor #(
             emit_bytes    <= 32'd0;
             emit_bresp    <= AXI_RESP_OKAY;
             emit_overflow <= 1'b0;
+            emit_backend  <= 4'd0;
 
             sqe_done_seq      <= 32'd0;
             overflow_sticky   <= 1'b0;
-            config_generation <= 1'b0;
             meta_desync       <= 1'b0;
             outstanding_count <= 16'd0;
 
@@ -405,25 +444,18 @@ module sqe_write_done_monitor #(
             if (cfg_rd_fire) begin
                 s_cfg_axi_rvalid <= 1'b1;
                 s_cfg_axi_rresp  <= AXI_RESP_OKAY;
-                case (s_cfg_axi_araddr[11:0])
-                    MON_REG_ADMIN_SQ_BASE_LO:
-                        s_cfg_axi_rdata <= admin_sq_base_lo;
-                    MON_REG_ADMIN_SQ_BASE_HI:
-                        s_cfg_axi_rdata <= admin_sq_base_hi;
-                    MON_REG_ADMIN_SQ_BYTES:
-                        s_cfg_axi_rdata <= admin_sq_bytes_reg;
-                    MON_REG_ADMIN_SQ_CTRL:
-                        s_cfg_axi_rdata <= admin_sq_ctrl;
-                    MON_REG_STATUS:
-                        s_cfg_axi_rdata <= {22'd0,
-                                            meta_desync,
-                                            config_generation,
-                                            meta_count[5:0],
-                                            job_full,
-                                            overflow_sticky};
-                    default:
-                        s_cfg_axi_rdata <= 32'd0;
-                endcase
+                if (s_cfg_axi_araddr[11:0] == MON_REG_STATUS)
+                    s_cfg_axi_rdata <= {23'd0, meta_desync, meta_count[5:0],
+                                         job_full, overflow_sticky};
+                else if (cfg_read_index_valid) begin
+                    case (cfg_read_field)
+                    MON_REG_ADMIN_SQ_BASE_LO[4:0]: s_cfg_axi_rdata <= admin_sq_base_lo[cfg_read_index];
+                    MON_REG_ADMIN_SQ_BASE_HI[4:0]: s_cfg_axi_rdata <= admin_sq_base_hi[cfg_read_index];
+                    MON_REG_ADMIN_SQ_BYTES[4:0]: s_cfg_axi_rdata <= admin_sq_bytes_reg[cfg_read_index];
+                    MON_REG_ADMIN_SQ_CTRL[4:0]: s_cfg_axi_rdata <= admin_sq_ctrl[cfg_read_index];
+                    default: s_cfg_axi_rdata <= 32'd0;
+                    endcase
+                end else s_cfg_axi_rdata <= 32'd0;
             end else if (s_cfg_axi_rready && s_cfg_axi_rvalid) begin
                 s_cfg_axi_rvalid <= 1'b0;
             end
@@ -435,27 +467,21 @@ module sqe_write_done_monitor #(
                 s_cfg_axi_bvalid <= 1'b1;
                 s_cfg_axi_bresp  <= AXI_RESP_OKAY;
 
-                case (s_cfg_axi_awaddr[11:0])
-                    MON_REG_ADMIN_SQ_BASE_LO:
-                        admin_sq_base_lo <= cfg_next_base_lo;
-                    MON_REG_ADMIN_SQ_BASE_HI:
-                        admin_sq_base_hi <= cfg_next_base_hi;
-                    MON_REG_ADMIN_SQ_BYTES:
-                        admin_sq_bytes_reg <= cfg_next_bytes;
-                    MON_REG_ADMIN_SQ_CTRL:
-                        admin_sq_ctrl <= cfg_next_ctrl;
-                    MON_REG_STATUS: begin
-                        if (s_cfg_axi_wstrb[0] && s_cfg_axi_wdata[0]) begin
-                            overflow_sticky <= 1'b0;
-                        end
-                    end
-                    default: begin
-                    end
-                endcase
-
-                if (cfg_window_changed) begin
-                    config_generation <= !config_generation;
+                if (s_cfg_axi_awaddr[11:0] == MON_REG_STATUS) begin
+                    if (s_cfg_axi_wstrb[0] && s_cfg_axi_wdata[0])
+                        overflow_sticky <= 1'b0;
+                end else if (cfg_index_valid) begin
+                    case (cfg_field)
+                    MON_REG_ADMIN_SQ_BASE_LO[4:0]: admin_sq_base_lo[cfg_index] <= cfg_next_base_lo;
+                    MON_REG_ADMIN_SQ_BASE_HI[4:0]: admin_sq_base_hi[cfg_index] <= cfg_next_base_hi;
+                    MON_REG_ADMIN_SQ_BYTES[4:0]: admin_sq_bytes_reg[cfg_index] <= cfg_next_bytes;
+                    MON_REG_ADMIN_SQ_CTRL[4:0]: admin_sq_ctrl[cfg_index] <= cfg_next_ctrl;
+                    default: begin end
+                    endcase
                 end
+
+                if (cfg_window_changed)
+                    config_generation[cfg_index] <= config_generation[cfg_index] + 1'b1;
             end else if (s_cfg_axi_bready && s_cfg_axi_bvalid) begin
                 s_cfg_axi_bvalid <= 1'b0;
             end
@@ -468,6 +494,8 @@ module sqe_write_done_monitor #(
             if (outstanding_overflow || outstanding_underflow) begin
                 overflow_sticky <= 1'b1;
             end
+            if (aw_fire && aw_multi_hit)
+                overflow_sticky <= 1'b1;
 
             // ----------------------------------------------------------------
             // Metadata FIFO and overflow/desync handling.
@@ -493,11 +521,12 @@ module sqe_write_done_monitor #(
                 // as miss entries so B responses stay aligned with AW order.
                 if (meta_push) begin
                     meta_hit_fifo[meta_wr_ptr]        <= aw_hit_sq;
-                    meta_generation_fifo[meta_wr_ptr] <= config_generation;
+                    meta_generation_fifo[meta_wr_ptr] <= config_generation[aw_backend];
+                    meta_backend_fifo[meta_wr_ptr]    <= aw_backend;
                     meta_first_slot_fifo[meta_wr_ptr] <= aw_first_slot;
                     meta_last_slot_fifo[meta_wr_ptr]  <= aw_last_slot;
                     meta_first_addr_fifo[meta_wr_ptr] <= overlap_start_addr;
-                    meta_bytes_fifo[meta_wr_ptr]      <= aw_bytes;
+                    meta_bytes_fifo[meta_wr_ptr]      <= overlap_bytes;
                     meta_wr_ptr <= meta_wr_ptr + {{(FIFO_INDEX_WIDTH-1){1'b0}}, 1'b1};
                 end
 
@@ -522,17 +551,7 @@ module sqe_write_done_monitor #(
             // A job can cover multiple slots; the AXIS emitter expands it into
             // one SQE_WRITE_DONE packet per slot.
             // ----------------------------------------------------------------
-            if (cfg_window_changed) begin
-                job_count  <= {(FIFO_INDEX_WIDTH+1){1'b0}};
-                job_wr_ptr <= {FIFO_INDEX_WIDTH{1'b0}};
-                job_rd_ptr <= {FIFO_INDEX_WIDTH{1'b0}};
-                emit_active <= 1'b0;
-                m_axis_c2h_tvalid <= 1'b0;
-                m_axis_c2h_tlast  <= 1'b0;
-                m_axis_c2h_tkeep  <= {AXIS_DATA_WIDTH/8{1'b0}};
-                m_axis_c2h_tdata  <= {AXIS_DATA_WIDTH{1'b0}};
-                overflow_sticky <= 1'b0;
-            end else begin
+            begin
                 if (job_push) begin
                     job_first_slot_fifo[job_wr_ptr] <= meta_pop_first_slot;
                     job_last_slot_fifo[job_wr_ptr]  <= meta_pop_last_slot;
@@ -540,6 +559,7 @@ module sqe_write_done_monitor #(
                     job_bytes_fifo[job_wr_ptr]      <= meta_pop_bytes;
                     job_bresp_fifo[job_wr_ptr]      <= s_mon_axi_bresp;
                     job_overflow_fifo[job_wr_ptr]   <= overflow_sticky;
+                    job_backend_fifo[job_wr_ptr]    <= meta_pop_backend;
                     job_wr_ptr <= job_wr_ptr + {{(FIFO_INDEX_WIDTH-1){1'b0}}, 1'b1};
                 end
 
@@ -574,14 +594,15 @@ module sqe_write_done_monitor #(
 
                     sqe_done_seq <= pkt_seq;
 
-                    if (pkt_slot != pkt_last_slot) begin
+                    if (pkt_next_remaining != 32'd0) begin
                         emit_active    <= 1'b1;
                         emit_slot      <= pkt_slot + 16'd1;
                         emit_last_slot <= pkt_last_slot;
                         emit_addr      <= pkt_next_addr;
-                        emit_bytes     <= pkt_bytes;
+                        emit_bytes     <= pkt_next_remaining;
                         emit_bresp     <= pkt_bresp;
                         emit_overflow  <= pkt_overflow | overflow_sticky;
+                        emit_backend   <= pkt_backend;
                     end else begin
                         emit_active <= 1'b0;
                     end

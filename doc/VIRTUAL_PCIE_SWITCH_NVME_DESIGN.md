@@ -1,10 +1,10 @@
-# 虚拟 PCIe Switch 下挂单 NVMe 的实现方案
+# 虚拟 PCIe Switch 下挂 0 至 13 个 NVMe 的实现方案
 
 ## 1. 目标
 
 当前系统原先依赖 FPGA 中的 DUT-facing XDMA Root Port IP，让香山 Linux 通过 `xlnx,xdma-host-3.00` PCI host bridge 枚举下游设备。这个路径和当前 proxy 状态机基本假设 XDMA RP 下只有一个被代理设备。
 
-仓库 13 的新目标是：**不再依赖真实 DUT-facing XDMA RP 硬件**，而是在香山侧实现一个由 FPGA/QEMU 共同维护的虚拟 PCIe 层次结构。第一阶段只模拟一个 switch 下挂一个 NVMe：
+仓库 13 的目标是：**不再依赖真实 DUT-facing XDMA RP 硬件**，而是在香山侧实现一个由 FPGA/QEMU 共同维护的虚拟 PCIe 层次结构。下面先用只启用一个 backend 的最小拓扑解释基本机制；第 11 节描述当前 `0..13` 个 NVMe 的实现：
 
 ```text
 PCI host bridge
@@ -64,7 +64,7 @@ Capability list: NVMe endpoint 由 QEMU PCI core 初始化
 如果这些规则放进 FPGA，会很快变成一个不完整的 PCI config emulator。仓库 13 当前采用：
 
 ```text
-QEMU 初始化并维护 4 个 BDF 的 16KB compact ECAM shadow
+单 backend 基线由 QEMU 初始化并维护 4 个 BDF 的 compact ECAM shadow
 FPGA ECAM read 直接读 shadow BRAM
 FPGA ECAM write 发 CFG_WRITE packet 并等待 QEMU ACK
 QEMU 用 bridge wmask/w1cmask helper 或 pci_default_write_config() 更新 shadow
@@ -142,7 +142,7 @@ host bypass/coherent alias
 
 ### 4.2 Compact ECAM Shadow BRAM
 
-不实现完整 16MB/256MB ECAM RAM。第一阶段只保存 4 个 function，每个 4KB：
+不实现完整 16MB/256MB ECAM RAM。单 backend 基线保存 4 个 function，每个 4KB：
 
 ```text
 shadow offset 0x0000 -> 00:00.0 Root Port
@@ -151,7 +151,7 @@ shadow offset 0x2000 -> 02:01.0 Switch Downstream Port
 shadow offset 0x3000 -> 03:00.0 NVMe endpoint
 ```
 
-因此 BRAM 只需要 16KB。FPGA 的 BDF 映射逻辑是固定表：
+在当前多 backend 实现中，这张表扩为公式化的 28 个 slot，并使用 128KB aperture；单 backend 时前 4 个有效 slot 为：
 
 ```text
 00:00.0 -> slot 0
@@ -266,6 +266,11 @@ guest 写 CQ doorbell
 
 Device Tree 中必须通过 `interrupt-map` 把 PCI INTA# 映射到 PLIC。单 NVMe 阶段可以把 INTA/B/C/D 都映射到同一个 PLIC interrupt，后续多设备再做 INTx swizzle 或拆分中断。
 
+多 backend 使用一根 aggregate level INTx。QEMU 每次重新计算所有 backend 的
+pending CQ，只有全部设备都没有 pending completion 时才拉低。历史上的
+clear/assert retry pulse 仍可通过 `intx-retry-pulse=on` 临时启用，但默认关闭；
+正常运行只使用标准 level 语义，避免一个设备的重试脉冲短暂撤销其他设备的中断。
+
 ## 5. Vivado Block Design
 
 `shell/nm37_vu37p/fpga/scripts/xiangshan.tcl` 的核心改动：
@@ -290,10 +295,24 @@ vconf_bram_ctrl_b/S_AXI <- host/QEMU via xdma_ep/M_AXI_LITE
 ```text
 HOST_MBX_REG          0x11000000, range 0x1000
 HOST_SQE_MONITOR_CFG  0x11001000, range 0x1000
-HOST_ECAM_SHADOW_BRAM 0x11010000, range 0x4000
+HOST_ECAM_SHADOW_BRAM 0x11010000, range 0x20000
 ```
 
 5. `virtual_pcie_switch_proxy_0/m_axis_c2h` 接入原 C2H 合流路径，继续和 `sqe_write_done_monitor` 共用 DMA32 packet ring。
+
+BAR route 冲突诊断位于 proxy mailbox：
+
+```text
+0x060 ROUTE_ERROR_STATUS
+      bit0    sticky，写 1 清除
+      bits2:1 最近一次命中的 route 数量
+0x064 ROUTE_ERROR_COUNT
+0x068 ROUTE_ERROR_ADDR_LO
+0x06c ROUTE_ERROR_ADDR_HI
+```
+
+当同一个 MMIO 地址同时命中多个有效 route 时，FPGA 返回 `SLVERR`，同时记录
+冲突次数和最后地址。未命中仍保持 read 返回全 1、write no-op 的既有语义。
 
 ## 6. QEMU 软件结构
 
@@ -363,7 +382,7 @@ pci_default_write_config()
 QEMU realize 阶段：
 
 ```text
-打开 XDMA user/control/event/bypass
+打开 XDMA user/control/bypass
 初始化真实 NVMe BAR 和能力缓存
 初始化 QEMU PCIDevice 的 NVMe config
 初始化 3 个 bridge shadow slot + 1 个 NVMe shadow slot
@@ -372,10 +391,14 @@ readback fence 确认 shadow 写入已到 FPGA
 写 PROXY_CTRL_ECAM_SHADOW_READY
 同步 NVMe BAR0 route mailbox
 写 PROXY_CTRL_BAR_ROUTE_READY
-启动 DMA32 RX thread 和 event handler
+启动 DMA32 RX thread
 ```
 
 这样香山开始枚举时，ECAM read 可以直接从 FPGA BRAM 返回 QEMU 准备好的配置空间。
+vSwitch 不再注册 `/dev/xdma*_events_0` 的旧配置回调：该 user IRQ 在当前
+Block Design 中来自 `host_uart/interrupt`，并不是 ECAM 配置事件。ECAM write
+唯一的权威控制路径是 `CFG_WRITE DMA32 packet -> QEMU 更新 shadow -> ACK seq`。
+`xdma-event-dev` 属性仅为兼容已有启动命令而保留，当前不会打开或消费该节点。
 
 ### 6.3 CFG_WRITE 处理流程
 
@@ -481,7 +504,7 @@ pcie_virtual: pcie@60000000 {
 香山侧 PCI MEM:     0x50000000, 16MB
 host mailbox:       0x11000000, 4KB
 host SQE monitor:   0x11001000, 4KB
-host ECAM shadow:   0x11010000, 16KB
+host ECAM shadow:   0x11010000, 128KB
 ```
 
 ## 9. 分阶段验证
@@ -581,17 +604,61 @@ QEMU 路径应继续使用 coherent alias、PRP/PRP list 翻译、SQE monitor �
 
 ## 11. 当前实现边界
 
-当前仓库 13 实现的是：
+当前仓库 13 实现的是启动时可配置的 `0..13` NVMe vSwitch：
 
 ```text
 generic ECAM host bridge
-固定 4 BDF 虚拟 switch 拓扑
-QEMU 维护 16KB compact ECAM shadow
+00:00.0 Root Port
+01:00.0 Switch Upstream Port
+02:(1+i).0 Downstream Port -> (03+i):00.0 NVMe i, i=0..12
+QEMU 维护 28 x 4KB compact ECAM shadow，BRAM aperture 为 128KB
 FPGA ECAM read 读 BRAM
 FPGA ECAM write 发 CFG_WRITE 并等 QEMU ACK
-单 NVMe endpoint BAR0 后端复用现有 NVMe proxy
-INTx level 中断
+每个 endpoint 独立 BAR0 route、NVMe register/queue/PRP/CQ 状态
+13 项 SQE monitor window，SQE_WRITE_DONE packet 携带 backend_id
+所有 endpoint 共用一根 aggregate INTx level 中断
 ```
+
+QEMU 使用 `backend-config=/path/to/vswitch-nvme.json` 指定真实设备。数组顺序
+就是 `backend_id` 和虚拟端口顺序；空数组是合法的 switch-only 模式。兼容的
+单设备入口仍为 `real-host-bdf=0000:xx:yy.z`，但不能和 `backend-config` 同时使用。
+
+```json
+{
+  "version": 1,
+  "devices": [
+    { "real-host-bdf": "0000:af:00.0" },
+    { "real-host-bdf": "0000:b0:00.0" }
+  ]
+}
+```
+
+DMA32 ring 默认扩为 64KB，可通过 `dma32-ring-size` 覆盖。消费者保存物理 slot
+的 `type + seq` 和扫描 cursor，每轮只扫描固定数量 slot，避免 ring 扩大后高频
+全表轮询。manager 统一拥有 XDMA、shadow BRAM 和共享 INTx；真实 BAR、NVMe
+寄存器、namespace LBA shift、SQ/CQ、pending doorbell 和 CID 状态均属于各自
+backend，处理 packet 时必须先按 BDF 或 `backend_id` 选择 backend。
+
+### 11.1 多设备可靠性约束
+
+当前实现对多 backend 的共享软件路径增加以下约束：
+
+1. 每个 backend 保存 `admin_outstanding_count`。Admin CID bitmap 仍用于校验具体
+   CQE，但高频 CQ 轮询通过计数器 O(1) 判断是否存在命令，不再每轮扫描 65536 个 CID。
+2. Admin SQE 可见性检查执行两次立即 coherent-alias 读取。两次内容不一致、全零
+   或仍等于 seed 时返回 `WAIT`，由 RX 线程按 deadline 重新调度；读取函数内部不
+   sleep，因此单个设备不会阻塞其他设备的 DMA32 packet 消费。
+3. `sqe_write_done_monitor` 对 AXI write 与每个 64B SQE slot 分别求交集。每个
+   `SQE_WRITE_DONE` packet 的地址和 bytes 只覆盖当前 slot 的实际写入范围，支持
+   非对齐且跨多个 slot 的 burst，QEMU 据此准确累计 64-bit byte mask。
+4. monitor overflow 是全局诊断状态，只在 manager 启动时清除一次。重配某个
+   backend 的 Admin SQ window 不再擦除其他 backend 已产生的 overflow 证据。
+5. QEMU 退出或部分 backend 初始化失败时恢复各真实设备原来的 PCI Command。
+   控制器保持 disabled，因为恢复旧 `CC.EN` 会重新引用可能已经失效的 queue
+   地址；后续归还 host 驱动仍应走正常 reset/probe 流程。
+6. 单个 backend 执行 `CC.EN=0`、INT mask 或 CQ doorbell 更新时不能直接清共享
+   INTx。QEMU 先更新该 backend 状态，再重新 OR 全部 backend 的 pending 状态，
+   只有 aggregate pending 为零时才向 FPGA 写 level 0。
 
 当前不实现：
 
@@ -599,9 +666,9 @@ INTx level 中断
 真实 PCIe 链路训练 / TLP / DLLP
 完整 switch capability / AER / hotplug
 MSI/MSI-X
-动态增加 downstream port
 完整 16MB ECAM RAM
-多个 endpoint 同时转发
+运行时热插拔或改变 backend 数量
+每个 endpoint 独立 MSI/MSI-X
 ```
 
 这条路线比“仿 Xilinx XDMA RP 控制寄存器”更干净，也比“自己实现真实 PCIe RP/TLP/链路层”可控得多；后续增加 NIC 或多设备时，应继续扩展 QEMU config shadow 表和 packet BDF/BAR 路由，而不是把 PCI 配置语义重新搬回 FPGA。

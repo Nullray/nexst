@@ -891,10 +891,10 @@ proc create_root_design { parentCell } {
   create_bd_addr_seg -range 0x1000 -offset 0x10011000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs host_uart/S_AXI/Reg] PCIE_EP_BAR_HOST_UART
   create_bd_addr_seg -range 0x100000 -offset 0x10100000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs u_role/s_axi_ctrl/reg0] PCIE_EP_BAR_ROLE_CTRL
   
-  # QEMU host-side mailbox and 16KB compact ECAM shadow BRAM.
+  # QEMU host-side mailbox and 128KB compact ECAM shadow BRAM.
   create_bd_addr_seg -range 0x1000 -offset 0x11000000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs virtual_pcie_switch_proxy_0/s_mbx_axi/reg0] HOST_MBX_REG
   create_bd_addr_seg -range 0x1000 -offset 0x11001000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs sqe_write_done_monitor_0/s_cfg_axi/reg0] HOST_SQE_MONITOR_CFG
-  create_bd_addr_seg -range 0x4000 -offset 0x11010000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs vconf_bram_ctrl_b/S_AXI/Mem0] HOST_ECAM_SHADOW_BRAM
+  create_bd_addr_seg -range 0x20000 -offset 0x11010000 [get_bd_addr_spaces xdma_ep/M_AXI_LITE] [get_bd_addr_segs vconf_bram_ctrl_b/S_AXI/Mem0] HOST_ECAM_SHADOW_BRAM
   
   create_bd_addr_seg -range 0x100000000 -offset 0x0 [get_bd_addr_spaces xdma_ep/M_AXI_BYPASS] [get_bd_addr_segs ddr4_mig/C0_DDR4_MEMORY_MAP/C0_DDR4_ADDRESS_BLOCK] PCIE_EP_BYPASS_RAW_DDR
   # The alias bridge is an RTL address-transforming bridge, not a BD address-transparent interconnect.
@@ -910,7 +910,7 @@ proc create_root_design { parentCell } {
     [get_bd_addr_segs u_role/s_axi_dma/reg0] \
     PCIE_ALIAS_BRIDGE_ROLE_DMA
 
-  create_bd_addr_seg -range 0x4000 -offset 0x0 \
+  create_bd_addr_seg -range 0x20000 -offset 0x0 \
     [get_bd_addr_spaces virtual_pcie_switch_proxy_0/m_ecam_shadow_axi] \
     [get_bd_addr_segs vconf_bram_ctrl_a/S_AXI/Mem0] \
     VPCIE_ECAM_SHADOW_READ

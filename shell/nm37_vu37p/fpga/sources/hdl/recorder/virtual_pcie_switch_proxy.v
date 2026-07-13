@@ -117,10 +117,9 @@ localparam PKT_BAR_WRITE = 32'd2;
 localparam PKT_BAR_READ  = 32'd3;
 localparam PKT_BAR_WRITE_DONE = 32'd4;
 localparam PKT_LEN = 32'd32;
+localparam MAX_NVME = 13;
 localparam BDF_ROOT_PORT = 16'h0000;
 localparam BDF_SW_UP     = 16'h0100;
-localparam BDF_SW_DOWN   = 16'h0208;
-localparam BDF_NVME      = 16'h0300;
 localparam BAR_TAG_CFG   = 3'd7;
 localparam AXI_OKAY      = 2'b00;
 localparam AXI_SLVERR    = 2'b10;
@@ -128,6 +127,7 @@ localparam AXI_SLVERR    = 2'b10;
 localparam GUEST_BAR0_CTRL_VALID      = 0;
 localparam GUEST_BAR0_CTRL_MEM_ENABLE = 1;
 localparam GUEST_BAR0_CTRL_IS64       = 2;
+localparam GUEST_BAR0_CTRL_BACKEND_LSB = 8;
 localparam PROXY_CTRL_BAR_ROUTE_READY = 0;
 localparam PROXY_CTRL_ECAM_SHADOW_READY = 1;
 
@@ -145,7 +145,11 @@ localparam MMIO_DONE_PKT = 2'd3;
 reg [31:0] seq_counter;
 
 reg [31:0] mbx_ack;
-reg [31:0] guest_bar0_lo, guest_bar0_hi, guest_bar0_size, guest_bar0_ctrl;
+reg [31:0] route_bar_lo [0:MAX_NVME-1];
+reg [31:0] route_bar_hi [0:MAX_NVME-1];
+reg [31:0] route_bar_size [0:MAX_NVME-1];
+reg [15:0] route_bdf [0:MAX_NVME-1];
+reg [31:0] route_ctrl [0:MAX_NVME-1];
 reg [31:0] proxy_ctrl;
 reg [31:0] mbx_bar_resp_data_lo, mbx_bar_resp_data_hi;
 reg [31:0] mbx_bar_resp_seq, mbx_bar_resp_ctrl;
@@ -158,6 +162,10 @@ reg [31:0] mbx_wdata_hold;
 reg [3:0]  mbx_wstrb_hold;
 reg        intx_level;
 reg [31:0] intx_count;
+reg        route_error_sticky;
+reg [1:0]  route_error_last_hits;
+reg [31:0] route_error_count;
+reg [63:0] route_error_last_addr;
 
 reg [1:0]  ecam_r_state;
 reg        ecam_w_state;
@@ -188,6 +196,7 @@ reg        bar_done_pending;
 reg [31:0] bar_done_flags;
 reg [31:0] bar_done_seq;
 reg [31:0] bar_done_off;
+integer reset_i;
 
 assign interrupt_out = intx_level;
 
@@ -278,24 +287,39 @@ endfunction
 
 function ecam_bdf_supported;
     input [15:0] bdf;
+    reg [7:0] busno;
+    reg [4:0] devno;
     begin
+        busno = bdf[15:8];
+        devno = bdf[7:3];
         ecam_bdf_supported = (bdf == BDF_ROOT_PORT) ||
                              (bdf == BDF_SW_UP) ||
-                             (bdf == BDF_SW_DOWN) ||
-                             (bdf == BDF_NVME);
+                             ((busno == 8'd2) && (bdf[2:0] == 3'd0) &&
+                              (devno >= 5'd1) && (devno <= MAX_NVME)) ||
+                             ((busno >= 8'd3) && (busno <= 8'd15) &&
+                              (devno == 5'd0) && (bdf[2:0] == 3'd0));
     end
 endfunction
 
-function [1:0] ecam_bdf_slot;
+function [4:0] ecam_bdf_slot;
     input [15:0] bdf;
+    reg [7:0] busno;
+    reg [4:0] devno;
     begin
-        case (bdf)
-        BDF_ROOT_PORT: ecam_bdf_slot = 2'd0;
-        BDF_SW_UP:     ecam_bdf_slot = 2'd1;
-        BDF_SW_DOWN:   ecam_bdf_slot = 2'd2;
-        BDF_NVME:      ecam_bdf_slot = 2'd3;
-        default:       ecam_bdf_slot = 2'd0;
-        endcase
+        busno = bdf[15:8];
+        devno = bdf[7:3];
+        if (bdf == BDF_ROOT_PORT)
+            ecam_bdf_slot = 5'd0;
+        else if (bdf == BDF_SW_UP)
+            ecam_bdf_slot = 5'd1;
+        else if ((busno == 8'd2) && (devno >= 5'd1) &&
+                 (devno <= MAX_NVME) && (bdf[2:0] == 3'd0))
+            ecam_bdf_slot = 5'd2 + ((devno - 5'd1) << 1);
+        else if ((busno >= 8'd3) && (busno <= 8'd15) &&
+                 (devno == 5'd0) && (bdf[2:0] == 3'd0))
+            ecam_bdf_slot = 5'd3 + ((busno - 8'd3) << 1);
+        else
+            ecam_bdf_slot = 5'd0;
     end
 endfunction
 
@@ -304,19 +328,28 @@ function [31:0] ecam_shadow_offset;
     reg [31:0] off;
     begin
         off = ecam_reg_off(addr);
-        ecam_shadow_offset = {18'd0, ecam_bdf_slot(ecam_bdf(addr)), off[11:0]};
+        ecam_shadow_offset = {15'd0, ecam_bdf_slot(ecam_bdf(addr)), off[11:0]};
     end
 endfunction
 
 function [31:0] mbx_read32;
     input [31:0] addr;
+    integer ridx;
+    reg [11:0] roff;
     begin
-        case (addr[11:0])
+        roff = addr[11:0];
+        ridx = (roff - 12'h100) >> 5;
+        if ((roff >= 12'h100) && (roff < 12'h2a0) && (ridx < MAX_NVME)) begin
+            case (roff[4:0])
+            5'h00: mbx_read32 = route_bar_lo[ridx];
+            5'h04: mbx_read32 = route_bar_hi[ridx];
+            5'h08: mbx_read32 = route_bar_size[ridx];
+            5'h0c: mbx_read32 = {16'd0, route_bdf[ridx]};
+            5'h10: mbx_read32 = route_ctrl[ridx];
+            default: mbx_read32 = 32'd0;
+            endcase
+        end else case (roff)
         12'h010: mbx_read32 = mbx_ack;
-        12'h020: mbx_read32 = guest_bar0_lo;
-        12'h024: mbx_read32 = guest_bar0_hi;
-        12'h028: mbx_read32 = guest_bar0_size;
-        12'h02c: mbx_read32 = guest_bar0_ctrl;
         12'h030: mbx_read32 = proxy_ctrl;
         12'h034: mbx_read32 = mbx_bar_resp_data_lo;
         12'h038: mbx_read32 = mbx_bar_resp_seq;
@@ -325,25 +358,58 @@ function [31:0] mbx_read32;
         12'h050: mbx_read32 = {31'd0, intx_level};
         12'h054: mbx_read32 = {30'd0, intx_level, intx_level};
         12'h058: mbx_read32 = intx_count;
+        12'h060: mbx_read32 = {29'd0, route_error_last_hits, route_error_sticky};
+        12'h064: mbx_read32 = route_error_count;
+        12'h068: mbx_read32 = route_error_last_addr[31:0];
+        12'h06c: mbx_read32 = route_error_last_addr[63:32];
         default: mbx_read32 = 32'h0000_0000;
         endcase
     end
 endfunction
 
-function nvme_bar_hit;
+function route_hit;
     input [63:0] addr;
+    input [3:0] idx;
     reg [63:0] bar_base;
     reg [63:0] bar_limit;
     begin
-        bar_base = {guest_bar0_hi, guest_bar0_lo};
-        bar_limit = bar_base + {32'd0, guest_bar0_size};
-        nvme_bar_hit = proxy_ctrl[PROXY_CTRL_BAR_ROUTE_READY] &&
-                       guest_bar0_ctrl[GUEST_BAR0_CTRL_VALID] &&
-                       guest_bar0_ctrl[GUEST_BAR0_CTRL_MEM_ENABLE] &&
-                       (guest_bar0_size != 32'd0) &&
+        bar_base = {route_bar_hi[idx], route_bar_lo[idx]};
+        bar_limit = bar_base + {32'd0, route_bar_size[idx]};
+        route_hit = proxy_ctrl[PROXY_CTRL_BAR_ROUTE_READY] &&
+                       route_ctrl[idx][GUEST_BAR0_CTRL_VALID] &&
+                       route_ctrl[idx][GUEST_BAR0_CTRL_MEM_ENABLE] &&
+                       (route_ctrl[idx][GUEST_BAR0_CTRL_BACKEND_LSB +: 4] == idx) &&
+                       (route_bar_size[idx] != 32'd0) &&
                        (bar_limit > bar_base) &&
                        (addr >= bar_base) &&
                        (addr < bar_limit);
+    end
+endfunction
+
+function [3:0] route_first_index;
+    input [63:0] addr;
+    integer i;
+    reg found;
+    begin
+        route_first_index = 4'd0;
+        found = 1'b0;
+        for (i = 0; i < MAX_NVME; i = i + 1) begin
+            if (!found && route_hit(addr, i[3:0])) begin
+                route_first_index = i[3:0];
+                found = 1'b1;
+            end
+        end
+    end
+endfunction
+
+function [1:0] route_hit_count;
+    input [63:0] addr;
+    integer i;
+    begin
+        route_hit_count = 2'd0;
+        for (i = 0; i < MAX_NVME; i = i + 1)
+            if (route_hit(addr, i[3:0]) && route_hit_count != 2'd3)
+                route_hit_count = route_hit_count + 1'b1;
     end
 endfunction
 
@@ -375,9 +441,10 @@ endfunction
 
 function [31:0] bar_offset32;
     input [63:0] addr;
+    input [3:0] idx;
     reg [63:0] bar_base;
     begin
-        bar_base = {guest_bar0_hi, guest_bar0_lo};
+        bar_base = {route_bar_hi[idx], route_bar_lo[idx]};
         bar_offset32 = (addr - bar_base) & 32'hffff_ffff;
     end
 endfunction
@@ -401,10 +468,13 @@ always @(posedge clk) begin
     if (rst) begin
         seq_counter <= 32'd0;
         mbx_ack <= 32'd0;
-        guest_bar0_lo <= MMIO_BASE;
-        guest_bar0_hi <= 32'd0;
-        guest_bar0_size <= 32'd0;
-        guest_bar0_ctrl <= 32'd0;
+        for (reset_i = 0; reset_i < MAX_NVME; reset_i = reset_i + 1) begin
+            route_bar_lo[reset_i] <= 32'd0;
+            route_bar_hi[reset_i] <= 32'd0;
+            route_bar_size[reset_i] <= 32'd0;
+            route_bdf[reset_i] <= 16'd0;
+            route_ctrl[reset_i] <= 32'd0;
+        end
         proxy_ctrl <= 32'd0;
         mbx_bar_resp_data_lo <= 32'd0;
         mbx_bar_resp_data_hi <= 32'd0;
@@ -419,6 +489,10 @@ always @(posedge clk) begin
         mbx_wstrb_hold <= 4'd0;
         intx_level <= 1'b0;
         intx_count <= 32'd0;
+        route_error_sticky <= 1'b0;
+        route_error_last_hits <= 2'd0;
+        route_error_count <= 32'd0;
+        route_error_last_addr <= 64'd0;
         ecam_r_state <= ECAM_R_IDLE;
         ecam_w_state <= ECAM_W_IDLE;
         ecam_write_seq <= 32'd0;
@@ -596,12 +670,26 @@ always @(posedge clk) begin
         if (mbx_aw_pending && mbx_w_pending && !s_mbx_axi_bvalid) begin
             mbx_aw_pending <= 1'b0;
             mbx_w_pending <= 1'b0;
-            case (mbx_awaddr_hold[11:0])
+            if ((mbx_awaddr_hold[11:0] >= 12'h100) &&
+                (mbx_awaddr_hold[11:0] < 12'h2a0)) begin
+                case (mbx_awaddr_hold[4:0])
+                5'h00: route_bar_lo[(mbx_awaddr_hold[11:5] - 7'h08)] <=
+                    apply_wstrb32(route_bar_lo[(mbx_awaddr_hold[11:5] - 7'h08)],
+                                  mbx_wdata_hold, mbx_wstrb_hold);
+                5'h04: route_bar_hi[(mbx_awaddr_hold[11:5] - 7'h08)] <=
+                    apply_wstrb32(route_bar_hi[(mbx_awaddr_hold[11:5] - 7'h08)],
+                                  mbx_wdata_hold, mbx_wstrb_hold);
+                5'h08: route_bar_size[(mbx_awaddr_hold[11:5] - 7'h08)] <=
+                    apply_wstrb32(route_bar_size[(mbx_awaddr_hold[11:5] - 7'h08)],
+                                  mbx_wdata_hold, mbx_wstrb_hold);
+                5'h0c: route_bdf[(mbx_awaddr_hold[11:5] - 7'h08)] <= mbx_wdata_hold[15:0];
+                5'h10: route_ctrl[(mbx_awaddr_hold[11:5] - 7'h08)] <=
+                    apply_wstrb32(route_ctrl[(mbx_awaddr_hold[11:5] - 7'h08)],
+                                  mbx_wdata_hold, mbx_wstrb_hold);
+                default: begin end
+                endcase
+            end else case (mbx_awaddr_hold[11:0])
             12'h010: mbx_ack <= mbx_wdata_hold;
-            12'h020: guest_bar0_lo <= apply_wstrb32(guest_bar0_lo, mbx_wdata_hold, mbx_wstrb_hold);
-            12'h024: guest_bar0_hi <= apply_wstrb32(guest_bar0_hi, mbx_wdata_hold, mbx_wstrb_hold);
-            12'h028: guest_bar0_size <= apply_wstrb32(guest_bar0_size, mbx_wdata_hold, mbx_wstrb_hold);
-            12'h02c: guest_bar0_ctrl <= apply_wstrb32(guest_bar0_ctrl, mbx_wdata_hold, mbx_wstrb_hold);
             12'h030: proxy_ctrl <= apply_wstrb32(proxy_ctrl, mbx_wdata_hold, mbx_wstrb_hold);
             12'h034: mbx_bar_resp_data_lo <= mbx_wdata_hold;
             12'h038: mbx_bar_resp_seq <= mbx_wdata_hold;
@@ -616,6 +704,10 @@ always @(posedge clk) begin
             12'h050: begin
                 if (!intx_level && mbx_wdata_hold[0]) intx_count <= intx_count + 1'b1;
                 intx_level <= mbx_wdata_hold[0];
+            end
+            12'h060: begin
+                if (mbx_wstrb_hold[0] && mbx_wdata_hold[0])
+                    route_error_sticky <= 1'b0;
             end
             default: begin end
             endcase
@@ -644,7 +736,7 @@ always @(posedge clk) begin
             !s_mmio_axi_bvalid && !m_axis_c2h_tvalid && !bar_done_pending) begin
             mmio_aw_pending <= 1'b0;
             mmio_w_pending <= 1'b0;
-            if (nvme_bar_hit(mmio_awaddr_hold) &&
+            if ((route_hit_count(mmio_awaddr_hold) == 2'd1) &&
                 (mmio_awlen_hold == 8'd0) &&
                 mmio_wlast_hold &&
                 (axsize_to_pkt_size(mmio_awsize_hold) != 4'd0)) begin
@@ -652,45 +744,63 @@ always @(posedge clk) begin
                 mmio_wstrb8 = pick_wstrb8(mmio_awaddr_hold, mmio_wstrb_hold);
                 seq_counter <= seq_counter + 1'b1;
                 mmio_active_seq <= seq_counter + 1'b1;
-                mmio_active_flags <= make_flags(BDF_NVME, 3'd0,
+                mmio_active_flags <= make_flags(route_bdf[route_first_index(mmio_awaddr_hold)], 3'd0,
                                                 axsize_to_pkt_size(mmio_awsize_hold),
                                                 mmio_wstrb8);
-                mmio_active_off <= bar_offset32(mmio_awaddr_hold);
+                mmio_active_off <= bar_offset32(mmio_awaddr_hold,
+                                                route_first_index(mmio_awaddr_hold));
                 mmio_active_addr <= mmio_awaddr_hold;
                 mmio_active_done_req <= 1'b0;
                 send_packet(PKT_BAR_WRITE,
-                            make_flags(BDF_NVME, 3'd0,
+                            make_flags(route_bdf[route_first_index(mmio_awaddr_hold)], 3'd0,
                                        axsize_to_pkt_size(mmio_awsize_hold),
                                        mmio_wstrb8),
                             seq_counter + 1'b1,
-                            bar_offset32(mmio_awaddr_hold),
+                            bar_offset32(mmio_awaddr_hold,
+                                         route_first_index(mmio_awaddr_hold)),
                             mmio_wlane[31:0], mmio_wlane[63:32]);
                 mmio_state <= MMIO_WAIT_WR;
             end else begin
-                s_mmio_axi_bresp <= nvme_bar_hit(mmio_awaddr_hold) ? AXI_SLVERR : AXI_OKAY;
+                if (route_hit_count(mmio_awaddr_hold) > 2'd1) begin
+                    route_error_sticky <= 1'b1;
+                    route_error_last_hits <= route_hit_count(mmio_awaddr_hold);
+                    route_error_count <= route_error_count + 1'b1;
+                    route_error_last_addr <= mmio_awaddr_hold;
+                end
+                s_mmio_axi_bresp <= (route_hit_count(mmio_awaddr_hold) > 2'd1) ?
+                                    AXI_SLVERR : AXI_OKAY;
                 s_mmio_axi_bvalid <= 1'b1;
             end
         end
         if (s_mmio_axi_arvalid && s_mmio_axi_arready && !bar_done_pending) begin
-            if (nvme_bar_hit(s_mmio_axi_araddr) &&
+            if ((route_hit_count(s_mmio_axi_araddr) == 2'd1) &&
                 (s_mmio_axi_arlen == 8'd0) &&
                 (axsize_to_pkt_size(s_mmio_axi_arsize) != 4'd0)) begin
                 seq_counter <= seq_counter + 1'b1;
                 mmio_active_seq <= seq_counter + 1'b1;
-                mmio_active_flags <= make_flags(BDF_NVME, 3'd0,
+                mmio_active_flags <= make_flags(route_bdf[route_first_index(s_mmio_axi_araddr)], 3'd0,
                                                 axsize_to_pkt_size(s_mmio_axi_arsize), 8'd0);
-                mmio_active_off <= bar_offset32(s_mmio_axi_araddr);
+                mmio_active_off <= bar_offset32(s_mmio_axi_araddr,
+                                                route_first_index(s_mmio_axi_araddr));
                 mmio_active_addr <= s_mmio_axi_araddr;
                 send_packet(PKT_BAR_READ,
-                            make_flags(BDF_NVME, 3'd0,
+                            make_flags(route_bdf[route_first_index(s_mmio_axi_araddr)], 3'd0,
                                        axsize_to_pkt_size(s_mmio_axi_arsize), 8'd0),
                             seq_counter + 1'b1,
-                            bar_offset32(s_mmio_axi_araddr),
+                            bar_offset32(s_mmio_axi_araddr,
+                                         route_first_index(s_mmio_axi_araddr)),
                             32'd0, 32'd0);
                 mmio_state <= MMIO_WAIT_RD;
             end else begin
+                if (route_hit_count(s_mmio_axi_araddr) > 2'd1) begin
+                    route_error_sticky <= 1'b1;
+                    route_error_last_hits <= route_hit_count(s_mmio_axi_araddr);
+                    route_error_count <= route_error_count + 1'b1;
+                    route_error_last_addr <= s_mmio_axi_araddr;
+                end
                 s_mmio_axi_rdata <= {4{32'hffff_ffff}};
-                s_mmio_axi_rresp <= nvme_bar_hit(s_mmio_axi_araddr) ? AXI_SLVERR : AXI_OKAY;
+                s_mmio_axi_rresp <= (route_hit_count(s_mmio_axi_araddr) > 2'd1) ?
+                                    AXI_SLVERR : AXI_OKAY;
                 s_mmio_axi_rlast <= 1'b1;
                 s_mmio_axi_rvalid <= 1'b1;
             end
