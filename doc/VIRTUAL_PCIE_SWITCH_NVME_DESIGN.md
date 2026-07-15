@@ -1,10 +1,12 @@
 # 虚拟 PCIe Switch 下挂 0 至 13 个 NVMe 的实现方案
 
+运行时寄存器、字段所有权和软件写入顺序以 `doc/VSWITCH_REGISTER_INTERFACE_SPEC.md` 为规范性接口定义。
+
 ## 1. 目标
 
 当前系统原先依赖 FPGA 中的 DUT-facing XDMA Root Port IP，让香山 Linux 通过 `xlnx,xdma-host-3.00` PCI host bridge 枚举下游设备。这个路径和当前 proxy 状态机基本假设 XDMA RP 下只有一个被代理设备。
 
-仓库 13 的目标是：**不再依赖真实 DUT-facing XDMA RP 硬件**，而是在香山侧实现一个由 FPGA/QEMU 共同维护的虚拟 PCIe 层次结构。下面先用只启用一个 backend 的最小拓扑解释基本机制；第 11 节描述当前 `0..13` 个 NVMe 的实现：
+仓库 14 的目标是：**不再依赖真实 DUT-facing XDMA RP 硬件**，而是在香山侧实现一个由 FPGA/QEMU 共同维护的虚拟 PCIe 层次结构。下面先用只启用一个 backend 的最小拓扑解释基本机制；第 11 节描述当前 `0..13` 个 NVMe 的实现：
 
 ```text
 PCI host bridge
@@ -36,7 +38,7 @@ pci-host-ecam-generic 是 Linux Device Tree 里的一种 PCI/PCIe Host Bridge co
 
 这个 PCIe Root Complex / Host Bridge 已经由固件或硬件初始化好了，并且它的配置空间访问方式符合标准 ECAM，Linux 可以用通用 PCI Host 驱动来枚举 PCIe 设备。
 
-仓库 13 改为 generic ECAM host bridge：
+仓库 14 改为 generic ECAM host bridge：
 
 ```dts
 compatible = "pci-host-ecam-generic";
@@ -61,10 +63,10 @@ Bridge bus number/window: Linux 枚举时会动态写入
 Capability list: NVMe endpoint 由 QEMU PCI core 初始化
 ```
 
-如果这些规则放进 FPGA，会很快变成一个不完整的 PCI config emulator。仓库 13 当前采用：
+如果这些规则放进 FPGA，会很快变成一个不完整的 PCI config emulator。仓库 14 当前采用：
 
 ```text
-单 backend 基线由 QEMU 初始化并维护 4 个 BDF 的 compact ECAM shadow
+QEMU 初始化并维护 28 个 function slot 的 compact ECAM shadow
 FPGA ECAM read 直接读 shadow BRAM
 FPGA ECAM write 发 CFG_WRITE packet 并等待 QEMU ACK
 QEMU 用 bridge wmask/w1cmask helper 或 pci_default_write_config() 更新 shadow
@@ -211,10 +213,10 @@ FPGA 不在本地修改配置空间字段，也不处理 BAR sizing。写流程�
 
 ```text
 bit0 PROXY_CTRL_BAR_ROUTE_READY
-  QEMU 已经写入 GUEST_BAR0_LO/HI/SIZE/CTRL，FPGA 可以进行 NVMe BAR0 MMIO hit 判断。
+  QEMU 已完成 13 项 BAR route table 的初始化，FPGA 可以进行 BAR0 MMIO hit 判断。
 
 bit1 PROXY_CTRL_ECAM_SHADOW_READY
-  QEMU 已经初始化完整 16KB compact ECAM shadow BRAM，FPGA 可以从 BRAM 响应 ECAM read。
+  QEMU 已经初始化完整 128KB compact ECAM shadow BRAM，FPGA 可以从 BRAM 响应 ECAM read。
 ```
 
 两个 bit 放在同一个 control 寄存器中是可以接受的，因为它们都是 QEMU 对 FPGA 的全局路径 ready 信号；但语义不同：
@@ -228,13 +230,13 @@ FPGA 必须分别判断，不应把二者混成一个“backend ready”。
 
 ### 4.6 MMIO 路由
 
-FPGA 的 `nvme_bar_hit()` 只依赖 QEMU 写入的 mailbox BAR route：
+FPGA 的 MMIO route matcher 只依赖 QEMU 写入的 13 项 BAR route table：
 
 ```text
-MBX_REG_GUEST_BAR0_LO
-MBX_REG_GUEST_BAR0_HI
-MBX_REG_GUEST_BAR0_SIZE
-MBX_REG_GUEST_BAR0_CTRL
+route[i].BAR_LO / BAR_HI
+route[i].BAR_SIZE
+route[i].BDF
+route[i].CTRL(valid / MEM-enable / backend_id)
 MBX_REG_PROXY_CTRL.bit0 BAR_ROUTE_READY
 ```
 
@@ -243,12 +245,12 @@ MBX_REG_PROXY_CTRL.bit0 BAR_ROUTE_READY
 ```text
 guest_mmio_addr -> offset = guest_mmio_addr - guest_bar0_base
 packet type = BAR_READ / BAR_WRITE
-bdf = 03:00.0
+bdf = route[i].BDF
 bar = 0
 offset / size / wstrb / data
 ```
 
-QEMU 对 `03:00.0 BAR0` 继续复用当前 NVMe proxy 的 BAR 处理逻辑，包括 `CAP/VS/CC/CSTS/AQA/ASQ/ACQ/doorbell`、Admin queue、PRP/PRP list 翻译、coherent alias 与 INTx。
+QEMU 按 BDF 选择 backend，并复用 NVMe proxy 的 BAR 处理逻辑，包括 `CAP/VS/CC/CSTS/AQA/ASQ/ACQ/doorbell`、Admin queue、PRP/PRP list 翻译、coherent alias 与 INTx。
 
 ### 4.7 INTx
 
@@ -293,12 +295,26 @@ vconf_bram_ctrl_b/S_AXI <- host/QEMU via xdma_ep/M_AXI_LITE
 4. host/QEMU 侧地址段：
 
 ```text
-HOST_MBX_REG          0x11000000, range 0x1000
-HOST_SQE_MONITOR_CFG  0x11001000, range 0x1000
-HOST_ECAM_SHADOW_BRAM 0x11010000, range 0x20000
+HOST_MBX_REG                    0x11000000, range 0x1000
+RETIRED_SQE_MONITOR_RESERVED    0x11001000, range 0x1000, unmapped
+HOST_ECAM_SHADOW_BRAM           0x11010000, range 0x20000
 ```
 
-5. `virtual_pcie_switch_proxy_0/m_axis_c2h` 接入原 C2H 合流路径，继续和 `sqe_write_done_monitor` 共用 DMA32 packet ring。
+5. role DDR 和 proxy C2H 使用直接链路：
+
+```text
+u_role/m_axi_mem
+  -> axi_ic_ddr_mem_reg_slice_S01
+  -> axi_ic_ddr_mem/S01_AXI
+
+virtual_pcie_switch_proxy_0/m_axis_c2h
+  -> axis_rs_active_proxy_c2h
+  -> axis_cc_proxy_c2h1
+  -> axis_rs_proxy_c2h_out
+  -> xdma_ep/S_AXIS_C2H_1
+```
+
+vSwitch 不再例化 SQE write-done monitor，也不再使用 C2H 2-to-1 合流器。
 
 BAR route 冲突诊断位于 proxy mailbox：
 
@@ -330,7 +346,7 @@ scope-fpga-vswitch-nvme
 
 它是独立实验路径，不修改旧 `scope_fpga_proxy.c`。
 
-### 6.1 4 个 Virtual Config Slot
+### 6.1 28 个 Virtual Config Slot
 
 QEMU 维护：
 
@@ -343,13 +359,14 @@ struct ScopeVswitchConfigFn {
 };
 ```
 
-4 个 slot 对应：
+slot 映射为：
 
 ```text
 slot 0: 00:00.0 Root Port
 slot 1: 01:00.0 Switch Upstream Port
-slot 2: 02:01.0 Switch Downstream Port
-slot 3: 03:00.0 NVMe endpoint
+slot 2+2*i: 02:(i+1).0 Switch Downstream Port i
+slot 3+2*i: (03+i):00.0 NVMe endpoint i
+i = 0..12
 ```
 
 Bridge slot 使用 QEMU-side helper 初始化 Type 1 header，并用 `wmask/w1cmask` 处理可写字段和 W1C 字段：
@@ -385,8 +402,8 @@ QEMU realize 阶段：
 打开 XDMA user/control/bypass
 初始化真实 NVMe BAR 和能力缓存
 初始化 QEMU PCIDevice 的 NVMe config
-初始化 3 个 bridge shadow slot + 1 个 NVMe shadow slot
-写完整 16KB ECAM shadow BRAM
+初始化两个公共 bridge slot、active downstream/endpoint slot和inactive全1 slot
+写完整 28 x 4KB ECAM shadow到128KB BRAM aperture
 readback fence 确认 shadow 写入已到 FPGA
 写 PROXY_CTRL_ECAM_SHADOW_READY
 同步 NVMe BAR0 route mailbox
@@ -424,7 +441,7 @@ QEMU 处理：
   写回对应 4KB slot 的变更 dword 到 ECAM shadow BRAM
   readback fence
   ACK seq
-如果 bdf 是 03:00.0 NVMe
+如果 bdf 是 active NVMe endpoint
   调用 pci_default_write_config()
   复制 pci_dev->config 到 NVMe shadow slot
   写回 ECAM shadow BRAM
@@ -437,12 +454,11 @@ QEMU 处理：
 
 ### 6.4 NVMe 后端复用
 
-`03:00.0 BAR0` 的访问进入现有 NVMe proxy 状态机：
+active endpoint BAR0 的访问按BDF选择backend后进入NVMe proxy状态机：
 
 ```text
 CAP/VS/CSTS/CC/AQA/ASQ/ACQ
 SQ/CQ doorbell
-SQE_WRITE_DONE
 Admin CQ shadow scan
 PRP/PRP list 翻译
 coherent alias
@@ -453,7 +469,7 @@ INTx level
 
 ## 7. Packet ABI
 
-仓库 13 的 vSwitch packet 继续使用 32B DMA32 packet，但 `flags` 中显式携带 BDF/BAR/size/wstrb：
+仓库 14 的 vSwitch packet 使用32B DMA32 packet，`flags`中显式携带BDF/BAR/size/wstrb：
 
 ```text
 flags[15:0]  = bdf = (bus << 8) | (dev << 3) | fn
@@ -465,7 +481,7 @@ data         = low 32-bit payload
 guest_addr_lo= high 32-bit payload for 64-bit BAR lane
 ```
 
-第一阶段只有 `03:00.0 BAR0` 进入 NVMe 后端；保留 BDF/BAR 字段是为了后续扩展 NIC 或多个 downstream endpoint。
+当前有效packet类型只有`CFG_WRITE`、`BAR_WRITE`、`BAR_READ`和`BAR_WRITE_DONE`。vSwitch不定义或消费`SQE_WRITE_DONE`。BDF字段用于在多个endpoint之间选择backend。
 
 ## 8. Device Tree 和地址规划
 
@@ -503,7 +519,7 @@ pcie_virtual: pcie@60000000 {
 香山侧 ECAM window: 0x60000000, 16MB
 香山侧 PCI MEM:     0x50000000, 16MB
 host mailbox:       0x11000000, 4KB
-host SQE monitor:   0x11001000, 4KB
+reserved hole:      0x11001000, 4KB, unmapped
 host ECAM shadow:   0x11010000, 128KB
 ```
 
@@ -577,7 +593,7 @@ QEMU 日志应看到 `03:00.0 BAR0` 的 `CAP/VS/CSTS/CC/AQA/ASQ/ACQ/doorbell`。
 dd if=/dev/nvme0n1 of=/dev/null bs=512 count=1
 ```
 
-QEMU 路径应继续使用 coherent alias、PRP/PRP list 翻译、SQE monitor 和 INTx level。
+QEMU 路径应继续使用 coherent alias稳定读取、PRP/PRP list翻译和INTx level。Admin SQ doorbell的门控事件为`BAR_WRITE_DONE`，不再等待SQE monitor packet。
 
 ## 10. 风险点
 
@@ -604,7 +620,7 @@ QEMU 路径应继续使用 coherent alias、PRP/PRP list 翻译、SQE monitor �
 
 ## 11. 当前实现边界
 
-当前仓库 13 实现的是启动时可配置的 `0..13` NVMe vSwitch：
+当前仓库 14 实现的是启动时可配置的 `0..13` NVMe vSwitch：
 
 ```text
 generic ECAM host bridge
@@ -615,7 +631,7 @@ QEMU 维护 28 x 4KB compact ECAM shadow，BRAM aperture 为 128KB
 FPGA ECAM read 读 BRAM
 FPGA ECAM write 发 CFG_WRITE 并等 QEMU ACK
 每个 endpoint 独立 BAR0 route、NVMe register/queue/PRP/CQ 状态
-13 项 SQE monitor window，SQE_WRITE_DONE packet 携带 backend_id
+Admin SQE通过coherent alias稳定读取，不使用SQE monitor
 所有 endpoint 共用一根 aggregate INTx level 中断
 ```
 
@@ -637,7 +653,7 @@ DMA32 ring 默认扩为 64KB，可通过 `dma32-ring-size` 覆盖。消费者保
 的 `type + seq` 和扫描 cursor，每轮只扫描固定数量 slot，避免 ring 扩大后高频
 全表轮询。manager 统一拥有 XDMA、shadow BRAM 和共享 INTx；真实 BAR、NVMe
 寄存器、namespace LBA shift、SQ/CQ、pending doorbell 和 CID 状态均属于各自
-backend，处理 packet 时必须先按 BDF 或 `backend_id` 选择 backend。
+backend，处理BAR packet时必须先按BDF选择backend。
 
 ### 11.1 多设备可靠性约束
 
@@ -648,15 +664,13 @@ backend，处理 packet 时必须先按 BDF 或 `backend_id` 选择 backend。
 2. Admin SQE 可见性检查执行两次立即 coherent-alias 读取。两次内容不一致、全零
    或仍等于 seed 时返回 `WAIT`，由 RX 线程按 deadline 重新调度；读取函数内部不
    sleep，因此单个设备不会阻塞其他设备的 DMA32 packet 消费。
-3. `sqe_write_done_monitor` 对 AXI write 与每个 64B SQE slot 分别求交集。每个
-   `SQE_WRITE_DONE` packet 的地址和 bytes 只覆盖当前 slot 的实际写入范围，支持
-   非对齐且跨多个 slot 的 burst，QEMU 据此准确累计 64-bit byte mask。
-4. monitor overflow 是全局诊断状态，只在 manager 启动时清除一次。重配某个
-   backend 的 Admin SQ window 不再擦除其他 backend 已产生的 overflow 证据。
-5. QEMU 退出或部分 backend 初始化失败时恢复各真实设备原来的 PCI Command。
+3. FPGA完成guest doorbell的AXI B handshake后发送`BAR_WRITE_DONE`。QEMU收到该
+   packet后才开始SQE稳定读取；如果one-shot packet未被cursor及时消费，超时恢复
+   会精确搜索ring并推断BAR completion，但SQE稳定读取仍是转发真实doorbell的门槛。
+4. QEMU 退出或部分 backend 初始化失败时恢复各真实设备原来的 PCI Command。
    控制器保持 disabled，因为恢复旧 `CC.EN` 会重新引用可能已经失效的 queue
    地址；后续归还 host 驱动仍应走正常 reset/probe 流程。
-6. 单个 backend 执行 `CC.EN=0`、INT mask 或 CQ doorbell 更新时不能直接清共享
+5. 单个 backend 执行 `CC.EN=0`、INT mask 或 CQ doorbell 更新时不能直接清共享
    INTx。QEMU 先更新该 backend 状态，再重新 OR 全部 backend 的 pending 状态，
    只有 aggregate pending 为零时才向 FPGA 写 level 0。
 

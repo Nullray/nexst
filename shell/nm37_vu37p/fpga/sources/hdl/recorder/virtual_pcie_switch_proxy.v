@@ -124,12 +124,14 @@ localparam BAR_TAG_CFG   = 3'd7;
 localparam AXI_OKAY      = 2'b00;
 localparam AXI_SLVERR    = 2'b10;
 
-localparam GUEST_BAR0_CTRL_VALID      = 0;
-localparam GUEST_BAR0_CTRL_MEM_ENABLE = 1;
-localparam GUEST_BAR0_CTRL_IS64       = 2;
-localparam GUEST_BAR0_CTRL_BACKEND_LSB = 8;
+localparam ROUTE_CTRL_VALID_BIT       = 0;
+localparam ROUTE_CTRL_MEM_ENABLE_BIT  = 1;
+localparam ROUTE_CTRL_BACKEND_LSB     = 8;
 localparam PROXY_CTRL_BAR_ROUTE_READY = 0;
 localparam PROXY_CTRL_ECAM_SHADOW_READY = 1;
+localparam [31:0] PROXY_CTRL_VALID_MASK = 32'h0000_0003;
+localparam [31:0] BAR_RESP_CTRL_VALID_MASK = 32'h0000_000f;
+localparam [31:0] ROUTE_CTRL_VALID_MASK = 32'h0000_0f07;
 
 localparam ECAM_R_IDLE    = 2'd0;
 localparam ECAM_R_WAIT_AR = 2'd1;
@@ -376,9 +378,9 @@ function route_hit;
         bar_base = {route_bar_hi[idx], route_bar_lo[idx]};
         bar_limit = bar_base + {32'd0, route_bar_size[idx]};
         route_hit = proxy_ctrl[PROXY_CTRL_BAR_ROUTE_READY] &&
-                       route_ctrl[idx][GUEST_BAR0_CTRL_VALID] &&
-                       route_ctrl[idx][GUEST_BAR0_CTRL_MEM_ENABLE] &&
-                       (route_ctrl[idx][GUEST_BAR0_CTRL_BACKEND_LSB +: 4] == idx) &&
+                       route_ctrl[idx][ROUTE_CTRL_VALID_BIT] &&
+                       route_ctrl[idx][ROUTE_CTRL_MEM_ENABLE_BIT] &&
+                       (route_ctrl[idx][ROUTE_CTRL_BACKEND_LSB +: 4] == idx) &&
                        (route_bar_size[idx] != 32'd0) &&
                        (bar_limit > bar_base) &&
                        (addr >= bar_base) &&
@@ -682,19 +684,24 @@ always @(posedge clk) begin
                 5'h08: route_bar_size[(mbx_awaddr_hold[11:5] - 7'h08)] <=
                     apply_wstrb32(route_bar_size[(mbx_awaddr_hold[11:5] - 7'h08)],
                                   mbx_wdata_hold, mbx_wstrb_hold);
-                5'h0c: route_bdf[(mbx_awaddr_hold[11:5] - 7'h08)] <= mbx_wdata_hold[15:0];
+                5'h0c: route_bdf[(mbx_awaddr_hold[11:5] - 7'h08)] <=
+                    apply_wstrb32({16'd0, route_bdf[(mbx_awaddr_hold[11:5] - 7'h08)]},
+                                  mbx_wdata_hold, mbx_wstrb_hold);
                 5'h10: route_ctrl[(mbx_awaddr_hold[11:5] - 7'h08)] <=
                     apply_wstrb32(route_ctrl[(mbx_awaddr_hold[11:5] - 7'h08)],
-                                  mbx_wdata_hold, mbx_wstrb_hold);
+                                  mbx_wdata_hold, mbx_wstrb_hold) &
+                    ROUTE_CTRL_VALID_MASK;
                 default: begin end
                 endcase
             end else case (mbx_awaddr_hold[11:0])
             12'h010: mbx_ack <= mbx_wdata_hold;
-            12'h030: proxy_ctrl <= apply_wstrb32(proxy_ctrl, mbx_wdata_hold, mbx_wstrb_hold);
+            12'h030: proxy_ctrl <=
+                apply_wstrb32(proxy_ctrl, mbx_wdata_hold, mbx_wstrb_hold) &
+                PROXY_CTRL_VALID_MASK;
             12'h034: mbx_bar_resp_data_lo <= mbx_wdata_hold;
             12'h038: mbx_bar_resp_seq <= mbx_wdata_hold;
             12'h03c: begin
-                mbx_bar_resp_ctrl <= mbx_wdata_hold;
+                mbx_bar_resp_ctrl <= mbx_wdata_hold & BAR_RESP_CTRL_VALID_MASK;
                 if (mbx_wdata_hold[2] != mbx_bar_resp_toggle_seen) begin
                     mbx_bar_resp_toggle_seen <= mbx_wdata_hold[2];
                     mbx_bar_resp_pending <= 1'b1;
