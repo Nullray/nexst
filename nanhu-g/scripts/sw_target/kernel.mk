@@ -47,6 +47,10 @@ KERN_IMAGE := $(INSTALL_LOC)/Image
 
 ROOTFS_SRC := $(NANHU_G_SW_LOC)/rootfs
 INITRAMFS_TXT := $(abspath $(ROOTFS_SRC)/initramfs.txt)
+SCOPE_MMIO_LAT_USER_SRC := $(abspath ../tools/proto/scope_mmio_lat_user.c)
+SCOPE_MMIO_LAT_USER_ROOTFS_MK := $(ROOTFS_SRC)/apps/scripts/scope-mmio-lat-user/Makefile
+PCIUTILS_ROOTFS_MK := $(ROOTFS_SRC)/apps/scripts/pciutils/Makefile
+PCIUTILS_SRC_MK := $(ROOTFS_SRC)/apps/pciutils/Makefile
 
 KERN_COMPILE_FLAGS += CONFIG_INITRAMFS_SOURCE=$(INITRAMFS_TXT)
 
@@ -74,7 +78,12 @@ linux_distclean: $(obj-modules-clean-y)
 
 rootfs: $(INITRAMFS_TXT)
 
-$(INITRAMFS_TXT):
+$(INITRAMFS_TXT): $(ROOTFS_SRC)/Makefile \
+		  $(ROOTFS_SRC)/scripts/gen-initramfs-list.sh \
+		  $(SCOPE_MMIO_LAT_USER_ROOTFS_MK) \
+		  $(SCOPE_MMIO_LAT_USER_SRC) \
+		  $(PCIUTILS_ROOTFS_MK) \
+		  $(PCIUTILS_SRC_MK)
 	$(EXPORT_CC_PATH) && $(MAKE) -C $(ROOTFS_SRC) RISCV=$(abspath $(riscv_LINUX_GCC_PATH)/..) CROSS_COMPILE=$(riscv_LINUX_GCC_PREFIX)
 
 rootfs_clean:

@@ -1,2 +1,36 @@
 .vscode/
 **/ready_for_download
+
+# Independent repositories
+/qemu-mount/
+
+# Vivado and generated FPGA projects
+/.gen/
+/.srcs/
+**/.Xil/
+**/project_1/
+*.jou
+*.log
+*.str
+hs_err_pid*.log
+
+# Local build and runtime output
+/sandbox/
+/tools/proto/scope-mmio-lat-user
+/tools/proto/xdma_bypass_compare
+
+# Local debugging helpers
+/fix_*.py
+/test*.py
+/test*.tcl
+/get_old.sh
+/tools/fix_qemu_build_links.sh
+
+# Editor, backup, and downloaded reference files
+*.orig
+*.rej
+*.patch
+*.swp
+*~
+*.backup.*
+/*.pdf

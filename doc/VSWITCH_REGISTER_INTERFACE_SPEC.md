@@ -2,7 +2,7 @@
 
 ## 1. 文档约定
 
-本文档定义 `scope-fpga-vswitch-nvme` 与 `virtual_pcie_switch_proxy` 之间的运行时接口合同。内容以移除 SQE write-done monitor 后的仓库 14 实现为准。
+本文档定义 generic `scope-fpga-vswitch` 与 `virtual_pcie_switch_proxy` 之间的运行时接口合同。NVMe-only `scope-fpga-vswitch-nvme` 保留为兼容入口，并使用相同硬件合同。
 
 术语约定：
 
@@ -130,7 +130,7 @@ QEMU 在更新 ECAM shadow、同步相关 BAR route 并完成 readback fence 后
 | Local offset | `0x034`, `0x038`, `0x03c`, `0x04c` |
 | Access | RW; `BAR_RESP_CTRL` is commit-on-toggle |
 | Reset | All zero |
-| Producer | QEMU selected NVMe backend |
+| Producer | QEMU selected backend |
 | Consumer | FPGA MMIO response FSM |
 | Fields | 64-bit read data, sequence, AXI response, commit toggle, DONE request |
 | Ordering | DATA_LO, DATA_HI, SEQ, then CTRL toggle |
@@ -158,7 +158,7 @@ QEMU 必须按以下顺序写入：
 
 第 4 步是整条 response 的提交点。QEMU 不得在更新 data 或 sequence 之前翻转 toggle。
 
-`REQUEST_BAR_WRITE_DONE` 只用于需要等待 guest B handshake 的 early-response write，当前对应 Admin SQ doorbell。它不表示 SQE memory 已经可见。
+`REQUEST_BAR_WRITE_DONE` 只用于需要等待 guest B handshake 的 early-response write：NVMe Admin SQ doorbell，以及 IGB queue 0 的 `TDT/RDT`。它只确认 MMIO B handshake，不表示 SQE 或 NIC descriptor 已经可见。
 
 ### 3.5 INTx Registers (`0x050-0x058`)
 
@@ -321,7 +321,7 @@ ECAM shadow是内存窗口，不是寄存器组。QEMU通过BRAM Port B写入，
 | `0` | `00:00.0` | Root Port config |
 | `1` | `01:00.0` | Switch Upstream Port config |
 | `2 + 2*i` | `02:(i+1).0` | Downstream Port `i` config |
-| `3 + 2*i` | `(03+i):00.0` | NVMe endpoint `i` config |
+| `3 + 2*i` | `(03+i):00.0` | backend endpoint `i` config（NVMe或IGB） |
 
 其中`i=0..12`，共28个slot，占用`0x00000-0x1bfff`。`0x1c000-0x1ffff`为aperture尾部保留区，软件不得使用。
 
@@ -404,7 +404,71 @@ vSwitch packet固定为32字节，由FPGA产生、QEMU manager消费：
 
 QEMU按物理slot保存最后消费的`type + seq`。只有magic、len、type和sequence均合法且与slot历史不同的packet才会被分发。vSwitch允许的最大type为4。
 
-## 7. Ownership Matrix
+## 7. Vortex Endpoint BAR0 Contract
+
+Vortex endpoint使用`1b36:1310`、PCI class`0x120000`和一个4KB 32-bit BAR0。BAR绝对地址由Linux PCI resource allocator在`0x50000000/16MB`窗口中分配，因此软件必须使用PCI BAR mapping，不能假定固定绝对地址。
+
+| Contract field | Value |
+| --- | --- |
+| Register | Vortex Command Processor virtual BAR0 |
+| AXI address | Linux分配的endpoint BAR0 base + local offset |
+| XDMA offset | N/A |
+| Local offset | `0x000-0xfff` |
+| Access | 32-bit aligned MMIO only |
+| Reset | backend realize时queue disabled、tail/seq/error为0 |
+| Producer | 香山`libvortex-vswitch`/`scope_vortex` driver；QEMU提供RO状态 |
+| Consumer | QEMU Vortex backend |
+| Ordering | 64-bit地址先写LO再写HI；tail写HI是doorbell提交点 |
+| Invalid behavior | 非4字节、未对齐或未实现offset返回PCIe SLVERR |
+
+### 7.1 CP and Capability Registers
+
+| Offset | Name | Access | Meaning |
+| ---: | --- | --- | --- |
+| `0x000` | `CP_CTRL` | RW | bit0虚拟CP enable；其他位当前不保留状态 |
+| `0x008` | `DEV_CAPS` | RO | 物理U280 Vortex capability |
+| `0x010` | `CYCLE_LO` | RO | 最近完成物理job后的cycle snapshot低32位 |
+| `0x014` | `CYCLE_HI` | RO | 最近完成物理job后的cycle snapshot高32位 |
+| `0x018` | `GPU_CAPS_LO` | RO | GPU capability低32位 |
+| `0x01c` | `GPU_CAPS_HI` | RO | GPU capability高32位 |
+| `0x020` | `ISA_CAPS_LO` | RO | ISA capability低32位 |
+| `0x024` | `ISA_CAPS_HI` | RO | ISA capability高32位 |
+
+capability值由QEMU在连接`scope-vortex-bridge`时从物理Vortex CP读取。cycle值由Vortex worker在物理job完成后刷新；BAR read本身不跨socket同步访问U280。
+
+### 7.2 Queue Registers
+
+| Offset | Name | Access | Meaning |
+| ---: | --- | --- | --- |
+| `0x100` | `Q_RING_LO` | RW | guest coherent command ring地址低32位 |
+| `0x104` | `Q_RING_HI` | RW | guest coherent command ring地址高32位 |
+| `0x108` | `Q_HEAD_LO` | RW | guest head buffer地址低32位 |
+| `0x10c` | `Q_HEAD_HI` | RW | guest head buffer地址高32位 |
+| `0x110` | `Q_CMPL_LO` | RW | guest completion buffer地址低32位 |
+| `0x114` | `Q_CMPL_HI` | RW | guest completion buffer地址高32位 |
+| `0x118` | `Q_RING_LOG2` | RW | 必须为16，即64KB ring |
+| `0x11c` | `Q_CONTROL` | RW | bit0 enable；写bit1清虚拟tail/seq/error状态 |
+| `0x120` | `Q_TAIL_LO` | RW staging | guest单调tail低32位，不单独提交 |
+| `0x124` | `Q_TAIL_HI` | RW commit | 写入后和staged LO组成tail并提交 |
+| `0x128` | `Q_SEQNUM` | RO | QEMU已退休的guest command line累计数 |
+| `0x12c` | `Q_ERROR` | RO | 虚拟transport错误码 |
+| `0x130` | `Q_LAST_DCR` | RO | 最近一次DCR read结果 |
+
+`Q_ERROR`当前定义：`0`无错误，`1`bridge/RPC/物理job或数据搬运失败，`2`tail回退，`3`tail增量未按64B对齐或超过ring，`4`上一tail尚未捕获时又提交新tail，`5`guest command ring在5秒deadline内未得到两次一致的coherent-alias读取。QEMU对错误1和5推进受影响的`Q_SEQNUM`并保留错误，使runtime得到失败状态而不是无限等待。
+
+### 7.3 Queue Submission Ordering
+
+1. runtime通过驱动分配coherent ring/head/completion buffer。
+2. 依次写`Q_RING/Q_HEAD/Q_CMPL`的LO、HI和`Q_RING_LOG2=16`。
+3. 写`Q_CONTROL.enable=1`和`CP_CTRL.enable=1`。
+4. runtime填充完整64B command line。
+5. 写`Q_TAIL_LO`，最后写`Q_TAIL_HI`提交。
+6. QEMU通过coherent alias连续稳定读取新增command line并排入该backend worker。
+7. worker完成U280提交和必要数据回写后推进`Q_SEQNUM`。
+
+香山内核接口`/dev/scope-vortexN`实行单进程独占打开。其DMA handle只归属创建它的file descriptor；close会释放该fd所有buffer。
+
+## 8. Ownership Matrix
 
 | Interface | Producer/owner | Consumer | Commit condition |
 | --- | --- | --- | --- |
@@ -417,10 +481,13 @@ QEMU按物理slot保存最后消费的`type + seq`。只有magic、len、type和
 | `RP_INTX_CTRL` | QEMU | FPGA interrupt output | 32-bit register write |
 | INTx status/count | FPGA | QEMU/debug software | FPGA level transition |
 | Route diagnostics | FPGA | QEMU/debug software | 多route命中 |
+| Vortex virtual CP BAR | guest Vortex runtime/QEMU status | QEMU Vortex backend/guest runtime | `Q_TAIL_HI`提交；`Q_SEQNUM`退休 |
+| Vortex bridge RPC | QEMU Vortex worker | x86 `scope-vortex-bridge` | matching request ID response |
+| U280 host-only BO | x86 bridge/XRT | physical Vortex `m_axi_host` | XRT BO lifetime |
 
-## 8. Software Transaction Recipes
+## 9. Software Transaction Recipes
 
-### 8.1 Initialize vSwitch
+### 9.1 Initialize vSwitch
 
 1. 初始化并写入全部ECAM slot。
 2. readback fence后设置`ECAM_SHADOW_READY`。
@@ -430,7 +497,7 @@ QEMU按物理slot保存最后消费的`type + seq`。只有magic、len、type和
 6. 写`RP_INTX_CTRL=0`。
 7. 启动DMA32 ring consumer。
 
-### 8.2 Handle `CFG_WRITE`
+### 9.2 Handle `CFG_WRITE`
 
 1. 校验magic、type、len和BDF。
 2. 应用PCI config writable/W1C语义。
@@ -439,7 +506,7 @@ QEMU按物理slot保存最后消费的`type + seq`。只有magic、len、type和
 5. 执行shadow readback fence。
 6. 写`MBX_ACK=seq`。
 
-### 8.3 Return BAR Response
+### 9.3 Return BAR Response
 
 1. 处理BDF对应backend。
 2. read请求先写DATA_LO/HI；write请求跳过data。
@@ -447,21 +514,21 @@ QEMU按物理slot保存最后消费的`type + seq`。只有magic、len、type和
 4. 生成AXI response和可选DONE request。
 5. 翻转commit toggle并最后写`BAR_RESP_CTRL`。
 
-### 8.4 Update Shared INTx
+### 9.4 Update Shared INTx
 
-1. 重新计算所有backend的CQ pending与mask。
+1. 重新计算所有backend的pending与mask：NVMe使用CQ/INTMS，IGB使用virtual ICR/IMS。
 2. 对pending结果做OR。
 3. aggregate level变化或需要显式重写时写`RP_INTX_CTRL`。
 4. 可读`RP_INTX_STATUS/COUNT`用于诊断，不以count代替level语义。
 
-### 8.5 Read and Clear Route Error
+### 9.5 Read and Clear Route Error
 
 1. 读`ROUTE_ERROR_COUNT`作为采样起点。
 2. 读status和last address。
 3. 再读count；若变化则重新采样。
 4. byte0写`1`到`ROUTE_ERROR_STATUS`清sticky。
 
-## 9. Compile-Time Interface Constants
+## 10. Compile-Time Interface Constants
 
 下列值不是运行时寄存器：
 

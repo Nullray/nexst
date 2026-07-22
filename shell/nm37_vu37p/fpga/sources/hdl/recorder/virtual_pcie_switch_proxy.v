@@ -117,7 +117,7 @@ localparam PKT_BAR_WRITE = 32'd2;
 localparam PKT_BAR_READ  = 32'd3;
 localparam PKT_BAR_WRITE_DONE = 32'd4;
 localparam PKT_LEN = 32'd32;
-localparam MAX_NVME = 13;
+localparam MAX_BACKENDS = 13;
 localparam BDF_ROOT_PORT = 16'h0000;
 localparam BDF_SW_UP     = 16'h0100;
 localparam BAR_TAG_CFG   = 3'd7;
@@ -147,11 +147,11 @@ localparam MMIO_DONE_PKT = 2'd3;
 reg [31:0] seq_counter;
 
 reg [31:0] mbx_ack;
-reg [31:0] route_bar_lo [0:MAX_NVME-1];
-reg [31:0] route_bar_hi [0:MAX_NVME-1];
-reg [31:0] route_bar_size [0:MAX_NVME-1];
-reg [15:0] route_bdf [0:MAX_NVME-1];
-reg [31:0] route_ctrl [0:MAX_NVME-1];
+reg [31:0] route_bar_lo [0:MAX_BACKENDS-1];
+reg [31:0] route_bar_hi [0:MAX_BACKENDS-1];
+reg [31:0] route_bar_size [0:MAX_BACKENDS-1];
+reg [15:0] route_bdf [0:MAX_BACKENDS-1];
+reg [31:0] route_ctrl [0:MAX_BACKENDS-1];
 reg [31:0] proxy_ctrl;
 reg [31:0] mbx_bar_resp_data_lo, mbx_bar_resp_data_hi;
 reg [31:0] mbx_bar_resp_seq, mbx_bar_resp_ctrl;
@@ -297,7 +297,7 @@ function ecam_bdf_supported;
         ecam_bdf_supported = (bdf == BDF_ROOT_PORT) ||
                              (bdf == BDF_SW_UP) ||
                              ((busno == 8'd2) && (bdf[2:0] == 3'd0) &&
-                              (devno >= 5'd1) && (devno <= MAX_NVME)) ||
+                              (devno >= 5'd1) && (devno <= MAX_BACKENDS)) ||
                              ((busno >= 8'd3) && (busno <= 8'd15) &&
                               (devno == 5'd0) && (bdf[2:0] == 3'd0));
     end
@@ -315,7 +315,7 @@ function [4:0] ecam_bdf_slot;
         else if (bdf == BDF_SW_UP)
             ecam_bdf_slot = 5'd1;
         else if ((busno == 8'd2) && (devno >= 5'd1) &&
-                 (devno <= MAX_NVME) && (bdf[2:0] == 3'd0))
+                 (devno <= MAX_BACKENDS) && (bdf[2:0] == 3'd0))
             ecam_bdf_slot = 5'd2 + ((devno - 5'd1) << 1);
         else if ((busno >= 8'd3) && (busno <= 8'd15) &&
                  (devno == 5'd0) && (bdf[2:0] == 3'd0))
@@ -341,7 +341,7 @@ function [31:0] mbx_read32;
     begin
         roff = addr[11:0];
         ridx = (roff - 12'h100) >> 5;
-        if ((roff >= 12'h100) && (roff < 12'h2a0) && (ridx < MAX_NVME)) begin
+        if ((roff >= 12'h100) && (roff < 12'h2a0) && (ridx < MAX_BACKENDS)) begin
             case (roff[4:0])
             5'h00: mbx_read32 = route_bar_lo[ridx];
             5'h04: mbx_read32 = route_bar_hi[ridx];
@@ -395,7 +395,7 @@ function [3:0] route_first_index;
     begin
         route_first_index = 4'd0;
         found = 1'b0;
-        for (i = 0; i < MAX_NVME; i = i + 1) begin
+        for (i = 0; i < MAX_BACKENDS; i = i + 1) begin
             if (!found && route_hit(addr, i[3:0])) begin
                 route_first_index = i[3:0];
                 found = 1'b1;
@@ -409,7 +409,7 @@ function [1:0] route_hit_count;
     integer i;
     begin
         route_hit_count = 2'd0;
-        for (i = 0; i < MAX_NVME; i = i + 1)
+        for (i = 0; i < MAX_BACKENDS; i = i + 1)
             if (route_hit(addr, i[3:0]) && route_hit_count != 2'd3)
                 route_hit_count = route_hit_count + 1'b1;
     end
@@ -470,7 +470,7 @@ always @(posedge clk) begin
     if (rst) begin
         seq_counter <= 32'd0;
         mbx_ack <= 32'd0;
-        for (reset_i = 0; reset_i < MAX_NVME; reset_i = reset_i + 1) begin
+        for (reset_i = 0; reset_i < MAX_BACKENDS; reset_i = reset_i + 1) begin
             route_bar_lo[reset_i] <= 32'd0;
             route_bar_hi[reset_i] <= 32'd0;
             route_bar_size[reset_i] <= 32'd0;
