@@ -1,6 +1,6 @@
 # 跨软硬件协同虚拟 PCIe/外设系统架构
 
-本项目在 FPGA 原型平台上把香山 Linux 的 PCIe 配置访问、BAR MMIO 和真实设备 DMA 与 x86/QEMU 协同起来。当前仓库 14 的主线不再依赖 DUT-facing XDMA Root Port，而是由 FPGA 和 QEMU 实现一个 Linux 配置空间视角的虚拟 PCIe switch，并把主机侧真实 NVMe、Intel 82580 Ethernet function 或 U280 上的 Vortex GPGPU 作为 mediated backend 映射给香山。
+本项目在 FPGA 原型平台上把香山 Linux 的 PCIe 配置访问、BAR MMIO 和真实设备 DMA 与 x86/QEMU 协同起来。当前仓库 14 的主线不再依赖 DUT-facing XDMA Root Port，而是由 FPGA 和 QEMU 实现一个 Linux 配置空间视角的虚拟 PCIe switch，并通过受控backend把主机侧真实 NVMe、Intel 82580 Ethernet function 或 U280 上的 Vortex GPGPU 映射给香山。
 
 核心控制链路为：
 
@@ -23,7 +23,19 @@
 -> 香山 guest memory
 ```
 
-QEMU 负责控制面、地址翻译和状态机推进，不复制普通 NVMe IO 或 Ethernet packet data。真实 NVMe/82580 到 FPGA endpoint 的数据传输仍是 host PCIe fabric 上的 P2P DMA。Vortex 第一阶段使用独立 U280 XRT host-memory BO，QEMU 在香山 coherent alias 与该 BO 之间搬运命令的数据操作数，因此它是 mediated copy path，不宣称为设备到设备 P2P。
+Vortex 的主线数据链路为：
+
+```text
+U280 CP m_axi_host（PCIe requester）
+<-> host PCIe MRd/MWr
+<-> NM37 BAR2 coherent alias
+<-> u_role/s_axi_dma coherency 入口
+<-> 香山 guest memory
+```
+
+QEMU 负责控制面、地址翻译和状态机推进，不复制普通 NVMe IO、Ethernet packet 或
+Vortex `MEM_WRITE/MEM_READ` payload。三类真实设备的数据传输都走 host PCIe
+fabric P2P；Vortex 旧的 XRT BO 软件搬运路径仍作为显式 `mediated` 兼容模式保留。
 
 ## 1. 虚拟 PCIe 拓扑
 
@@ -91,6 +103,34 @@ ECAM shadow 实际保存 28 个 4KB function slot，共 112KB，BRAM aperture �
 | `0x100000000-0x1ffffffff` | coherent alias，经 role DMA/coherency 入口访问 guest memory |
 
 `axi_alias_attr_bridge.v` 对 alias 地址减去 `0x100000000`，并把 `AWCACHE/ARCACHE` 设置为 `4'hf`，随后将事务送入 `u_role/s_axi_dma`。QEMU 对 SQE/CQE 的访问以及 patch 给真实 NVMe 的 queue/data DMA 地址默认均使用 coherent alias。
+
+这里存在两个不同宽度、不同事务合同的 AXI 观察点，不能混为一谈：
+
+```text
+XDMA EP M_AXI_BYPASS（512-bit，250MHz）
+  |- raw DDR window
+  `- coherent alias window
+       -> axi_alias_attr_bridge（512-bit，减去alias base并设置cache属性）
+       -> AXI interconnect/width conversion
+       -> u_role/s_axi_dma（128-bit）
+```
+
+当前 XDMA IP 对 `M_AXI_BYPASS` 的接口元数据声明 `HAS_BURST=0`、
+`SUPPORTS_NARROW_BURST=0`。因此该原始观察点的合同是512-bit单beat事务；小于
+64B的写可通过部分`WSTRB`表达，而不能仅凭部分`WSTRB`认定为AXI narrow
+transfer。后级interconnect和位宽转换可能把一个512-bit beat重组为多个
+128-bit beat，所以对`u_role/s_axi_dma`的事务判断必须在后级接口单独观察。
+
+QEMU使用两种相关但不同的地址：访问`/dev/xdma0_bypass`时使用BAR内offset，
+真实NVMe/82580 DMA则使用主机PCIe地址。二者都按下式选择coherent alias：
+
+```text
+alias_offset  = 0x100000000 + guest_pa
+real_dma_addr = fpga_bypass_bar_host_base + alias_offset
+```
+
+地址翻译保留guest PA本身作为raw offset，而不是减去`guest-ddr-base`；
+`guest-ddr-base/size`只负责合法范围检查。
 
 ## 3. QEMU Manager 与 Backend
 
@@ -229,23 +269,126 @@ TDT和RDT分别进入独立的64项有序pending FIFO。每个方向内部保持
 
 真实 82580 的 PCI INTx 被禁用并保持 IMC mask；QEMU轮询真实 ICR和link状态，把 cause保存到virtual ICR/IMS。guest读取ICR按read-clear语义消费cause，各backend的pending做OR后驱动同一根aggregate INTx。guest写`CTRL.RST`不会无条件穿透：backend先停DMA并mask中断，等待真实reset完成，再清空自己的ring、tail和interrupt shadow。
 
-### 4.5 Vortex U280 Mediated Backend
+### 4.5 Vortex U280 控制中转与数据 P2P Backend
 
-Vortex endpoint 暴露 4KB Command Processor BAR0。香山 `scope_vortex` PCI driver 通过 ioctl 提供32-bit CP寄存器访问，并用`dma_alloc_coherent()`建立guest command ring和host staging buffer。rootfs中的RISC-V静态程序把Vortex common runtime与vSwitch callback transport直接链接在同一个ELF中，因此原生`vecadd`主程序不需要理解QEMU协议，也不依赖guest中的`libvortex*.so`或动态C++运行库。
+Vortex endpoint 暴露 4KB Command Processor BAR0。香山 `scope_vortex` PCI driver
+通过ioctl提供32-bit CP寄存器访问，并用`dma_alloc_coherent()`建立guest command
+ring和数据buffer。RISC-V应用把Vortex common runtime与vSwitch callback
+transport静态链接在同一个ELF中；应用和通用runtime不需要理解FPGA BAR packet、
+QEMU/bridge RPC或XRT地址。
 
-guest提交tail后，QEMU在worker线程中完成：
+#### 4.5.1 地址所有权与direct-P2P数据路径
+
+Vortex路径同时存在五类互不等价的地址：
+
+| 地址 | 所有者和含义 | 能否直接交给物理CP |
+| --- | --- | --- |
+| guest command/data PA | 香山`dma_alloc_coherent()`返回的guest DMA地址 | 否，必须翻译 |
+| NM37 BAR2 coherent-alias offset | `0x100000000 + guest_pa` | 作为peer BAR目标 |
+| U280 peer-window CP地址 | Address Translator映射到NM37 BAR2的地址 | 是 |
+| XRT control BO CP地址 | 物理command ring等小型控制对象 | 是 |
+| Vortex device地址 | U280 HBM逻辑地址 | 是，经过aperture范围检查 |
+
+第一阶段只把Address Translator指向XRT管理的host-only BO，因此香山PA和
+coherent alias不能原样交给物理CP，必须经QEMU软件搬运。当前direct-P2P模式
+把translator后16个4MiB entry重映射为一个64MiB NM37 BAR2动态窗口；U280
+`m_axi_host`保持原有AXI requester语义，但其PCIe目标由该窗口决定：
 
 ```text
-读取coherent alias中的64B command line
--> 对MEM_WRITE/MEM_READ中的guest DMA PA建立U280 XRT host-only BO
--> 上传或记录下载目标，并把命令地址patch成U280 CP可见地址
--> 通过Unix socket RPC写物理CP ring并提交tail
--> 等待物理Q_SEQNUM完成
--> 对MEM_READ把BO内容写回guest coherent alias
--> 更新虚拟Q_SEQNUM/Q_ERROR
+MEM_WRITE:
+  U280 PCIe MRd -> NM37 BAR2 coherent alias -> 香山DDR -> U280 HBM
+
+MEM_READ:
+  U280 HBM -> U280 PCIe MWr -> NM37 BAR2 coherent alias -> 香山DDR
 ```
 
-主机进程`scope-vortex-bridge`动态加载`libvortex-xrt.so`，负责U280 xclbin加载、CP寄存器访问和XRT host-memory BO生命周期。QEMU的共享RX线程不等待GPU执行；每个Vortex backend由独立worker处理长命令。第一阶段支持vecadd所需的memory、DCR、launch、fence和flush命令，不支持device event/profile命令，也不生成INTx。
+固定地址合同为guest DDR `[0x80000000, 0x100000000)`、BAR2 alias offset
+`0x100000000`、translator slot 4MiB、peer window 64MiB。QEMU按下式选择窗口并
+patch `MEM_WRITE/MEM_READ`的host operand：
+
+```text
+window_guest_base = clamp(align_down(guest_pa, 4MiB), DDR末端-64MiB)
+bar_offset        = 0x100000000 + window_guest_base
+cp_operand        = peer_cp_base + guest_pa - window_guest_base
+```
+
+QEMU和bridge只提交映射与命令，Socket不传输MEM payload，日志中的
+`payload_cpu_bytes`必须为0。`MEM_COPY`及Vortex device地址保持在U280 HBM域中。
+旧的XRT BO搬运只在JSON明确选择`mediated`时使用，direct-P2P出错不会静默回退。
+主机进程`scope-vortex-bridge`动态加载`libvortex-xrt.so`，并独占U280 xclbin、
+物理CP、control BO和peer mapping生命周期。
+
+#### 4.5.2 虚拟CP、物理CP与并发边界
+
+实现维护两套独立队列状态：
+
+| 状态 | 存储位置 | 所有者 |
+| --- | --- | --- |
+| guest ring/head/completion、virtual tail/seqnum | 香山DDR和QEMU `ScopeVortexState` | guest runtime与QEMU |
+| physical ring/head/completion、physical tail/seqnum | XRT host-only BO和U280 CP | QEMU worker与bridge |
+
+guest提交tail后的状态推进为：
+
+```text
+guest写64B command line并提交virtual tail
+-> QEMU通过coherent alias连续读取两次并确认内容稳定
+-> 复制为不可变ScopeVortexJob
+-> worker提交MEM命令前的普通physical batch并等待完成
+-> 计算64MiB窗口，必要时PEER_MAP并取得generation
+-> patch单条MEM命令的host operand
+-> 单独提交该MEM命令并等待physical Q_SEQNUM/Q_ERROR
+-> 再处理后续命令
+-> 更新virtual Q_SEQNUM/Q_ERROR
+```
+
+窗口只在前一physical batch完成后切换，避免重编程translator时仍有PCIe请求在途。
+`MEM_READ`的posted MWr在RTL中以同一目标地址的64B readback结束；只有收到该MRd
+completion，命令才报告完成。RRESP/BRESP错误进入queue `Q_ERROR`。
+
+共享DMA32 RX线程只负责BAR packet和稳定快照，不等待U280执行。每个Vortex
+backend的专用worker是bridge socket的唯一QEMU所有者，长时间GPU执行不会阻塞
+NVMe、IGB或其他Vortex backend的公共控制面。
+
+当前物理RTL的queue reset pulse不会清除fetch `head_r`或engine
+`seqnum_r`。QEMU连接或重连bridge时必须先读取物理seqnum，并按common
+runtime“一条命令占一个64B line”的合同恢复：
+
+```text
+physical_tail = physical_seqnum * 64
+```
+
+随后继续使用单调physical tail并在访问ring BO时按64KB ring大小取模。guest
+打开device时只复位虚拟tail、seqnum和error，不得用guest reset覆盖物理BO地址
+或物理seqnum基线。job失败时QEMU设置virtual `Q_ERROR`并退休对应virtual
+seqnum，使guest获得错误而不是永久自旋；当前Vortex endpoint不生成INTx。
+
+#### 4.5.3 CP命令与单bank地址合同
+
+当前backend接受：
+
+```text
+NOP
+MEM_WRITE / MEM_READ / MEM_COPY
+DCR_WRITE / DCR_READ
+LAUNCH
+FENCE
+CACHE_FLUSH
+```
+
+`EVENT_SIGNAL/EVENT_WAIT`、profile flag、`LAUNCH_QMD`、`DRAW`和未知opcode
+会被拒绝。这里定义的是transport和物理CP的命令能力合同，不与某一个测试程序
+绑定。
+
+当前U280 xclbin使用一个256MiB HBM bank，platform memory address width为
+28位。RTL最终只保留Vortex device地址低28位：
+
+```text
+physical_hbm_offset = vortex_device_address & 0x0fffffff
+```
+
+因此不同高位VMA可能指向同一物理HBM位置。当前guest RV32 kernel链接到
+`0x08000000`，用于避开低地址console和buffer区域；这个链接地址属于当前
+单bank软硬件地址合同，而不是任意可替换的部署参数。
 
 ### 4.6 Block Design
 
@@ -257,6 +400,9 @@ guest提交tail后，QEMU在worker线程中完成：
 - `u_role/m_axi_mem` 经 DDR register slice 直接接入 DDR interconnect；
 - vSwitch `interrupt_out` 接 `role_intr_concat/In1`；
 - XDMA EP bypass 分成 raw DDR 和 coherent alias 两个分支；
+- `system_ila_4`直接观察512-bit `xdma_ep/M_AXI_BYPASS`，用于区分host
+  bypass事务与后级128-bit role DMA事务；由于XDMA接口声明
+  `HAS_BURST=0`，System ILA不会自动保留`AWBURST/ARBURST`探针；
 - DUT-facing `xdma_rp` 不再属于当前 vSwitch bitstream。
 
 ## 5. 配置与 MMIO 控制流程
@@ -289,7 +435,10 @@ Linux ECAM write
 Linux 访问 endpoint BAR0
 -> FPGA 13 项 route table 唯一命中
 -> BAR_READ/BAR_WRITE packet 携带 virtual BDF、BAR、offset、size、wstrb
--> QEMU 选择 backend 并处理 NVMe register/doorbell
+-> QEMU按BDF/backend_id选择ScopeBackendOps
+   |- NVMe：真实BAR、doorbell和queue地址翻译
+   |- IGB：虚拟寄存器、descriptor和tail推进
+   `- Vortex：虚拟CP寄存器和command job提交
 -> QEMU 写 BAR response mailbox
 -> FPGA 返回 AXI R/B response
 ```
@@ -333,9 +482,9 @@ aggregate_intx = OR(backend[i].intx_pending)
 
 任一 backend 仍有未消费 CQE 时，共享 `interrupt_out` 保持高电平。某个 endpoint 的 CQ doorbell、INTMS 或 `CC.EN=0` 只能更新自己的状态；只有 aggregate pending 变为零时，QEMU 才向 FPGA 写 INTx level 0。`intx-retry-pulse` 是默认关闭的调试属性，不属于正常中断语义。
 
-## 7. Linux 与 Rootfs
+## 7. Linux 软件边界
 
-### 7.1 Device Tree
+### 7.1 PCI Host Bridge 与标准驱动
 
 `nanhu-g/software/dt/XSTop_vpcie.dts` 使用：
 
@@ -347,31 +496,24 @@ PCI memory = 0x50000000 / 16MB
 INTA-D     -> PLIC interrupt 2
 ```
 
-Linux 使用标准 PCI core、NVMe driver 和内建 `igb` driver，不需要了解 QEMU backend BDF 或 coherent alias host 地址。Vortex endpoint由`drivers/misc/scope_vortex.c`绑定并生成`/dev/scope-vortexN`。仓库14的 RISC-V defconfig 已启用`CONFIG_IGB=y`和`CONFIG_SCOPE_VORTEX=y`，PTP clock仍关闭。
+Linux使用标准PCI core和`pci-host-ecam-generic`枚举QEMU合成的拓扑。NVMe和
+82580 endpoint分别绑定标准`nvme`和`igb`驱动；guest只认识虚拟BDF、
+BAR和guest DMA地址，不知道真实host BDF、XDMA BAR host base或coherent-alias
+主机地址。地址翻译、真实设备所有权和中断聚合都停留在QEMU/backend边界。
 
-### 7.2 PCI 工具
+### 7.2 Vortex Guest Transport
 
-rootfs 集成完整 pciutils `lspci` 和 `pci.ids`，安装为 `/usr/bin/lspci`，覆盖 BusyBox 同名简化 applet。常用检查包括：
+Vortex endpoint由`drivers/misc/scope_vortex.c`绑定并生成
+`/dev/scope-vortexN`。该驱动只实现合成设备所需的transport边界：
 
-```text
-lspci -tv
-lspci -nnvv
-lspci -s 03:00.0 -vvxxx
-lspci -k
-```
+- 对4KB BAR0进行对齐的32-bit CP寄存器访问；
+- 分配、释放和mmap coherent DMA buffer；
+- 把每个打开文件拥有的DMA对象与其他进程隔离，并限制单次分配大小。
 
-使用`VORTEX_ENABLE=1`构建rootfs时，会安装`/bin/vortex-vecadd`、静态`/bin/vx-vecadd`、静态`/bin/scope-vortex-check`、`kernel.vxbin`和`/usr/lib/vortex/build-info`。非默认硬件配置通过`VORTEX_CONFIGS`传入，并必须与U280 xclbin使用的Vortex配置一致；wrapper先比较物理U280 capability和编译配置，再启动vecadd。该功能默认关闭，避免没有Vortex RV32工具链的普通rootfs构建被可选组件阻塞。
-
-### 7.3 网络配置
-
-rootfs 安装 BusyBox `udhcpc` 的默认事件脚本到`/usr/share/udhcpc/default.script`。脚本在`bound/renew`事件中配置IPv4地址、默认路由和DNS，在`deconfig`事件中移除旧IPv4地址并保持接口up。该脚本是DHCP控制面的必要组成部分；DHCP协议交换成功本身不会自动修改Linux接口地址。
-
-标准启动顺序为：
-
-```text
-ip link set eth0 up
-udhcpc -i eth0 -f -q
-```
+Vortex common runtime通过callback使用这些UAPI，kernel loader、buffer管理和
+测试程序不依赖FPGA/QEMU协议。物理U280 capability由bridge读取、QEMU缓存并
+通过虚拟CP BAR发布；guest runtime配置、RV32 kernel与U280 xclbin必须遵守同一
+cores/warps/threads、ISA和memory-bank合同。
 
 ## 8. XDMA Host 驱动
 
@@ -382,22 +524,25 @@ udhcpc -i eth0 -f -q
 - C2H cyclic DMA 启停和 stale transfer 清理；
 - bypass BAR 映射，用于 QEMU访问 coherent alias guest memory。
 
-QEMU 异常退出、重新烧 bitstream 或 PCIe link 重建后，应确保旧 cyclic transfer 被停止，避免新 manager 继承失效 ring 状态。
+DMA32 ring和cyclic transfer由单个manager session独占。manager cleanup先停止
+transfer再释放ring；驱动的stale-transfer清理保证进程异常退出、bitstream重载
+或PCIe link重建后，新session不会继承指向失效ring的DMA状态。
 
 ## 9. 当前实现边界
 
 当前静态实现支持：
 
-- 启动时配置 `0..13` 个NVMe、82580或Vortex backend；
+- 启动时配置0至13个NVMe、82580或Vortex backend；
 - generic ECAM 虚拟 switch 拓扑；
 - QEMU 权威维护多 BDF config shadow；
 - 每 endpoint 独立 BAR0 和设备私有状态；
 - NVMe queue、PRP/PRP list、CQ 和 namespace LBA shift；
 - 82580 queue 0 TX/RX ring、descriptor-type-aware DMA地址翻译、独立TX/RX pending、virtual ICR/IMS和受控reset；
-- Vortex 4KB CP BAR、guest/physical command ring转换、U280 XRT bridge和vecadd rootfs入口；
-- coherent alias P2P DMA；
+- Vortex 4KB CP BAR、guest/physical双队列、动态peer window、MEM命令direct-P2P和物理seqnum重连恢复；
+- NVMe/82580经coherent alias对香山guest memory执行host PCIe fabric P2P DMA；
+- Vortex由U280作为PCIe requester经NM37 BAR2 coherent alias直接访问香山guest memory；
+- Vortex显式`mediated`兼容模式；direct-P2P模式禁止silent fallback；
 - 共享 level INTx；
-- PRP list 和 namespace LBA shift；
 - BAR_DONE timeout recovery。
 
 当前不实现：
@@ -407,11 +552,13 @@ QEMU 异常退出、重新烧 bitstream 或 PCIe link 重建后，应确保旧 c
 - 运行时增加/删除 backend；
 - BAR0 之外的 endpoint BAR；
 - 82580多队列、MSI/MSI-X、BAR3、VFIO eventfd和PTP；
-- Vortex device event/profile命令、GPU fault interrupt和零拷贝guest-to-U280数据路径；
+- Vortex device event/profile命令、GPU fault interrupt和多owner共享peer window；
 - 把一个真实 NVMe 控制器虚拟成多个隔离 controller；
 - 完整 16MB ECAM RAM。
 
-真实设备必须由 QEMU 独占。NVMe必须能够干净进入 `CSTS.RDY=0`；如果出现 `RDY=1/CFS=1`，应先恢复真实控制器状态。82580必须整卡四个function均从host驱动解绑。当前单队列路径已完成标准`igb`绑定、link/carrier、DHCP租约、IPv4配置和双向ping验证；长时间收发、吞吐、接口反复up/down及reset压力仍属于后续验收范围。
+真实NVMe/82580 function必须由对应QEMU backend独占，U280 user PF、xclbin和XRT
+context必须由`scope-vortex-bridge`独占。这是当前设备生命周期和故障隔离边界；
+设计不提供同一真实function的多租户共享、热迁移或运行时backend替换。
 
 ## 10. 关键文件
 
@@ -429,8 +576,7 @@ QEMU 异常退出、重新烧 bitstream 或 PCIe link 重建后，应确保旧 c
 | `shell/nm37_vu37p/fpga/scripts/xiangshan.tcl` | Vivado BD 连接与地址段 |
 | `nanhu-g/software/dt/XSTop_vpcie.dts` | generic ECAM host bridge Device Tree |
 | `work_farm/software/linux/drivers/misc/scope_vortex.c` | 香山Vortex PCI transport和coherent DMA UAPI |
-| `nanhu-g/software/rootfs/apps/scripts/vortex-vecadd` | Vortex runtime、kernel和vecadd的可选rootfs集成 |
-| `nanhu-g/software/rootfs/files/usr/share/udhcpc/default.script` | DHCP租约的IPv4地址、路由和DNS安装脚本 |
+| `doc/VSWITCH_VORTEX_INTEGRATION_DESIGN.md` | Vortex endpoint、双CP队列、地址所有权和RPC设计合同 |
 | `shell/software/xdma_drv/XDMA/linux-kernel/xdma` | DMA32 cyclic ring 和 XDMA host access |
 | `doc/VSWITCH_REGISTER_INTERFACE_SPEC.md` | mailbox、route、ECAM shadow 与 packet ABI 接口合同 |
 | `doc/VSWITCH_NIC_INTEGRATION_STUDY.md` | 82580 mediated backend技术依据、实现约束和验证状态 |

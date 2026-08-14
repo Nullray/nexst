@@ -3,7 +3,8 @@
   "devices": [
     {
       "type": "vortex",
-      "bridge-socket": "/run/scope-vortex0.sock"
+      "bridge-socket": "/run/scope-vortex0.sock",
+      "data-path": "direct-p2p"
     }
   ]
 }

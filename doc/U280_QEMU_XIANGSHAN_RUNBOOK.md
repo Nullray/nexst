@@ -23,7 +23,7 @@
 /home/yanjiarun/Vortex/tools/scope_vortex_bridge/scope-vortex-bridge
 /home/yanjiarun/Vortex/sw/runtime/libvortex-xrt.so
 /home/yanjiarun/Vortex/hw/syn/xilinx/xrt/
-  build1_u280_xilinx_u280_gen3x16_xdma_1_202211_1_hw/bin/vortex_afu.xclbin
+  build1_p2p_xilinx_u280_gen3x16_xdma_1_202211_1_hw/bin/vortex_afu.xclbin
 /home/yanjiarun/nexst_proxy_14/qemu-mount/build/qemu-system-x86_64
 /home/yanjiarun/nexst_proxy_14/tools/proto/pcie-util
 /home/yanjiarun/nexst_proxy_14/nanhu-g/ready_for_download/proto_nm37_vu37p/bootrom.bin
@@ -31,15 +31,20 @@
 /home/yanjiarun/nexst_proxy_14/nanhu-g/ready_for_download/proto_nm37_vu37p/RV_BOOT_vortex_1bank.bin
 ```
 
-用于当前 `build1...xclbin` 的镜像是 `RV_BOOT_vortex_1bank.bin`，其中包含：
+用于当前 `build1...xclbin` 的镜像是 `RV_BOOT_vortex_1bank.bin`。镜像包含 capability checker、通用启动器和一组彼此独立的 host/kernel：
 
 ```text
-/bin/vortex-vecadd
-/bin/vx-vecadd
 /bin/scope-vortex-check
-/usr/lib/vortex/kernel.vxbin
+/bin/vortex-run
+/bin/vortex-run-all
+/bin/vortex-{vecadd,sgemm,conv3,multikernel,bfs,sort}
+/bin/vx-{vecadd,sgemm,conv3,multikernel,bfs,sort}
+/usr/lib/vortex/{vecadd,sgemm,conv3,multikernel,bfs,sort}.vxbin
 /usr/lib/vortex/build-info
 ```
+
+`vortex-TEST` 是指向 `vortex-run` 的软链接。启动器会自动选择同名静态 host
+程序和 `/usr/lib/vortex/TEST.vxbin`；`vortex-run TEST ...` 也可直接使用。
 
 当前 `build1...xclbin` 只连接 `m_axi_mem_0 -> HBM[0]`。匹配的 guest
 runtime/kernel 已按以下参数重新构建并封装到上述新镜像：
@@ -52,7 +57,13 @@ VX_CFG_PLATFORM_MEMORY_ADDR_WIDTH=28
 ```
 
 原来的 `RV_BOOT.bin` 仍保留为 32-bank 版本，没有被覆盖；不要将它与当前
-单-bank xclbin 组合使用。重新生成单-bank 镜像可执行：
+单-bank xclbin 组合使用。
+
+当前direct-P2P xclbin已经从包含`VX_cp_dma.sv` readback/error修改的RTL重新
+生成，Vitis/Vivado实现完成且满足时序约束。板级验收必须使用上述
+`build1_p2p.../vortex_afu.xclbin`，不能退回旧的`build1_u280...`产物。
+
+重新生成单-bank guest镜像可执行：
 
 ```bash
 cd /home/yanjiarun/nexst_proxy_14
@@ -74,12 +85,13 @@ cd /home/yanjiarun/nexst_proxy_14
 ### 每次主机启动后做
 
 1. 检查 U280、香山 FPGA 和 BDF。
-2. 运行本地 XRT 启动脚本；它装载 U280 驱动并启用 1 GiB host memory。
+2. 运行本地XRT direct-P2P启动脚本；它装载驱动、启用64MiB control Host
+   Memory、加载xclbin并校验相邻64MiB peer window。
 3. 确认香山侧 `xdma` 驱动和 `/dev/xdma0_*`。
-4. 启动 Vortex bridge；bridge 会加载 xclbin。
+4. 启动Vortex bridge；bridge会打开同一xclbin并提供peer RPC。
 5. 启动采用 Vortex backend JSON 的 QEMU manager。
-6. 装载香山 `bootrom.bin`、`RV_BOOT.bin` 并打开串口。
-7. 在香山 Linux 中检查虚拟 PCIe endpoint、驱动和 vecadd。
+6. 装载香山 `bootrom.bin`、`RV_BOOT_vortex_1bank.bin` 并打开串口。
+7. 在香山 Linux 中检查虚拟 PCIe endpoint、驱动和 Vortex 测试套件。
 
 仅仅执行 `xbutil program` 成功还不够。QEMU 运行期间必须一直有 bridge
 进程提供 `/run/scope-vortex0.sock`。
@@ -146,7 +158,12 @@ JTAG 配置是易失的。配置 `system.bit` 后，应在保持板卡供电的�
 
 ```bash
 cd /home/yanjiarun/nexst_proxy_14
-./tools/u280_xrt_start.sh
+sudo ./tools/u280_xrt_start.sh \
+  --vortex-p2p \
+  --u280-bdf 0000:ab:00.1 \
+  --peer-bdf 0000:2a:00.0 \
+  --xclbin /home/yanjiarun/Vortex/hw/syn/xilinx/xrt/\
+build1_p2p_xilinx_u280_gen3x16_xdma_1_202211_1_hw/bin/vortex_afu.xclbin
 source ./tools/u280_xrt_env.sh
 
 xbutil examine --device 0000:ab:00.1 --report platform pcie-info
@@ -154,8 +171,18 @@ cat /sys/bus/pci/devices/0000:ab:00.1/host_mem_size
 ```
 
 预期 user PF 为 `10ee:500d`、驱动为 `xocl`，`Enabled Host Memory` 为
-`1 GB`，sysfs 值为 `1073741824`。后续不要混用 `/opt/xilinx/xrt` 的 XRT
-2.14 工具和本地 XRT 2.16 驱动；bridge 也必须解析到本地 XRT 2.16 动态库。
+`64 MB`，sysfs值为`67108864`。脚本还必须打印slot size `4194304`、control
+size `67108864`、peer size `67108864`，以及：
+
+```text
+Bridge allowlist argument: --allow-peer-bdf 0000:2a:00.0
+```
+
+若已经加载了不带`vortex_peer_mode=1`的xocl、Host Memory仍为1GiB，或bridge
+正在占用U280，脚本会列出相关进程并退出，不会自动解绑设备。停止用户进程后，
+由管理员显式卸载旧模块/禁用旧Host Memory，再重新运行脚本。后续不要混用
+`/opt/xilinx/xrt`的XRT 2.14工具和本地XRT 2.16驱动；bridge也必须解析到本地
+XRT 2.16动态库。
 
 每次 bridge 启动前可检查：
 
@@ -166,8 +193,8 @@ ldd /home/yanjiarun/Vortex/sw/runtime/libvortex-xrt.so | grep -E 'xrt|not found'
 
 ## 6. 启动 Vortex bridge（终端 A）
 
-手工执行 `xbutil program` 只完成加载验证。正式链路让 bridge 打开 XRT device
-并加载同一 xclbin，因此即使刚刚加载成功，也仍执行下面的命令：
+启动脚本中的`xbutil program`同时建立并验证HOST translator topology。正式链路
+仍由bridge打开XRT device和同一xclbin，因此脚本成功后继续执行下面的命令：
 
 ```bash
 sudo env \
@@ -177,8 +204,9 @@ sudo env \
     --socket /run/scope-vortex0.sock \
     --driver-lib /home/yanjiarun/Vortex/sw/runtime/libvortex-xrt.so \
     --device-index 0 \
+    --allow-peer-bdf 0000:2a:00.0 \
     --xclbin /home/yanjiarun/Vortex/hw/syn/xilinx/xrt/\
-build1_u280_xilinx_u280_gen3x16_xdma_1_202211_1_hw/bin/vortex_afu.xclbin
+build1_p2p_xilinx_u280_gen3x16_xdma_1_202211_1_hw/bin/vortex_afu.xclbin
 ```
 
 保持终端 A 运行。另开终端检查：
@@ -218,6 +246,10 @@ guest-ddr-base=0x80000000,guest-ddr-size=0x80000000,\
 dma32-ring-size=0x10000
 ```
 
+该JSON明确设置`"data-path": "direct-p2p"`。因此peer capability、BAR2范围、
+mapping generation或physical `Q_ERROR`任一检查失败都会让backend报错退出，
+不会回退到Socket payload搬运。
+
 保持终端 B 运行。这里的 `fpga-host-bdf` 是香山/NM37 的 `0000:2a:00.0`，
 不是 U280 的 `ab:00.0` 或 `ab:00.1`。若启动时重新枚举出了不同 BDF，应把
 命令中的值同步改为 `10ee:903f` 对应的新 BDF。
@@ -254,6 +286,12 @@ cd /home/yanjiarun/nexst_proxy_14/tools/proto
 sudo ./load_and_run_5.sh xdma0
 ```
 
+当前镜像把控制台shell配置为BusyBox `respawn` action；shell打开console失败、
+收到EOF或意外退出后，PID 1会重新启动它，不再停留在只完成`sysinit`的状态。
+如果画面仍只显示`Run /init as init process`，先按一次回车并输入
+`echo SHELL_ALIVE`：能看到回显说明系统已进入shell，只是无换行的prompt字符丢失，
+使用上面的单参数命令重新连接UART即可；完全没有回显时再重新装载镜像。
+
 ## 9. 香山 Linux 内验收
 
 进入香山 shell 后执行：
@@ -264,6 +302,15 @@ ls -l /dev/scope-vortex*
 cat /usr/lib/vortex/build-info
 scope-vortex-check
 vortex-vecadd -n 64
+vortex-sgemm -n 32
+vortex-conv3 -n 32
+vortex-conv3 -n 32 -l
+vortex-multikernel -n 128
+vortex-bfs -n 256
+vortex-sort -n 16
+
+# 或按上述保守规模依次执行整套测试，首项失败即停止
+vortex-run-all
 ```
 
 预期结果：
@@ -272,12 +319,16 @@ vortex-vecadd -n 64
 - kernel driver 为 `scope-vortex`，并出现 `/dev/scope-vortex0`。
 - `scope-vortex-check` 报告的 core/warp/thread、memory bank、address width 和
   ISA 与物理 xclbin 一致。
-- `vortex-vecadd` 完成逐元素结果校验。
+- `vortex-vecadd` 验证基本上传、launch 和双向搬运。
+- `sgemm`、`conv3` 覆盖浮点矩阵/卷积；`conv3 -l` 额外覆盖本地内存路径。
+- `multikernel` 覆盖同一进程连续装载/启动多个 kernel；`bfs` 和 `sort` 覆盖
+  更不规则的访存及同步模式。
+- `vortex-run-all` 只有在全部命令均返回成功时才打印最终通过。
 
 当前单-bank `build1...xclbin` 应与 `RV_BOOT_vortex_1bank.bin` 内的
 `build-info` 一致。如果误加载原来的 32-bank `RV_BOOT.bin`，
-`scope-vortex-check` 失败是正确的保护行为；不要跳过 checker 强行把 vecadd
-结果记为通过。
+`scope-vortex-check` 失败是正确的保护行为；不要跳过 checker 强行运行或把
+任何计算测试记为通过。
 
 ## 10. 故障定位顺序
 
@@ -285,19 +336,22 @@ vortex-vecadd -n 64
 
 1. `lspci`：U280 `500c/500d` 和香山 FPGA `903f` 是否都存在。
 2. 驱动：U280 是否为 `xclmgmt/xocl`，香山是否为 `xdma`。
-3. U280：`xbutil examine` 是否健康、host memory 是否为 1 GiB。
+3. U280：`xbutil examine`是否健康、host memory是否为64MiB、peer query是否
+   报告4MiB slot和两个64MiB窗口。
 4. bridge：进程是否存在、`/run/scope-vortex0.sock` 是否为 socket。
 5. QEMU：终端 B 是否仍运行，是否连接 bridge，是否独占 `/dev/xdma0_*`。
 6. 香山启动：bootrom/firmware load 是否完成，readback fence 是否成功，UART
    是否出现 OpenSBI/Linux 输出。
 7. guest PCI：是否枚举 `1b36:1310`，`scope_vortex` 是否 probe 成功。
 8. capability：xclbin 与 `build-info` 是否完全一致。
-9. 数据路径：最后才运行 `vortex-vecadd -n 64`。
+9. 基本数据路径：先运行 `vortex-vecadd -n 64`。
+10. 扩展回归：基本测试通过后再运行 `vortex-run-all`；若失败，单独重跑它
+    打印的最后一个测试命令。
 
 ## 11. 正常停止顺序
 
 1. 在香山 Linux 中执行 `sync`；需要停止系统时再执行 `poweroff`。
-2. 在终端 C 用 `Ctrl-A X` 退出 UART。
+2. 在终端 C 用 `Ctrl-\` 退出 UART。
 3. 在终端 B 用 `Ctrl-C` 停止 QEMU manager。
 4. 在终端 A 用 `Ctrl-C` 停止 bridge。
 5. 用 `pgrep -af 'scope-vortex-bridge|qemu-system-x86_64|pcie-util.*uart'`
