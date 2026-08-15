@@ -54,7 +54,13 @@ VX_CFG_NUM_CLUSTERS=1
 VX_CFG_NUM_CORES=1
 VX_CFG_PLATFORM_MEMORY_NUM_BANKS=1
 VX_CFG_PLATFORM_MEMORY_ADDR_WIDTH=28
+VORTEX_STARTUP_ADDR=0x08000000
 ```
+
+`STARTUP_ADDR=0x08000000` 是当前所有 RV32 `.vxbin` 的链接/装载基址，位于单个
+256 MiB HBM bank 的合法地址范围内。不能把使用旧默认值 `0x80000000` 构建的
+kernel 与当前 28-bit HBM 地址空间组合；这类错误不一定在 capability checker
+阶段暴露，可能表现为 module load、launch 或运行结果异常。
 
 原来的 `RV_BOOT.bin` 仍保留为 32-bank 版本，没有被覆盖；不要将它与当前
 单-bank xclbin 组合使用。
@@ -70,8 +76,26 @@ cd /home/yanjiarun/nexst_proxy_14
 ./tools/build_vortex_guest_single_bank.sh
 ```
 
-该脚本使用 `/usr/bin/riscv64-linux-gnu-*`，不会修改 `/opt`，并在结束前检查
-镜像内嵌的 bank 数和地址宽度。
+该脚本使用 `/usr/bin/riscv64-linux-gnu-*`，不会修改 `/opt`。当前版本会统一
+传入 `STARTUP_ADDR=0x08000000`，构建六个 host/kernel，检查 initramfs 中的
+wrapper、静态 host、`.vxbin` 和 RISC-V 动态库，并检查最终镜像内嵌的 startup
+address、core 数、bank 数和地址宽度。
+
+源码或测试 kernel 改变后不能只看旧镜像文件是否存在，应重新执行脚本。构建
+完成后可在主机侧检查嵌入的版本、配置和 kernel 哈希：
+
+```bash
+strings -a \
+  nanhu-g/ready_for_download/proto_nm37_vu37p/RV_BOOT_vortex_1bank.bin |
+  grep -E '^(vortex_(commit|branch|configs|startup_addr|tests)=|VX_CFG_)'
+
+git -C /home/yanjiarun/Vortex rev-parse HEAD
+```
+
+可复现的正式镜像应让 `vortex_commit` 对应预期源码提交，并显示
+`vortex_startup_addr=0x08000000`、一个 core、一个 memory bank、28-bit address
+width。若镜像是从 dirty tree 构建的，commit 字段本身不足以证明内容，必须重建
+或同时核对 `build-info` 中每个 `*_kernel_sha256`。
 
 ## 2. 哪些动作需要重复
 
@@ -131,6 +155,12 @@ ls -l /dev/xdma0_user /dev/xdma0_control /dev/xdma0_bypass
 0000:2a:00.0  10ee:903f  xdma
 ```
 
+如果 `ab:00.0` 显示为 `10ee:9038`、绑定通用 `xdma`，而且没有 `ab:00.1`，则
+当前 U280 不处于本文要求的 Alveo deployment shell/XRT PF 状态。不要把这个
+function 当作 `--u280-bdf` 继续运行；`u280_xrt_start.sh` 会按代码中的 PCI ID
+检查主动拒绝。应先按既定板卡 provisioning 恢复 `500c/500d`，完成冷重启并
+重新枚举，再继续本手册。
+
 ### 4.1 何时需要 Vivado
 
 如果 `0000:2a:00.0` 已存在、绑定 `xdma`，并且确定卡上的设计就是当前仓库 14
@@ -172,7 +202,9 @@ cat /sys/bus/pci/devices/0000:ab:00.1/host_mem_size
 
 预期 user PF 为 `10ee:500d`、驱动为 `xocl`，`Enabled Host Memory` 为
 `64 MB`，sysfs值为`67108864`。脚本还必须打印slot size `4194304`、control
-size `67108864`、peer size `67108864`，以及：
+size `67108864`、peer size `67108864`。当前代码还会读取 NM37 PCI resource
+table，要求 `--peer-bdf` 的 BAR2 是已分配的 memory BAR 且至少 8 GiB；该检查
+失败时不会装载 direct-P2P session。脚本成功时还会打印：
 
 ```text
 Bridge allowlist argument: --allow-peer-bdf 0000:2a:00.0
@@ -217,6 +249,13 @@ sudo test -S /run/scope-vortex0.sock
 ```
 
 若 bridge 已退出，先看它的终端输出；不要在 socket 缺失时继续启动香山。
+正常情况下终端 A 可以长期只有下面一行，这不表示数据通路卡住：
+
+```text
+scope-vortex-bridge: U280 ready, socket=/run/scope-vortex0.sock
+```
+
+Bridge 负责 RPC/XRT 转换，但当前逐命令 trace 由 QEMU 的 `vortex-log` 属性输出。
 
 > 如果以后生成 32-bank xclbin，需要同时换回或重建匹配的 32-bank guest
 > 镜像，不能只替换 xclbin。
@@ -243,12 +282,20 @@ xdma-user-dev=/dev/xdma0_user,\
 xdma-ctrl-dev=/dev/xdma0_control,\
 xdma-bypass-dev=/dev/xdma0_bypass,\
 guest-ddr-base=0x80000000,guest-ddr-size=0x80000000,\
-dma32-ring-size=0x10000
+dma32-ring-size=0x10000,\
+vortex-log=on
 ```
 
 该JSON明确设置`"data-path": "direct-p2p"`。因此peer capability、BAR2范围、
 mapping generation或physical `Q_ERROR`任一检查失败都会让backend报错退出，
 不会回退到Socket payload搬运。
+
+`vortex-log=on` 是当前 QEMU backend 的可观测性开关，建议在首次验收和排障时
+保留。它会在终端 B 打印 virtual/physical job、opcode、peer window、PCIe
+方向、guest PA、CP peer address、generation、耗时及
+`payload_cpu_bytes=0`。稳定运行后若不需要逐命令输出，可以删除该属性或改为
+`vortex-log=off`；它只影响日志，不改变数据路径。属性关闭时，QEMU 在枚举后
+没有新的 Vortex 行为输出是正常现象。
 
 保持终端 B 运行。这里的 `fpga-host-bdf` 是香山/NM37 的 `0000:2a:00.0`，
 不是 U280 的 `ab:00.0` 或 `ab:00.1`。若启动时重新枚举出了不同 BDF，应把
@@ -317,18 +364,38 @@ vortex-run-all
 
 - 虚拟 endpoint 的 PCI ID 为 `1b36:1310`、class 为 `120000`。
 - kernel driver 为 `scope-vortex`，并出现 `/dev/scope-vortex0`。
-- `scope-vortex-check` 报告的 core/warp/thread、memory bank、address width 和
-  ISA 与物理 xclbin 一致。
+- `scope-vortex-check` 比较 thread/warp/core 数、memory bank 数、每个 bank 的
+  bytes 和 ISA flags。它不直接比较或打印 `STARTUP_ADDR`；28-bit address width
+  由 `build-info` 记录，并通过预期 bank bytes 间接参与检查。
 - `vortex-vecadd` 验证基本上传、launch 和双向搬运。
 - `sgemm`、`conv3` 覆盖浮点矩阵/卷积；`conv3 -l` 额外覆盖本地内存路径。
-- `multikernel` 覆盖同一进程连续装载/启动多个 kernel；`bfs` 和 `sort` 覆盖
-  更不规则的访存及同步模式。
-- `vortex-run-all` 只有在全部命令均返回成功时才打印最终通过。
+- `multikernel` 装载一个带 VXSYMTAB footer 的 `.vxbin`，按名称解析并顺序启动
+  `add_k`、`mul_k`、`acc_k` 三个入口；同时检查 `.init_array` constructor、
+  `.tdata/.tbss` TLS 初始化、每个 kernel 的独立 PC、queue event 和结果回读。
+  当前仍只有一个物理 Vortex core，不表示三个 core 同时运行。
+- `bfs` 和 `sort` 覆盖更不规则的访存及同步模式。
+- 每个 `vortex-TEST` wrapper 默认先运行一次 checker，再选择匹配的静态
+  `/bin/vx-TEST` 和 `/usr/lib/vortex/TEST.vxbin`。`vortex-run-all` 只在开头运行
+  一次 checker，随后设置 `VORTEX_SKIP_CAPS_CHECK=1` 依次执行固定保守规模；只有
+  全部命令均返回成功时才打印最终通过。
 
 当前单-bank `build1...xclbin` 应与 `RV_BOOT_vortex_1bank.bin` 内的
 `build-info` 一致。如果误加载原来的 32-bank `RV_BOOT.bin`，
 `scope-vortex-check` 失败是正确的保护行为；不要跳过 checker 强行运行或把
 任何计算测试记为通过。
+
+checker 通过仍不等于 host/kernel 文件来自同一次构建。当前多测试镜像还应
+显示：
+
+```bash
+grep -E '^(vortex_(commit|startup_addr|tests)=|.*_kernel_sha256=)' \
+  /usr/lib/vortex/build-info
+```
+
+其中 `vortex_startup_addr` 应为 `0x08000000`，`vortex_tests` 应包含
+`vecadd sgemm conv3 multikernel bfs sort`。若准备验收当前源码提交，应把
+`vortex_commit` 与主机的 `git -C /home/yanjiarun/Vortex rev-parse HEAD` 对照；
+不一致时重新生成并装载 guest 镜像。
 
 ## 10. 故障定位顺序
 
@@ -343,10 +410,22 @@ vortex-run-all
 6. 香山启动：bootrom/firmware load 是否完成，readback fence 是否成功，UART
    是否出现 OpenSBI/Linux 输出。
 7. guest PCI：是否枚举 `1b36:1310`，`scope_vortex` 是否 probe 成功。
-8. capability：xclbin 与 `build-info` 是否完全一致。
+8. capability：checker 的 bank/core/ISA 是否匹配；`build-info` 的 address
+   width、startup address、测试列表和 kernel hash 是否来自预期构建。
 9. 基本数据路径：先运行 `vortex-vecadd -n 64`。
 10. 扩展回归：基本测试通过后再运行 `vortex-run-all`；若失败，单独重跑它
     打印的最后一个测试命令。
+
+如果终端 A 只有 `U280 ready`，而 guest 正在等待，先确认终端 B 是否启用了
+`vortex-log=on`。查看最后一条 job/opcode、peer-map generation、physical
+sequence、`Q_ERROR` 和是否出现 `payload_cpu_bytes=0`；不要仅凭 Bridge 没有
+逐命令输出判断它卡死。
+
+若只有 `vortex-multikernel` 失败，优先核对 `vortex_startup_addr`、
+`multikernel_kernel_sha256` 和 `vortex_commit`，确认静态 host 与多入口 `.vxbin`
+来自同一次构建。旧的单入口 runtime/kernel 组合可能出现入口解析失败、结果全
+零或异常 console 字符；应重新执行 `build_vortex_guest_single_bank.sh`，不要只
+替换某一个 `.vxbin`。
 
 ## 11. 正常停止顺序
 

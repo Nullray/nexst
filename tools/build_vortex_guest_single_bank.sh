@@ -16,6 +16,8 @@ readonly BOARD="nm37_vu37p"
 readonly PROJECT="target:nanhu-g:proto"
 readonly DT_TARGET="XSTop_vpcie"
 readonly VORTEX_CONFIGS_VALUE="-DVX_CFG_NUM_CLUSTERS=1 -DVX_CFG_NUM_CORES=1 -DVX_CFG_PLATFORM_MEMORY_NUM_BANKS=1 -DVX_CFG_PLATFORM_MEMORY_ADDR_WIDTH=28"
+readonly VORTEX_STARTUP_ADDR_VALUE="0x08000000"
+readonly VORTEX_TESTS_VALUE="vecadd sgemm conv3 multikernel bfs sort"
 readonly WORK_OUTPUT="${WORK_FARM}/target/nanhu-g/ready_for_download/proto_nm37_vu37p/RV_BOOT.bin"
 readonly WORK_BACKUP="${WORK_FARM}/target/nanhu-g/ready_for_download/proto_nm37_vu37p/RV_BOOT.pre_vortex_1bank.bin"
 readonly FINAL_OUTPUT="${REPO_ROOT}/nanhu-g/ready_for_download/proto_nm37_vu37p/RV_BOOT_vortex_1bank.bin"
@@ -27,13 +29,15 @@ require_file() {
     }
 }
 
-require_file "${VORTEX_HOME}/tools/scope_vortex_bridge/build_vecadd_riscv64.sh"
+require_file "${VORTEX_HOME}/tools/scope_vortex_bridge/build_guest_tests_riscv64.sh"
 require_file "${WORK_FARM}/Makefile"
 require_file "${CROSS_CXX_PATH}"
 require_file "${CROSS_PATH}/${CROSS_PREFIX}gcc"
 
 echo "Building XiangShan Vortex guest for the loaded single-bank U280 xclbin"
 echo "VORTEX_CONFIGS=${VORTEX_CONFIGS_VALUE}"
+echo "VORTEX_STARTUP_ADDR=${VORTEX_STARTUP_ADDR_VALUE}"
+echo "VORTEX_TESTS=${VORTEX_TESTS_VALUE}"
 
 # scope_vortex_guest does not currently track CONFIGS in its prerequisites.
 # Remove only its generated output so changed capability constants cannot leave
@@ -41,8 +45,10 @@ echo "VORTEX_CONFIGS=${VORTEX_CONFIGS_VALUE}"
 make -C "${VORTEX_HOME}/tools/scope_vortex_guest" clean
 
 CONFIGS="${VORTEX_CONFIGS_VALUE}" \
+    STARTUP_ADDR="${VORTEX_STARTUP_ADDR_VALUE}" \
     CROSS_CXX="${CROSS_CXX_PATH}" \
-    "${VORTEX_HOME}/tools/scope_vortex_bridge/build_vecadd_riscv64.sh"
+    VORTEX_TESTS="${VORTEX_TESTS_VALUE}" \
+    "${VORTEX_HOME}/tools/scope_vortex_bridge/build_guest_tests_riscv64.sh"
 
 # Re-enter the rootfs Makefile directly.  The outer work_farm target does not
 # track rebuilt Vortex guest binaries, while this Makefile has phony app
@@ -56,6 +62,8 @@ make -C "${ROOTFS_SRC}" \
     VORTEX_ENABLE=1 \
     VORTEX_HOME="${VORTEX_HOME}" \
     VORTEX_CONFIGS="${VORTEX_CONFIGS_VALUE}" \
+    VORTEX_STARTUP_ADDR="${VORTEX_STARTUP_ADDR_VALUE}" \
+    VORTEX_TESTS="${VORTEX_TESTS_VALUE}" \
     all
 
 # The Debian/Ubuntu RISC-V loader searches its multiarch directory, not the
@@ -67,6 +75,28 @@ for guest_lib in libc.so.6 libdl.so.2 libm.so.6 libpthread.so.0 libresolv.so.2; 
         exit 1
     }
 done
+
+for test_name in ${VORTEX_TESTS_VALUE}; do
+    grep -F "file /bin/vx-${test_name} " \
+        "${ROOTFS_SRC}/initramfs.txt" >/dev/null || {
+        echo "ERROR: initramfs is missing /bin/vx-${test_name}" >&2
+        exit 1
+    }
+    grep -F "slink /bin/vortex-${test_name} /bin/vortex-run " \
+        "${ROOTFS_SRC}/initramfs.txt" >/dev/null || {
+        echo "ERROR: initramfs is missing /bin/vortex-${test_name}" >&2
+        exit 1
+    }
+    grep -F "file /usr/lib/vortex/${test_name}.vxbin " \
+        "${ROOTFS_SRC}/initramfs.txt" >/dev/null || {
+        echo "ERROR: initramfs is missing /usr/lib/vortex/${test_name}.vxbin" >&2
+        exit 1
+    }
+done
+grep -F "file /bin/vortex-run-all " "${ROOTFS_SRC}/initramfs.txt" >/dev/null || {
+    echo "ERROR: initramfs is missing /bin/vortex-run-all" >&2
+    exit 1
+}
 
 make -C "${WORK_FARM}" \
     PRJ="${PROJECT}" \
@@ -84,6 +114,8 @@ make -C "${WORK_FARM}" \
     VORTEX_ENABLE=1 \
     VORTEX_HOME="${VORTEX_HOME}" \
     VORTEX_CONFIGS="${VORTEX_CONFIGS_VALUE}" \
+    VORTEX_STARTUP_ADDR="${VORTEX_STARTUP_ADDR_VALUE}" \
+    VORTEX_TESTS="${VORTEX_TESTS_VALUE}" \
     phy_os.os
 
 if [[ -f "${WORK_OUTPUT}" && ! -e "${WORK_BACKUP}" ]]; then
@@ -117,6 +149,7 @@ install -m 0644 "${WORK_OUTPUT}" "${FINAL_OUTPUT}"
 
 echo "Checking embedded guest configuration"
 for expected in \
+    "vortex_startup_addr=${VORTEX_STARTUP_ADDR_VALUE}" \
     "VX_CFG_NUM_CORES=1" \
     "VX_CFG_PLATFORM_MEMORY_NUM_BANKS=1" \
     "VX_CFG_PLATFORM_MEMORY_ADDR_WIDTH=28"; do
