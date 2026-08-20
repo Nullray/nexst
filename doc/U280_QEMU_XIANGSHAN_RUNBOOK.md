@@ -37,9 +37,9 @@
 /bin/scope-vortex-check
 /bin/vortex-run
 /bin/vortex-run-all
-/bin/vortex-{vecadd,sgemm,conv3,multikernel,bfs,sort}
-/bin/vx-{vecadd,sgemm,conv3,multikernel,bfs,sort}
-/usr/lib/vortex/{vecadd,sgemm,conv3,multikernel,bfs,sort}.vxbin
+/bin/vortex-{vecadd,sgemm,conv3,multikernel,bfs,sort,gds_read}
+/bin/vx-{vecadd,sgemm,conv3,multikernel,bfs,sort,gds_read}
+/usr/lib/vortex/{vecadd,sgemm,conv3,multikernel,bfs,sort,gds_read}.vxbin
 /usr/lib/vortex/build-info
 ```
 
@@ -77,7 +77,7 @@ cd /home/yanjiarun/nexst_proxy_14
 ```
 
 该脚本使用 `/usr/bin/riscv64-linux-gnu-*`，不会修改 `/opt`。当前版本会统一
-传入 `STARTUP_ADDR=0x08000000`，构建六个 host/kernel，检查 initramfs 中的
+传入 `STARTUP_ADDR=0x08000000`，构建七个 host/kernel，检查 initramfs 中的
 wrapper、静态 host、`.vxbin` 和 RISC-V 动态库，并检查最终镜像内嵌的 startup
 address、core 数、bank 数和地址宽度。
 
@@ -109,10 +109,10 @@ width。若镜像是从 dirty tree 构建的，commit 字段本身不足以证�
 ### 每次主机启动后做
 
 1. 检查 U280、香山 FPGA 和 BDF。
-2. 运行本地XRT direct-P2P启动脚本；它装载驱动、启用64MiB control Host
-   Memory、加载xclbin并校验相邻64MiB peer window。
+2. 运行本地 XRT direct-P2P 启动脚本；GDS 模式还会校验本地 xocl 版本并启用
+   映射 HBM[0] 的 U280 inbound P2P BAR。
 3. 确认香山侧 `xdma` 驱动和 `/dev/xdma0_*`。
-4. 启动Vortex bridge；bridge会打开同一xclbin并提供peer RPC。
+4. 启动 Vortex bridge；bridge 会按 `--xclbin` 再次调用 XRT `load_xclbin`，创建 Vortex IP 对象并提供 peer/GDS RPC；启动后必须复查 P2P 配置仍然健康。
 5. 启动采用 Vortex backend JSON 的 QEMU manager。
 6. 装载香山 `bootrom.bin`、`RV_BOOT_vortex_1bank.bin` 并打开串口。
 7. 在香山 Linux 中检查虚拟 PCIe endpoint、驱动和 Vortex 测试套件。
@@ -223,10 +223,60 @@ LD_LIBRARY_PATH=/home/yanjiarun/xrt-u280-2.16/lib \
 ldd /home/yanjiarun/Vortex/sw/runtime/libvortex-xrt.so | grep -E 'xrt|not found'
 ```
 
+### 5.1 GDS 模式的额外准备
+
+GDS 同时需要 U280 的 outbound HOST translator 和 inbound HBM P2P BAR。使用
+GDS backend JSON 时，初始化命令改为：
+
+```bash
+cd /home/yanjiarun/nexst_proxy_14
+sudo ./tools/u280_xrt_start.sh \
+  --vortex-p2p \
+  --vortex-gds \
+  --u280-bdf 0000:ab:00.1 \
+  --peer-bdf 0000:2a:00.0 \
+  --gds-nvme-bdf 0000:e1:00.0 \
+  --xclbin /home/yanjiarun/Vortex/hw/syn/xilinx/xrt/\
+build1_p2p_xilinx_u280_gen3x16_xdma_1_202211_1_hw/bin/vortex_afu.xclbin
+source ./tools/u280_xrt_env.sh
+```
+
+脚本只使用 `/home/yanjiarun/xrt-u280-2.16`，不修改 `/opt`。它要求正在加载的
+`xocl` 与本地 GDS 模块 `srcversion` 完全相同，并将 HBM[0] 配置为 256 MiB、
+P2P BAR 配置为 512 MiB、inbound HBM P2P remapper slot 配置为 2 MiB。如果加载的是旧 xocl，
+先停止 QEMU/Bridge 和所有 XRT 用户，检查 `sudo fuser -v /dev/dri/renderD*`，再由
+管理员显式执行 `sudo rmmod xocl` 后重跑；脚本不会自动解绑正在使用的设备。
+若报告 BAR resize pending，按提示温重启主机后重新执行同一命令。
+
+准备测试数据必须在 NVMe 仍绑定 host `nvme` driver 时完成。当前选定 SSD 是
+`0000:e1:00.0`、序列号 `PHLJ3252006F1P0UGN`、NSID 1、4 KiB LBA。建议把
+SLBA 262144（字节偏移 1 GiB）明确保留为实验区。先只审计：
+
+```bash
+sudo ./tools/prepare_vortex_gds_ssd.sh --slba 262144
+```
+
+只有确认脚本列出的 BDF、序列号、namespace、无签名/分区/占用以及精确覆盖
+范围都正确后，才执行它打印的 confirmation 命令：
+
+```bash
+sudo ./tools/prepare_vortex_gds_ssd.sh \
+  --slba 262144 \
+  --write \
+  --confirm ERASE-4096-BYTES-AT-SLBA-262144
+```
+
+该命令只覆盖 SLBA 262144 的 4096 字节，写入后用 direct I/O 读回比较；当前
+pattern 的 Vortex 预期 checksum 是 `0xb348a9c5`。任何安全检查失败都不要绕过，
+应先确认该盘是否包含需要保留的数据。
+
 ## 6. 启动 Vortex bridge（终端 A）
 
-启动脚本中的`xbutil program`同时建立并验证HOST translator topology。正式链路
-仍由bridge打开XRT device和同一xclbin，因此脚本成功后继续执行下面的命令：
+启动脚本中的 `xbutil program` 负责 program 目标 xclbin，并建立、验证 HOST translator
+和 GDS P2P BAR topology。当前 bridge 打开 XRT device 后会按 `--xclbin` 再次调用
+`xrt::device::load_xclbin`，随后创建 Vortex IP 对象并提供 peer/GDS RPC。由于这一步
+可能影响 P2P subdevice 生命周期，必须在 bridge 启动后复查 HBM[0] P2P BAR 配置；
+当前板级已验证下面的启动顺序可保持配置。脚本成功后继续执行下面的命令：
 
 ```bash
 sudo env \
@@ -237,6 +287,7 @@ sudo env \
     --driver-lib /home/yanjiarun/Vortex/sw/runtime/libvortex-xrt.so \
     --device-index 0 \
     --allow-peer-bdf 0000:2a:00.0 \
+    --allow-gds-nvme-bdf 0000:e1:00.0 \
     --xclbin /home/yanjiarun/Vortex/hw/syn/xilinx/xrt/\
 build1_p2p_xilinx_u280_gen3x16_xdma_1_202211_1_hw/bin/vortex_afu.xclbin
 ```
@@ -247,6 +298,20 @@ build1_p2p_xilinx_u280_gen3x16_xdma_1_202211_1_hw/bin/vortex_afu.xclbin
 pgrep -af scope-vortex-bridge
 sudo test -S /run/scope-vortex0.sock
 ```
+
+GDS 模式下还应在 bridge 启动后立即确认 P2P 配置没有被改变：
+
+```bash
+P2P=$(echo /sys/bus/pci/devices/0000:ab:00.1/p2p.u.*)
+cat "$P2P/p2p_enable"
+cat "$P2P/config"
+cat "$P2P/bar_map"
+```
+
+预期仍为 `p2p_enable=1`、`bar=exp_bar=536870912`、`0:HBM[0]:268435456`，
+且 inbound remapper 为 `slot_size: 2097152`、`slot_num: 256`。如果 bridge
+启动后重新出现 `exp_bar=68719476736` 或 `0::42951770112`，说明当前 `load_xclbin` 流程改变了 xclbin/P2P
+生命周期状态，不要手工补写 config 后继续正式验收。
 
 若 bridge 已退出，先看它的终端输出；不要在 socket 缺失时继续启动香山。
 正常情况下终端 A 可以长期只有下面一行，这不表示数据通路卡住：
@@ -286,6 +351,32 @@ dma32-ring-size=0x10000,\
 vortex-log=on
 ```
 
+上面是只含 Vortex 的普通 direct-P2P 配置。进行 GDS 实验时，必须先完成 5.1 节
+的数据准备，然后在 QEMU 启动前再次确认无挂载和 open fd，并把真实 NVMe 从
+host `nvme` driver 解绑，避免 host driver 与 QEMU 同时操作 controller：
+
+```bash
+findmnt -rn -S /dev/nvme0n1
+sudo fuser -v /dev/nvme0 /dev/nvme0n1
+echo 0000:e1:00.0 | sudo tee /sys/bus/pci/drivers/nvme/unbind
+test ! -e /sys/bus/pci/devices/0000:e1:00.0/driver
+```
+
+前两条应没有任何该 SSD 的使用者；有输出时停止，不要解绑。解绑后使用同一条
+QEMU 命令，只把 `backend-config` 替换为：
+
+```text
+backend-config=/home/yanjiarun/nexst_proxy_14/tools/proto/vswitch-vortex-u280-gds.json
+```
+
+该 JSON 按顺序创建一个真实 NVMe backend 和一个 Vortex backend，并用两边都
+校验的 `0000:e1:00.0` 建立唯一 GDS pair。Bridge 必须使用
+`--allow-gds-nvme-bdf 0000:e1:00.0` 启动，否则 QEMU 在查询 GDS capability 时
+fail-closed。当前 `gds_query()` 还会在返回 `VX_GDS_CAP_P2P_HBM0` 前检查 U280 的
+P2P 实际状态，包括 `p2p_enable=1`、512 MiB BAR/exp_bar/rbar/remap、256 MiB HBM[0]
+以及 2 MiB inbound remapper slot；任一条件不满足时 `GDS_CAPS` 直接失败，不再等到
+`GDS_ALLOC` 创建 P2P BO 时才暴露错误。`GDS_ALLOC` 前还会再次执行同一健康检查。
+
 该JSON明确设置`"data-path": "direct-p2p"`。因此peer capability、BAR2范围、
 mapping generation或physical `Q_ERROR`任一检查失败都会让backend报错退出，
 不会回退到Socket payload搬运。
@@ -296,6 +387,19 @@ mapping generation或physical `Q_ERROR`任一检查失败都会让backend报错�
 `payload_cpu_bytes=0`。稳定运行后若不需要逐命令输出，可以删除该属性或改为
 `vortex-log=off`；它只影响日志，不改变数据路径。属性关闭时，QEMU 在枚举后
 没有新的 Vortex 行为输出是正常现象。
+
+GDS 成功命中时，终端 B 还必须出现两类日志：
+
+```text
+[SCOPE GDS] op=READ ... hbm_addr=... p2p_bus_addr=...
+  payload_cpu_bytes=0 payload_nm37_bytes=0
+[SCOPE GDS] complete ... status=0x0000 state=5 error=0
+  payload_cpu_bytes=0 payload_nm37_bytes=0
+```
+
+只有第一行而没有 completion 表示真实 NVMe 请求尚未完成；完全没有
+`[SCOPE GDS]` 表示 arm 条件与实际 READ 的 NSID/SLBA/长度不匹配，不能把普通
+NVMe 成功读取当作 GDS 通过。
 
 保持终端 B 运行。这里的 `fpga-host-bdf` 是香山/NM37 的 `0000:2a:00.0`，
 不是 U280 的 `ab:00.0` 或 `ab:00.1`。若启动时重新枚举出了不同 BDF，应把
@@ -360,6 +464,34 @@ vortex-sort -n 16
 vortex-run-all
 ```
 
+若 QEMU 使用 GDS JSON，且 5.1 节已经在 host 的 SLBA 262144 写入并读回测试
+pattern，再显式运行：
+
+```bash
+ls -l /dev/nvme0n1
+vortex-gds_read \
+  -l 262144 \
+  -e 0xb348a9c5 \
+  -d /dev/nvme0n1 \
+  -b 4096 \
+  -i 1
+```
+
+测试先在 HBM[0] 的固定 16 MiB GDS arena 中申请 P2P BO，arm 一条精确匹配的
+4 KiB READ，再用 virtual NVMe 的 direct `pread` 触发标准 SQ/CQ 流程。payload
+被 QEMU 的受控 PRP 改写直接送到同一个 HBM buffer；CQE 后 runtime 执行 cache
+flush，Vortex kernel 在 HBM 内计算 checksum，CPU 只取回 4 字节结果。预期末尾
+为：
+
+```text
+GDS checksum actual=0xb348a9c5 expected=0xb348a9c5
+GDS PASSED!
+```
+
+guest 命令成功还需与终端 B 的两条 `[SCOPE GDS]` 日志共同验收，并确认
+`payload_cpu_bytes=0 payload_nm37_bytes=0`。当前原型只支持单 buffer、单个
+in-flight、PRP 模式和恰好 4096 字节；不要用其他长度推断硬件失败。
+
 预期结果：
 
 - 虚拟 endpoint 的 PCI ID 为 `1b36:1310`、class 为 `120000`。
@@ -393,7 +525,7 @@ grep -E '^(vortex_(commit|startup_addr|tests)=|.*_kernel_sha256=)' \
 ```
 
 其中 `vortex_startup_addr` 应为 `0x08000000`，`vortex_tests` 应包含
-`vecadd sgemm conv3 multikernel bfs sort`。若准备验收当前源码提交，应把
+`vecadd sgemm conv3 multikernel bfs sort gds_read`。若准备验收当前源码提交，应把
 `vortex_commit` 与主机的 `git -C /home/yanjiarun/Vortex rev-parse HEAD` 对照；
 不一致时重新生成并装载 guest 镜像。
 
@@ -404,8 +536,11 @@ grep -E '^(vortex_(commit|startup_addr|tests)=|.*_kernel_sha256=)' \
 1. `lspci`：U280 `500c/500d` 和香山 FPGA `903f` 是否都存在。
 2. 驱动：U280 是否为 `xclmgmt/xocl`，香山是否为 `xdma`。
 3. U280：`xbutil examine`是否健康、host memory是否为64MiB、peer query是否
-   报告4MiB slot和两个64MiB窗口。
-4. bridge：进程是否存在、`/run/scope-vortex0.sock` 是否为 socket。
+   报告4MiB slot和两个64MiB窗口；GDS 模式还要确认 inbound P2P 为
+   `p2p_enable=1`、`bar=exp_bar=536870912`、HBM[0]=268435456、slot size=2097152。
+4. bridge：进程是否存在、`/run/scope-vortex0.sock` 是否为 socket；Bridge 启动后再次
+   检查上述 P2P 配置应保持不变。若 QEMU 在 `GDS_CAPS` 阶段失败，优先查看 Bridge
+   的 P2P health-check 日志，而不是继续排查 NVMe PRP 或首次 `GDS_ALLOC`。
 5. QEMU：终端 B 是否仍运行，是否连接 bridge，是否独占 `/dev/xdma0_*`。
 6. 香山启动：bootrom/firmware load 是否完成，readback fence 是否成功，UART
    是否出现 OpenSBI/Linux 输出。
@@ -415,6 +550,9 @@ grep -E '^(vortex_(commit|startup_addr|tests)=|.*_kernel_sha256=)' \
 9. 基本数据路径：先运行 `vortex-vecadd -n 64`。
 10. 扩展回归：基本测试通过后再运行 `vortex-run-all`；若失败，单独重跑它
     打印的最后一个测试命令。
+11. GDS：确认 host 数据准备成功、e1:00.0 已从 host nvme driver 解绑、Bridge
+    带 GDS allowlist、QEMU 使用 GDS JSON；再核对 alloc/READ/completion 三段状态、
+    qid/cid、NVMe status 和两个 payload 计数。
 
 如果终端 A 只有 `U280 ready`，而 guest 正在等待，先确认终端 B 是否启用了
 `vortex-log=on`。查看最后一条 job/opcode、peer-map generation、physical
@@ -432,8 +570,17 @@ sequence、`Q_ERROR` 和是否出现 `payload_cpu_bytes=0`；不要仅凭 Bridge
 1. 在香山 Linux 中执行 `sync`；需要停止系统时再执行 `poweroff`。
 2. 在终端 C 用 `Ctrl-\` 退出 UART。
 3. 在终端 B 用 `Ctrl-C` 停止 QEMU manager。
-4. 在终端 A 用 `Ctrl-C` 停止 bridge。
-5. 用 `pgrep -af 'scope-vortex-bridge|qemu-system-x86_64|pcie-util.*uart'`
+4. 若本轮把 `0000:e1:00.0` 交给了 GDS QEMU，确认 QEMU 已退出后恢复 host
+   NVMe driver：
+
+   ```bash
+   echo 0000:e1:00.0 | sudo tee /sys/bus/pci/drivers/nvme/bind
+   udevadm settle
+   lsblk -o NAME,PATH,SIZE,MODEL,SERIAL,MOUNTPOINTS /dev/nvme0n1
+   ```
+
+5. 在终端 A 用 `Ctrl-C` 停止 bridge。
+6. 用 `pgrep -af 'scope-vortex-bridge|qemu-system-x86_64|pcie-util.*uart'`
    确认没有残留进程。
 
 一般不需要卸载 `xocl`、`xclmgmt` 或 `xdma`。只有确认所有用户进程均退出后，

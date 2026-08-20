@@ -13,15 +13,19 @@ readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly PEER_QUERY_SRC="${SCRIPT_DIR}/xocl_vortex_peer_query.c"
 readonly PEER_QUERY_BIN="/tmp/xocl-vortex-peer-query-${UID}-${KERNEL_RELEASE}"
 readonly DEFAULT_VORTEX_XCLBIN="/home/yanjiarun/Vortex/hw/syn/xilinx/xrt/build1_p2p_xilinx_u280_gen3x16_xdma_1_202211_1_hw/bin/vortex_afu.xclbin"
+readonly GDS_HBM0_BYTES="268435456"
+readonly GDS_P2P_BAR_BYTES="536870912"
 
 MGMT_BDF="0000:ab:00.0"
 USER_BDF="0000:ab:00.1"
 PEER_BDF="0000:2a:00.0"
+GDS_NVME_BDF="0000:e1:00.0"
 VORTEX_XCLBIN="$DEFAULT_VORTEX_XCLBIN"
 HOST_MEM_BYTES="1073741824"
 HOST_MEM_SIZE="1G"
 enable_host_mem=1
 vortex_p2p=0
+vortex_gds=0
 
 usage() {
   cat <<'EOF'
@@ -31,11 +35,15 @@ Load and verify the user-local XRT 2.16 drivers without touching /opt.
 The normal mode configures 1 GiB Host Memory. --vortex-p2p instead loads
 xocl with vortex_peer_mode=1, configures the 64 MiB control window, programs
 the Vortex xclbin, and validates the adjacent 64 MiB peer window.
+--vortex-gds additionally enables the U280 HBM0 P2P BAR used as the NVMe
+payload target. It never reads from or writes to the selected SSD.
 
 Options:
   --vortex-p2p       Enable the Vortex 64 MiB control + 64 MiB peer layout.
+  --vortex-gds       Also expose HBM0 through a 512 MiB U280 P2P BAR.
   --u280-bdf BDF     U280 user PF (default: 0000:ab:00.1).
   --peer-bdf BDF     Allowed NM37 peer function (default: 0000:2a:00.0).
+  --gds-nvme-bdf BDF NVMe requester used for GDS (default: 0000:e1:00.0).
   --xclbin PATH      P2P-capable Vortex xclbin (default: current build1 U280).
   --no-host-mem      Do not change Host Memory; still perform validations.
   -h, --help         Show this help.
@@ -55,6 +63,13 @@ while (( "$#" )); do
       HOST_MEM_SIZE="64M"
       shift
       ;;
+    --vortex-gds)
+      vortex_p2p=1
+      vortex_gds=1
+      HOST_MEM_BYTES="67108864"
+      HOST_MEM_SIZE="64M"
+      shift
+      ;;
     --u280-bdf)
       (( "$#" >= 2 )) || die "--u280-bdf requires an argument"
       USER_BDF="$2"
@@ -64,6 +79,11 @@ while (( "$#" )); do
     --peer-bdf)
       (( "$#" >= 2 )) || die "--peer-bdf requires an argument"
       PEER_BDF="$2"
+      shift 2
+      ;;
+    --gds-nvme-bdf)
+      (( "$#" >= 2 )) || die "--gds-nvme-bdf requires an argument"
+      GDS_NVME_BDF="$2"
       shift 2
       ;;
     --xclbin)
@@ -93,6 +113,7 @@ validate_bdf() {
 validate_bdf "$USER_BDF"
 validate_bdf "$MGMT_BDF"
 validate_bdf "$PEER_BDF"
+validate_bdf "$GDS_NVME_BDF"
 
 case "$XRT_ROOT" in
   /opt|/opt/*)
@@ -109,6 +130,10 @@ if (( vortex_p2p )); then
   modinfo -F parm "$XOCL_KO" | grep -q "^vortex_peer_mode:" ||
     die "${XOCL_KO} does not provide vortex_peer_mode; install the peer-enabled local module"
   [[ -r "$PEER_QUERY_SRC" ]] || die "missing peer query source: ${PEER_QUERY_SRC}"
+fi
+if (( vortex_gds )); then
+  grep -q 'DRM_XOCL_VORTEX_GDS_BO_QUERY' "${XRT_ROOT}/include/xocl_ioctl.h" ||
+    die "local XRT headers do not contain the Vortex GDS BO query ABI"
 fi
 
 
@@ -157,6 +182,23 @@ validate_peer_bar2() {
 
 if (( vortex_p2p )); then
   validate_peer_bar2
+fi
+
+validate_gds_nvme() {
+  local dev_path="/sys/bus/pci/devices/${GDS_NVME_BDF}"
+  local class vendor
+
+  [[ -d "$dev_path" ]] || die "GDS NVMe ${GDS_NVME_BDF} is absent"
+  class="$(<"${dev_path}/class")"
+  vendor="$(<"${dev_path}/vendor")"
+  [[ "${class,,}" == 0x010802 ]] ||
+    die "${GDS_NVME_BDF} has PCI class ${class}, expected NVMe class 0x010802"
+  printf 'GDS NVMe requester: %s vendor=%s class=%s\n' \
+    "$GDS_NVME_BDF" "$vendor" "$class"
+}
+
+if (( vortex_gds )); then
+  validate_gds_nvme
 fi
 
 driver_for() {
@@ -228,6 +270,14 @@ fi
 
 if module_loaded xocl; then
   check_loaded_version xocl "2.16.0"
+  if (( vortex_gds )); then
+    loaded_xocl_srcversion="$(< /sys/module/xocl/srcversion)"
+    installed_xocl_srcversion="$(modinfo -F srcversion "$XOCL_KO")"
+    if [[ "$loaded_xocl_srcversion" != "$installed_xocl_srcversion" ]]; then
+      show_xocl_users
+      die "loaded xocl srcversion ${loaded_xocl_srcversion} is not the installed GDS module ${installed_xocl_srcversion}; stop users, unload xocl, and rerun"
+    fi
+  fi
   if (( vortex_p2p )); then
     peer_mode_attr="/sys/module/xocl/parameters/vortex_peer_mode"
     if [[ ! -r "$peer_mode_attr" ]] ||
@@ -267,6 +317,83 @@ xrt_admin() {
     "$@"
 }
 
+find_p2p_sysfs_dir() {
+  local pci_path
+  local -a dirs=()
+
+  pci_path="$(readlink -f "/sys/bus/pci/devices/${USER_BDF}")"
+  shopt -s nullglob
+  dirs=("${pci_path}"/p2p.u.*)
+  shopt -u nullglob
+  (( ${#dirs[@]} == 1 )) ||
+    die "expected one xocl P2P sysfs directory under ${pci_path}, found ${#dirs[@]}"
+  printf '%s\n' "${dirs[0]}"
+}
+
+config_value() {
+  local file="$1"
+  local key="$2"
+  sed -n "s/^${key}://p" "$file"
+}
+
+configure_gds_p2p_bar() {
+  local p2p_dir config_attr enable_attr bar_map_attr
+  local enabled current_exp current_bar current_hbm0
+
+  p2p_dir="$(find_p2p_sysfs_dir)"
+  config_attr="${p2p_dir}/config"
+  enable_attr="${p2p_dir}/p2p_enable"
+  bar_map_attr="${p2p_dir}/bar_map"
+  [[ -e "$config_attr" && -e "$enable_attr" && -r "$bar_map_attr" ]] ||
+    die "xocl P2P sysfs controls are incomplete under ${p2p_dir}"
+
+  enabled="$(<"$enable_attr")"
+  current_exp="$(config_value "$config_attr" exp_bar)"
+  current_bar="$(config_value "$config_attr" bar)"
+  current_hbm0="$(sed -n 's/^0:[^:]*://p' "$config_attr")"
+
+  if [[ "$enabled" == 1 &&
+        ( "$current_exp" != "$GDS_P2P_BAR_BYTES" ||
+          "$current_bar" != "$GDS_P2P_BAR_BYTES" ||
+          "$current_hbm0" != "$GDS_HBM0_BYTES" ) ]]; then
+    show_xocl_users
+    die "U280 P2P is active with a different BAR layout; stop its users and disable it explicitly before changing to the GDS layout"
+  fi
+
+  if [[ "$current_hbm0" != "$GDS_HBM0_BYTES" ||
+        "$current_exp" != "$GDS_P2P_BAR_BYTES" ]]; then
+    printf '0:HBM[0]:%s\n' "$GDS_HBM0_BYTES" | \
+      "${SUDO[@]}" tee "$config_attr" >/dev/null
+    printf '1:END:0\n' | "${SUDO[@]}" tee "$config_attr" >/dev/null
+  fi
+
+  current_exp="$(config_value "$config_attr" exp_bar)"
+  [[ "$current_exp" == "$GDS_P2P_BAR_BYTES" ]] ||
+    die "GDS P2P expected BAR is ${current_exp}, expected ${GDS_P2P_BAR_BYTES}"
+
+  if [[ "$(<"$enable_attr")" != 1 ]]; then
+    xrt_admin "$XBUTIL" configure --p2p --device "$USER_BDF" enable
+  fi
+
+  # Enabling can destroy/recreate the P2P subdevice. A BAR resize may also
+  # remain pending until the host performs a warm reboot.
+  p2p_dir="$(find_p2p_sysfs_dir)"
+  config_attr="${p2p_dir}/config"
+  enable_attr="${p2p_dir}/p2p_enable"
+  bar_map_attr="${p2p_dir}/bar_map"
+  enabled="$(<"$enable_attr")"
+  current_exp="$(config_value "$config_attr" exp_bar)"
+  current_bar="$(config_value "$config_attr" bar)"
+  if [[ "$enabled" != 1 || "$current_exp" != "$GDS_P2P_BAR_BYTES" ||
+        "$current_bar" != "$GDS_P2P_BAR_BYTES" ]]; then
+    die "U280 P2P BAR resize is pending (enabled=${enabled}, bar=${current_bar}, expected=${current_exp}); perform a warm reboot and rerun this command"
+  fi
+
+  grep -q '^slot_size: 2097152$' "$bar_map_attr" ||
+    die "unexpected U280 P2P remapper slot size in ${bar_map_attr}"
+  echo "U280 GDS P2P: HBM0=${GDS_HBM0_BYTES} bytes, BAR=${current_bar} bytes, enabled=1"
+}
+
 echo "XRT drivers are bound: ${MGMT_BDF}=xclmgmt, ${USER_BDF}=xocl"
 xrt_admin "$XBMGMT" examine
 xrt_admin "$XBUTIL" examine
@@ -300,6 +427,10 @@ if (( vortex_p2p )); then
     die "scope-vortex-bridge is already running; refusing to reload its xclbin"
   fi
   xrt_admin "$XBUTIL" program --device "$USER_BDF" --user "$VORTEX_XCLBIN"
+
+  if (( vortex_gds )); then
+    configure_gds_p2p_bar
+  fi
 
   [[ -r "$host_mem_attr" ]] || die "xocl does not expose ${host_mem_attr}"
   current_host_mem="$(<"$host_mem_attr")"
@@ -349,6 +480,9 @@ if (( vortex_p2p )); then
 
   echo "$peer_layout"
   echo "Bridge allowlist argument: --allow-peer-bdf ${PEER_BDF}"
+  if (( vortex_gds )); then
+    echo "Bridge GDS allowlist argument: --allow-gds-nvme-bdf ${GDS_NVME_BDF}"
+  fi
 fi
 
 echo
@@ -359,4 +493,9 @@ if (( vortex_p2p )); then
   echo "Start Bridge in direct-P2P mode with:"
   echo "  scope-vortex-bridge --allow-peer-bdf ${PEER_BDF} ..."
   echo "Use a QEMU Vortex backend with data-path=direct-p2p."
+fi
+if (( vortex_gds )); then
+  echo "Enable GDS in the Vortex backend JSON with:"
+  echo "  \"gds-nvme-bdf\": \"${GDS_NVME_BDF}\""
+  echo "The startup script did not read or write the NVMe namespace."
 fi

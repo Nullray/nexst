@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "devices": [
+    {
+      "type": "nvme",
+      "real-host-bdf": "0000:e1:00.0"
+    },
+    {
+      "type": "vortex",
+      "bridge-socket": "/run/scope-vortex0.sock",
+      "data-path": "direct-p2p",
+      "gds-nvme-bdf": "0000:e1:00.0"
+    }
+  ]
+}
