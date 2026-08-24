@@ -213,5 +213,7 @@ cmp -s "$pattern_file" "$readback_file" || die "SSD readback differs from patter
 cat <<EOF
 Pattern write and direct readback passed.
 Run inside Xiangshan Linux:
-  vortex-gds_read -l ${slba} -e ${checksum} -d /dev/nvme0n1 -b ${lba_size} -i ${nsid}
+  vortex-gds_read --mode gds --slba ${slba} \
+    --expected-checksum ${checksum} --device /dev/nvme0n1 \
+    --bytes ${TEST_BYTES} --lba-bytes ${lba_size} --nsid ${nsid}
 EOF

@@ -1,6 +1,6 @@
 # 跨软硬件协同虚拟 PCIe/外设系统架构
 
-本项目在 FPGA 原型平台上把香山 Linux 的 PCIe 配置访问、BAR MMIO 和真实设备 DMA 与 x86/QEMU 协同起来。当前仓库 14 的主线不再依赖 DUT-facing XDMA Root Port，而是由 FPGA 和 QEMU 实现一个 Linux 配置空间视角的虚拟 PCIe switch，并通过受控backend把主机侧真实 NVMe、Intel 82580 Ethernet function 或 U280 上的 Vortex GPGPU 映射给香山。
+本项目在 FPGA 原型平台上把香山 Linux 的 PCIe 配置访问、BAR MMIO 和真实设备 DMA 与 x86/QEMU 协同起来。当前仓库 16 的主线不再依赖 DUT-facing XDMA Root Port，而是由 FPGA 和 QEMU 实现一个 Linux 配置空间视角的虚拟 PCIe switch，并通过受控backend把主机侧真实 NVMe、Ethernet function 或 U280 上的 Vortex GPGPU 映射给香山。
 
 核心控制链路为：
 
@@ -390,6 +390,35 @@ physical_hbm_offset = vortex_device_address & 0x0fffffff
 `0x08000000`，用于避开低地址console和buffer区域；这个链接地址属于当前
 单bank软硬件地址合同，而不是任意可替换的部署参数。
 
+#### 4.5.4 GPU-initiated storage（GIDS）
+
+GIDS 是 Vortex backend 的可选独占存储模式。Vortex kernel 在 HBM 中维护逻辑
+submission/completion queue，决定 opcode、LBA、HBM buffer、长度和提交时机；
+QEMU GIDS service 批量获取逻辑 SQE，执行边界与 generation 校验，映射到它独占的
+真实 NVMe I/O queue，再把物理完成转换成 HBM logical CQE。香山 CPU 和 host
+application 均不逐请求提交 I/O。
+
+```text
+Vortex kernel -> HBM logical SQ -> scope-vortex-bridge
+-> QEMU GIDS validation/physical NVMe queue -> real NVMe doorbell
+real NVMe <-> U280 P2P BAR/HBM payload
+real NVMe CQ -> QEMU -> bridge -> HBM logical CQ -> Vortex kernel
+```
+
+QEMU/bridge仍执行每请求的可信验证和物理队列转换，但不选择请求内容、不复制
+payload，也不是应用级request scheduler。READ与WRITE共享同一控制协议，payload
+均不经过香山DDR或host DRAM。物理NVMe不能同时作为普通virtual NVMe或当前
+CPU-initiated GDS backend使用；启动配置必须选择唯一owner。Bridge断开、physical
+completion超时或queue ABI错误会停止逻辑queue；Bridge仍可通信时QEMU把它置为
+`FAILED`，GPU通过queue state结束等待。Bridge完全断开时无法再写HBM，GPU依靠
+有界poll退出。两种情况的恢复都需要重建QEMU/Bridge session。
+
+当前CPU-initiated GDS仍作为独立模式保留：Linux管理NVMe SQ/CQ并逐请求发起
+`pread`，QEMU只把READ payload PRP改写到HBM。它与GIDS的差别是request initiator
+和queue owner，不是payload是否P2P。规范、实现计划和验收步骤分别见
+`VORTEX_GIDS_SCADA_ARCHITECTURE.md`、`VORTEX_GIDS_IMPLEMENTATION_PLAN.md`和
+`VORTEX_GIDS_RUNBOOK.md`。
+
 ### 4.6 Block Design
 
 `shell/nm37_vu37p/fpga/scripts/xiangshan.tcl` 完成以下连接：
@@ -542,6 +571,7 @@ transfer再释放ring；驱动的stale-transfer清理保证进程异常退出、
 - NVMe/82580经coherent alias对香山guest memory执行host PCIe fabric P2P DMA；
 - Vortex由U280作为PCIe requester经NM37 BAR2 coherent alias直接访问香山guest memory；
 - Vortex显式`mediated`兼容模式；direct-P2P模式禁止silent fallback；
+- Vortex GIDS逻辑SQ/CQ、GPU主动READ/WRITE、独占physical NVMe queue与HBM P2P payload；
 - 共享 level INTx；
 - BAR_DONE timeout recovery。
 
@@ -568,6 +598,8 @@ context必须由`scope-vortex-bridge`独占。这是当前设备生命周期和�
 | `qemu-mount/hw/misc/scope_fpga_vswitch_nvme_backend.c` | NVMe backend BAR/poll调度边界 |
 | `qemu-mount/hw/misc/scope_fpga_vswitch_igb_backend.c` | 82580 BAR0、queue0、descriptor、cause/mask和reset逻辑 |
 | `qemu-mount/hw/misc/scope_fpga_vswitch_vortex_backend.c` | Vortex虚拟CP、命令地址翻译和U280 worker |
+| `qemu-mount/hw/misc/scope_fpga_vswitch_gids.c` | GIDS请求校验、physical NVMe queue和completion转换 |
+| `qemu-mount/include/hw/misc/scope_vortex_gids_abi.h` | HBM逻辑SQ/CQ及状态ABI |
 | `qemu-mount/hw/misc/scope_vortex_bridge_proto.h` | QEMU与U280 bridge的固定RPC ABI |
 | `qemu-mount/hw/misc/scope_fpga_vswitch_nvme.c` | 原NVMe-only稳定回退QOM |
 | `qemu-mount/hw/misc/scope_fpga_vswitch_abi.h` | 带 BDF 的 32B packet ABI |
@@ -580,5 +612,7 @@ context必须由`scope-vortex-bridge`独占。这是当前设备生命周期和�
 | `shell/software/xdma_drv/XDMA/linux-kernel/xdma` | DMA32 cyclic ring 和 XDMA host access |
 | `doc/VSWITCH_REGISTER_INTERFACE_SPEC.md` | mailbox、route、ECAM shadow 与 packet ABI 接口合同 |
 | `doc/VSWITCH_NIC_INTEGRATION_STUDY.md` | 82580 mediated backend技术依据、实现约束和验证状态 |
+| `doc/VORTEX_GIDS_SCADA_ARCHITECTURE.md` | GPU主动存储的所有权、数据路径和故障语义 |
+| `doc/VORTEX_GIDS_RUNBOOK.md` | GIDS正确性、故障与三路径对比验收流程 |
 
-仓库 11 的 `scope_fpga_proxy.c`、`axilite_active_proxy.v`、`XSTop_pci.dts` 和 DUT-facing XDMA RP 路径仍可作为单设备兼容基线，但不再是仓库 14 vSwitch bitstream 的当前主线。
+仓库 11 的 `scope_fpga_proxy.c`、`axilite_active_proxy.v`、`XSTop_pci.dts` 和 DUT-facing XDMA RP 路径仍可作为单设备兼容基线，但不再是仓库 16 vSwitch bitstream 的当前主线。

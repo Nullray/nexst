@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "devices": [
+    {
+      "type": "vortex",
+      "data-path": "direct-p2p",
+      "bridge-socket": "/run/scope-vortex0.sock",
+      "gids-mode": "mediated",
+      "gids-nvme-bdf": "0000:e1:00.0",
+      "gids-nsid": 1,
+      "gids-slba-base": 262144,
+      "gids-block-count": 262144,
+      "gids-control-base": "0xffe00000",
+      "gids-control-size": "0x200000",
+      "gids-queue-depth": 64,
+      "gids-payload-size": "0x800000"
+    }
+  ]
+}

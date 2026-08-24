@@ -2,9 +2,10 @@
 
 set -Eeuo pipefail
 
-readonly REPO_ROOT="/home/yanjiarun/nexst_proxy_14"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 readonly WORK_FARM="${REPO_ROOT}/work_farm"
-readonly VORTEX_HOME="/home/yanjiarun/Vortex"
+readonly VORTEX_HOME="${VORTEX_HOME:-/home/yanjiarun/Vortex_16}"
 readonly ROOTFS_SRC="${REPO_ROOT}/nanhu-g/software/rootfs"
 readonly CROSS_CXX_PATH="/usr/bin/riscv64-linux-gnu-g++"
 readonly CROSS_PATH="/usr/bin"
@@ -17,7 +18,7 @@ readonly PROJECT="target:nanhu-g:proto"
 readonly DT_TARGET="XSTop_vpcie"
 readonly VORTEX_CONFIGS_VALUE="-DVX_CFG_NUM_CLUSTERS=1 -DVX_CFG_NUM_CORES=1 -DVX_CFG_PLATFORM_MEMORY_NUM_BANKS=1 -DVX_CFG_PLATFORM_MEMORY_ADDR_WIDTH=28"
 readonly VORTEX_STARTUP_ADDR_VALUE="0x08000000"
-readonly VORTEX_TESTS_VALUE="vecadd sgemm conv3 multikernel bfs sort gds_read"
+readonly VORTEX_TESTS_VALUE="vecadd sgemm conv3 multikernel bfs sort gds_read gids_io"
 readonly WORK_OUTPUT="${WORK_FARM}/target/nanhu-g/ready_for_download/proto_nm37_vu37p/RV_BOOT.bin"
 readonly WORK_BACKUP="${WORK_FARM}/target/nanhu-g/ready_for_download/proto_nm37_vu37p/RV_BOOT.pre_vortex_1bank.bin"
 readonly FINAL_OUTPUT="${REPO_ROOT}/nanhu-g/ready_for_download/proto_nm37_vu37p/RV_BOOT_vortex_1bank.bin"
