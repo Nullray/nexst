@@ -211,12 +211,25 @@ assign m_ecam_shadow_axi_wvalid = 1'b0;
 assign m_ecam_shadow_axi_bready = 1'b1;
 
 assign s_ecam_axi_awready = !rst && (ecam_w_state == ECAM_W_IDLE) &&
-                            !s_ecam_axi_bvalid && !ecam_aw_pending;
+                            !s_ecam_axi_bvalid && !ecam_aw_pending &&
+                            (ecam_r_state == ECAM_R_IDLE) &&
+                            !s_ecam_axi_rvalid &&
+                            !m_ecam_shadow_axi_arvalid &&
+                            !m_ecam_shadow_axi_rready;
 assign s_ecam_axi_wready  = !rst && (ecam_w_state == ECAM_W_IDLE) &&
-                            !s_ecam_axi_bvalid && !ecam_w_pending;
+                            !s_ecam_axi_bvalid && !ecam_w_pending &&
+                            (ecam_r_state == ECAM_R_IDLE) &&
+                            !s_ecam_axi_rvalid &&
+                            !m_ecam_shadow_axi_arvalid &&
+                            !m_ecam_shadow_axi_rready;
+/* Give writes priority so BAR readback cannot race QEMU's shadow update. */
 assign s_ecam_axi_arready = !rst && (ecam_r_state == ECAM_R_IDLE) &&
                             !s_ecam_axi_rvalid && !m_ecam_shadow_axi_arvalid &&
-                            !m_ecam_shadow_axi_rready;
+                            !m_ecam_shadow_axi_rready &&
+                            (ecam_w_state == ECAM_W_IDLE) &&
+                            !s_ecam_axi_bvalid &&
+                            !ecam_aw_pending && !ecam_w_pending &&
+                            !s_ecam_axi_awvalid && !s_ecam_axi_wvalid;
 
 assign s_mbx_axi_awready = !rst && !s_mbx_axi_bvalid && !mbx_aw_pending;
 assign s_mbx_axi_wready  = !rst && !s_mbx_axi_bvalid && !mbx_w_pending;

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "devices": [
+    {
+      "type": "nvme",
+      "transport": "remote-rdma",
+      "remote-host": "10.30.19.15",
+      "remote-service": "7471",
+      "remote-device-id": "remote-nvme0",
+      "rdma-device": "iwo3",
+      "rdma-memory-mode": "host-staging",
+      "rdma-staging-size": 4194304,
+      "namespace-id": 1
+    }
+  ]
+}
