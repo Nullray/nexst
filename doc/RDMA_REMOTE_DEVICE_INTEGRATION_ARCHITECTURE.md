@@ -58,6 +58,49 @@ namespace I/O和RDMA READ/WRITE，因此普通payload不经过Host B CPU复制�
 QEMU coherent XDMA访问在Host A staging MR与香山DDR间搬运，不能作为零拷贝或
 direct-P2P性能结果。
 
+### 1.2 远端82599数据包模式
+
+82599不使用NVMe的peer-memory payload协议，也不把远端物理BAR或DMA地址直接
+映射给香山。Host A QEMU维护最小82599 PF模型，包括BAR0、queue 0描述符、链路
+状态、cause/mask和legacy INTx；它通过coherent alias访问香山TX/RX ring。完整
+Ethernet frame经RDMA SEND传给Host B agent，agent使用专用82599 netdev的
+`AF_PACKET`接口收发。X722仅承载RDMA控制连接。
+
+该模式的设备语义为`type=ixgbe, transport=remote-rdma`，强制使用
+`host-staging`。香山内核启用`CONFIG_IXGBE=y`，配置空间只暴露128 KiB BAR0和
+INTA，隐藏MSI/MSI-X。首版固定单TX queue、单RX queue，并禁用RSS、TSO、header
+split和PTP。远端82599保持绑定Host B `ixgbe`，不得与SSH/RDMA接口复用。
+
+当前82599 backend补齐了Linux 5.16 `ixgbe` probe所需的最小虚拟硬件语义：
+软件/链路reset位按真实硬件行为自清零；EEC保持EEPROM present、auto-read done
+和software grant语义；FWSM返回有效firmware状态；虚拟EEPROM提供合法的firmware
+pointer/version和checksum；I2CCTL对bit-bang时钟/数据线返回一致的输入电平。
+这些语义仅用于满足标准`ixgbe`初始化，不转发Host B物理82599的NVM、firmware
+或I2C访问。修正后香山侧不再出现FWSM firmware warning和
+`pre-production adapter/LOM`提示。
+
+远端82599首次枚举还暴露了ECAM代理的读写并发问题：Linux写BAR后立即readback时，
+独立AXI读写通道可能同时访问shadow BRAM，使readback观察到旧值。当前RTL在一个
+ECAM事务完成前阻止另一方向握手，并在读写同时到达时优先完成写事务。该修正不
+改变配置空间内容、DMA32 packet ABI或local backend语义，但QEMU与FPGA应配套使用。
+
+TX completion采用远端确认语义。guest写TDT后，QEMU稳定读取TX descriptor和
+packet buffer并发送`IXGBE_TX`；只有Host B完成`AF_PACKET`提交并返回
+`IXGBE_TX_COMPLETE(request_id)`后，QEMU才写回对应TX descriptor的DD位并产生
+queue 0 legacy INTx。RDMA提交成功本身不等价于guest-visible TX completion。
+
+TDT/RDT属于packet-mediated 82599的普通doorbell，不再请求额外
+`BAR_WRITE_DONE`。Linux `ixgbe`在发布descriptor前已有内存屏障，QEMU侧又对
+descriptor执行稳定双读，因此BAR write response后即可把tail放入backend pending
+queue，由`poll()`在ring配置和descriptor可见后推进。该修改避免了
+`ip link set eth0 up`期间TDT/RDT初始化写被错误等待5 ms后产生
+`BAR_DONE_INFERRED`，同时不削弱descriptor可见性检查。
+
+默认情况下，guest-visible link状态继续严格跟随Host B真实82599 carrier。为便于
+在物理网线未连接时单独验证香山Linux→标准`ixgbe`→TX descriptor→QEMU→RDMA的
+发送路径，可显式设置`SCOPE_IXGBE_FORCE_LINK_UP=1`。该开关只改变香山看到的
+虚拟`LINKS`状态，不改变Host B物理82599的真实carrier，正常实验不得默认启用。
+
 相关现有设计见：
 
 - [PROJECT_ARCHITECTURE.md](PROJECT_ARCHITECTURE.md)
@@ -962,46 +1005,3 @@ NVMe READ:  SSD --NVMe DMA--> Host B shared pages --RDMA/Host A RNIC--> XiangSha
 P2PDMA dma-buf注册成可读写MR，以及实际PCIe拓扑/ACS/IOMMU是否允许该peer
 traffic。部署时应先完成14.1和14.2；通过后，其余工作可以保持现有FPGA/QEMU
 架构并逐层实现。
-
-### 1.2 远端82599数据包模式
-
-82599不使用NVMe的peer-memory payload协议，也不把远端物理BAR或DMA地址直接
-映射给香山。Host A QEMU维护最小82599 PF模型，包括BAR0、queue 0描述符、链路
-状态、cause/mask和legacy INTx；它通过coherent alias访问香山TX/RX ring。完整
-Ethernet frame经RDMA SEND传给Host B agent，agent使用专用82599 netdev的
-`AF_PACKET`接口收发。X722仅承载RDMA控制连接。
-
-该模式的设备语义为`type=ixgbe, transport=remote-rdma`，强制使用
-`host-staging`。香山内核启用`CONFIG_IXGBE=y`，配置空间只暴露128 KiB BAR0和
-INTA，隐藏MSI/MSI-X。首版固定单TX queue、单RX queue，并禁用RSS、TSO、header
-split和PTP。远端82599保持绑定Host B `ixgbe`，不得与SSH/RDMA接口复用。
-
-当前82599 backend补齐了Linux 5.16 `ixgbe` probe所需的最小虚拟硬件语义：
-软件/链路reset位按真实硬件行为自清零；EEC保持EEPROM present、auto-read done
-和software grant语义；FWSM返回有效firmware状态；虚拟EEPROM提供合法的firmware
-pointer/version和checksum；I2CCTL对bit-bang时钟/数据线返回一致的输入电平。
-这些语义仅用于满足标准`ixgbe`初始化，不转发Host B物理82599的NVM、firmware
-或I2C访问。修正后香山侧不再出现FWSM firmware warning和
-`pre-production adapter/LOM`提示。
-
-远端82599首次枚举还暴露了ECAM代理的读写并发问题：Linux写BAR后立即readback时，
-独立AXI读写通道可能同时访问shadow BRAM，使readback观察到旧值。当前RTL在一个
-ECAM事务完成前阻止另一方向握手，并在读写同时到达时优先完成写事务。该修正不
-改变配置空间内容、DMA32 packet ABI或local backend语义，但QEMU与FPGA应配套使用。
-
-TX completion采用远端确认语义。guest写TDT后，QEMU稳定读取TX descriptor和
-packet buffer并发送`IXGBE_TX`；只有Host B完成`AF_PACKET`提交并返回
-`IXGBE_TX_COMPLETE(request_id)`后，QEMU才写回对应TX descriptor的DD位并产生
-queue 0 legacy INTx。RDMA提交成功本身不等价于guest-visible TX completion。
-
-TDT/RDT属于packet-mediated 82599的普通doorbell，不再请求额外
-`BAR_WRITE_DONE`。Linux `ixgbe`在发布descriptor前已有内存屏障，QEMU侧又对
-descriptor执行稳定双读，因此BAR write response后即可把tail放入backend pending
-queue，由`poll()`在ring配置和descriptor可见后推进。该修改避免了
-`ip link set eth0 up`期间TDT/RDT初始化写被错误等待5 ms后产生
-`BAR_DONE_INFERRED`，同时不削弱descriptor可见性检查。
-
-默认情况下，guest-visible link状态继续严格跟随Host B真实82599 carrier。为便于
-在物理网线未连接时单独验证香山Linux→标准`ixgbe`→TX descriptor→QEMU→RDMA的
-发送路径，可显式设置`SCOPE_IXGBE_FORCE_LINK_UP=1`。该开关只改变香山看到的
-虚拟`LINKS`状态，不改变Host B物理82599的真实carrier，正常实验不得默认启用。
