@@ -184,6 +184,31 @@ Acceptance criteria:
 - QEMU reports no descriptor address outside guest DDR, queue stall, RDMA
   protocol failure or permanently asserted aggregate INTx.
 
+### DHCP reports a lease but does not return
+
+`udhcpc` prints `lease ... obtained` before it synchronously runs
+`/usr/share/udhcpc/default.script`.  First separate the DHCP data path from the
+guest address/route hook:
+
+```sh
+udhcpc -i eth0 -f -q -s /bin/true
+```
+
+If this always returns, DHCP TX/RX is complete and the hang is in the guest
+hook. Trace each hook command on the next run:
+
+```sh
+printf '%s\n' '#!/bin/sh' \
+  'exec sh -x /usr/share/udhcpc/default.script "$@"' >/tmp/udhcpc-trace.sh
+chmod +x /tmp/udhcpc-trace.sh
+udhcpc -i eth0 -f -q -s /tmp/udhcpc-trace.sh
+```
+
+At the same time, inspect `/tmp/scope-qemu-remote-82599.log` on Host A.
+`TX_COMPLETE ... intx=1` confirms TX completion publication. `RX_DELIVER`
+confirms delivery into a guest RX descriptor. Repeated `RX_DROP` indicates a
+full or disabled guest RX ring and must be investigated before retrying DHCP.
+
 ## 7. Recovery
 
 Stop XiangShan traffic, then QEMU, then the Host B agent. Restore Host B's

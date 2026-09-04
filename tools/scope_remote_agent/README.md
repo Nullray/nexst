@@ -41,6 +41,55 @@ aggregate INTx.  RSS, TSO, header split, PTP, MSI and MSI-X are intentionally
 not exposed.  The 82599 interface is the payload NIC; the X722 is the RDMA
 transport NIC.
 
+## Remote Intel 82599 shadow-ring backend
+
+`scope-remote-ixgbe-shadow-agent` is the experimental no-functional-driver
+alternative. The target 82599 is unbound from `ixgbe`; the agent maps PCI BAR0
+through sysfs and programs physical queue-0 TX/RX descriptor rings in a locked
+2 MiB hugetlbfs pool. It does not bind VFIO. Physical interrupts stay masked,
+and the agent polls real descriptor DD bits and `LINKS`.
+
+This mode requires a dedicated Host B with the target function in an identity
+DMA domain. It has no IOMMU isolation. The agent refuses a bound device, a
+non-hugetlbfs pool, non-contiguous PFNs, or startup without the explicit unsafe
+identity-DMA acknowledgement.
+
+```sh
+sudo ./scope-remote-ixgbe-shadow-agent \
+  --listen 10.30.19.15 --service 7472 \
+  --rdma-device iwo3 --device-id remote-82599-shadow-0 \
+  --pci-bdf 0000:5e:00.0 \
+  --hugepage-file /dev/hugepages/scope-82599-shadow \
+  --allow-unsafe-identity-dma \
+  --restore-sfp-tx-laser --require-link-up
+```
+
+For the inspected SFP+ adapter, `ixgbe` shutdown during unbind sets
+`ESDP.SDP3` and turns off the transmitter. `--restore-sfp-tx-laser` reverses
+that specific teardown operation and waits up to five seconds for `LINKS.UP`.
+It is not a replacement for full EEPROM/SFP/PHY initialization.
+
+Host A must set `"remote-device-mode": "shadow-ring"`; feature negotiation
+prevents it from connecting to the AF_PACKET agent by mistake. It also sets
+`"rdma-memory-mode": "inline"`, so QEMU does not allocate the otherwise unused
+Host A payload staging MR. The guarded deployment entry point for the inspected
+two-host setup is:
+
+```sh
+REMOTE_ALLOW_UNSAFE_IDENTITY_DMA=1 \
+  ./setup_remote_82599_shadow_ring.sh all
+```
+
+The wrapper prompts for the remote sudo password on a TTY. Set
+`REMOTE_SUDO_NONINTERACTIVE=1` only when remote `sudo -n` is already usable.
+Its stop path waits for the agent to disable queues and PCI bus mastering
+before it reprobes `ixgbe`.
+
+Phase 1 still transports complete frames in RDMA SEND messages, so it removes
+the Host B kernel networking path but is not end-to-end zero-copy. The exact
+data path, teardown order, and future one-sided RDMA phase are specified in
+`../../doc/RDMA_82599_SHADOW_RING_ARCHITECTURE.md`.
+
 On the target Host B (`10.30.19.15`), the guarded wrapper checks the verbs
 port, local address, device nodes, and that the namespace is not mounted:
 

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "devices": [
+    {
+      "type": "ixgbe",
+      "transport": "remote-rdma",
+      "remote-device-mode": "shadow-ring",
+      "remote-host": "10.30.19.15",
+      "remote-service": "7472",
+      "remote-device-id": "remote-82599-shadow-0",
+      "rdma-device": "iwo3",
+      "rdma-memory-mode": "inline"
+    }
+  ]
+}
