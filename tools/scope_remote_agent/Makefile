@@ -14,7 +14,8 @@ LDLIBS += $(RDMA_LIBS)
 .PHONY: all clean
 
 all: scope-remote-agent scope-remote-nic-agent \
-	scope-remote-ixgbe-shadow-agent scope-peer-mr-probe
+	scope-remote-ixgbe-shadow-agent scope-remote-nvme-shadow-agent \
+	scope-peer-mr-probe
 
 scope-remote-agent: scope_remote_agent.c scope_remote_proto.h
 	$(CC) $(CFLAGS) -o $@ scope_remote_agent.c $(LDLIBS)
@@ -25,9 +26,13 @@ scope-remote-nic-agent: scope_remote_nic_agent.c scope_remote_proto.h
 scope-remote-ixgbe-shadow-agent: scope_remote_ixgbe_shadow_agent.c scope_remote_proto.h
 	$(CC) $(CFLAGS) -o $@ scope_remote_ixgbe_shadow_agent.c $(LDLIBS)
 
+scope-remote-nvme-shadow-agent: scope_remote_nvme_shadow_agent.c scope_remote_proto.h
+	$(CC) $(CFLAGS) -o $@ scope_remote_nvme_shadow_agent.c $(LDLIBS)
+
 scope-peer-mr-probe: scope_peer_mr_probe.c scope_xdma_peer_uapi.h
 	$(CC) $(CFLAGS) -o $@ scope_peer_mr_probe.c $(LDLIBS)
 
 clean:
 	rm -f scope-remote-agent scope-remote-nic-agent \
-		scope-remote-ixgbe-shadow-agent scope-peer-mr-probe
+		scope-remote-ixgbe-shadow-agent scope-remote-nvme-shadow-agent \
+		scope-peer-mr-probe

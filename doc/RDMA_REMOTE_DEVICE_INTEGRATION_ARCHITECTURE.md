@@ -1,483 +1,60 @@
 # RDMA 远端外设接入架构（当前实现）
 
-## 1. 文档范围
+## 1. 范围与验证状态
 
-本文描述仓库当前已经实现的远端外设接入路径，而不是未来规划。事实来源为以下
-代码，最后核对日期为 2026-09-02：
+最后核对：2026-09-17，仓库 17 的 NexST 与 QEMU `nm37_vswitch` 分支。
+本文描述现有代码，不把设计目标或可选路径写成已经完成的硬件验证。
 
-- `qemu-mount/hw/misc/scope_fpga_vswitch.c`
-- `qemu-mount/hw/misc/scope_fpga_vswitch_rdma.c`
-- `qemu-mount/hw/misc/scope_fpga_vswitch_ixgbe_backend.c`
-- `qemu-mount/include/hw/misc/scope_remote_proto.h`
-- `tools/scope_remote_agent/scope_remote_agent.c`
-- `tools/scope_remote_agent/scope_remote_nic_agent.c`
-- `tools/scope_remote_agent/scope_remote_proto.h`
-- `shell/software/xdma_drv/XDMA/linux-kernel/xdma/cdev_peer.c`
+本轮远端 NVMe 调试已修复初始化超时、PRP list 页内偏移等问题。用户在本次更新前
+确认“现在代码可以正常工作”。QEMU 与 Host B agent 构建通过；PRP/CQ 测试
+2581 个用例和物理 CQE 完成路径测试 12 个用例通过。该反馈不等于已完成长时压力、
+写入校验、故障重连或带宽测量，本文不声明这些项目通过。
 
-QEMU 和 agent 两份 `scope_remote_proto.h` 当前内容一致。修改 wire ABI 时必须同步
-更新两份文件。
+操作步骤见 [Remote NVMe 验证手册](RDMA_REMOTE_NVME_VALIDATION_RUNBOOK.md)。
+现有 `RDMA_REMOTE_NIC_VALIDATION_RUNBOOK.md` 是 NIC packet 路径手册，不能将其
+“保留 ixgbe 驱动”规则用于 raw NVMe 或 raw 82599 shadow 模式。
 
-当前支持两种远端设备：
+## 2. 模式与设备所有权
 
-| 香山看到的设备 | Host B 设备 | 当前传输语义 |
+`type`、`transport`、`remote-device-mode` 和 `rdma-memory-mode` 是不同维度。
+`remote-rdma` 目前仅支持 `nvme`、`ixgbe`，不支持 `igb`、`vortex`。
+
+| 设备 / remote-device-mode | Host B agent | 目标设备所有权 | 执行路径 |
+| --- | --- | --- | --- |
+| NVMe `semantic`（默认） | `scope-remote-agent` | 保留 Linux nvme 驱动 | ioctl / O_DIRECT + RDMA |
+| NVMe `shadow-queue` | `scope-remote-nvme-shadow-agent` | 解绑 nvme，不绑定 VFIO | 真实 SQ/CQ + RDMA |
+| 82599 `packet`（默认） | `scope-remote-nic-agent` | 保留 Linux ixgbe 驱动 | AF_PACKET + RDMA SEND/RECV |
+| 82599 `shadow-ring` | `scope-remote-ixgbe-shadow-agent` | 解绑功能驱动，不绑定 VFIO | 真实 TX/RX ring + RDMA SEND/RECV |
+
+| 模式 | 允许的 memory mode | 示例配置 |
 | --- | --- | --- |
-| NVMe 控制器 | Linux 管理的 NVMe controller/namespace | NVMe 命令语义 + RDMA payload |
-| Intel 82599 `8086:10fb` | Linux `ixgbe` 管理的专用 netdev | 82599 虚拟模型 + 完整 Ethernet frame |
-
-两者都不是“把 Host B 的 PCIe 总线延伸到香山”，也不把 Host B 的真实 BAR、真实
-DMA 地址或真实队列直接映射给香山。
-
-## 2. 总体结论
-
-### 2.1 远端 NVMe
-
-Host A QEMU 维护 guest 可见的 NVMe BAR、队列和完成状态。香山写 SQ doorbell 后，
-QEMU读取SQE，解析并验证PRP，再发送`NVME_SUBMIT`给Host B。Host B agent使用：
-
-- controller fd上的`NVME_IOCTL_ADMIN_CMD`执行允许的Admin命令；
-- namespace fd上的`pread/pwrite(O_DIRECT)`执行普通READ/WRITE；
-- `fsync()`执行FLUSH；
-- Host B的一块page-aligned staging同时作为RDMA本地缓冲区和`pread/pwrite`缓冲区。
-
-物理NVMe继续由Host B内核NVMe驱动管理。当前实现没有raw physical SQ/CQ engine、
-没有`scope_remote_dma.ko`，也没有在userspace构造物理PRP。
-
-### 2.2 远端 82599
-
-Host A QEMU维护一个最小82599 PF模型。香山`ixgbe`驱动操作的是这个虚拟模型，
-不是Host B真实82599的BAR。QEMU读取香山TX descriptor和packet buffer，把完整
-Ethernet frame放进RDMA SEND消息。Host B nic agent收到后通过`AF_PACKET`
-`sendto()`交给真实82599 netdev。
-
-RX方向由Host B nic agent通过`AF_PACKET recvfrom()`取得完整帧，再用RDMA SEND
-发给QEMU；QEMU把帧和descriptor完成状态写回香山DDR。
-
-### 2.3 当前实际配置
-
-仓库当前两个远端配置均显式使用`host-staging`：
-
-- `vswitch-backends-remote-nvme.json`
-- `vswitch-backends-remote-82599.json`
-
-NVMe代码还实现了可选的`peer-dmabuf`模式；82599代码明确禁止该模式。
-
-## 3. 分层架构
-
-```text
-                         Host A
-┌────────────────────────────────────────────────────────────┐
-│ XiangShan Linux                                            │
-│   ├─ standard nvme driver                                  │
-│   └─ standard ixgbe driver                                 │
-│              │ CFG/BAR/descriptor/guest DMA address        │
-│ NM37 FPGA virtual PCIe switch + XiangShan DDR              │
-│              │ DMA32 control ring + BAR2 coherent alias    │
-│ QEMU scope-fpga-vswitch                                    │
-│   ├─ remote NVMe semantic model                            │
-│   ├─ virtual 82599 packet model                            │
-│   └─ remote-rdma RC transport                              │
-│              │                                             │
-│ Host A RNIC ─┴─────────────────────────────────────────────┼── RDMA
-└────────────────────────────────────────────────────────────┘
-                                                            │
-                         Host B                             │
-┌────────────────────────────────────────────────────────────┐
-│ Host B RNIC                                                │
-│   ├─ scope-remote-agent (NVMe)                             │
-│   │    ├─ registered staging buffer                        │
-│   │    ├─ NVME_IOCTL_ADMIN_CMD                             │
-│   │    └─ pread/pwrite(O_DIRECT)                           │
-│   └─ scope-remote-nic-agent (82599)                        │
-│        ├─ registered SEND/RECV message buffers             │
-│        └─ AF_PACKET socket                                 │
-│                                                            │
-│ Linux nvme driver / Linux ixgbe driver                     │
-│              │                                             │
-│ physical NVMe / physical Intel 82599                       │
-└────────────────────────────────────────────────────────────┘
-```
-
-设备语义和transport在配置层分开：
-
-```text
-Device semantics: nvme / igb / ixgbe / vortex
-Transport:        local-p2p / remote-rdma
-```
-
-但是当前组合不是任意的：
-
-- `remote-rdma`只接受`nvme`或`ixgbe`；
-- `ixgbe`只接受`remote-rdma + host-staging`；
-- `igb`和`vortex`没有远端实现；
-- local NVMe/IGB/Vortex仍走原有路径。
-
-## 4. RDMA控制协议
-
-### 4.1 连接
-
-QEMU和agent使用`librdmacm + libibverbs`建立RC QP。控制消息使用已注册的4 KiB
-SEND/RECV buffer。QEMU建立连接时依次执行：
-
-1. 创建RDMA endpoint和RC QP；
-2. 注册control TX/RX MR；
-3. 根据memory mode注册Host A payload MR；
-4. `rdma_connect()`；
-5. 交换`HELLO/HELLO_RSP`；
-6. 交换`DEVICE_OPEN/DEVICE_OPEN_RSP`；
-7. 进入非阻塞CQ polling。
-
-QEMU检查RDMA route实际选择的verbs device是否等于JSON中的`rdma-device`。Host B
-agent也做同样检查。
-
-### 4.2 Wire ABI
-
-当前协议版本为`major=1, minor=2`：
-
-```c
-struct scope_remote_hdr {
-    uint32_t magic;          /* "SRDM" */
-    uint16_t major;
-    uint16_t minor;
-    uint16_t opcode;
-    uint16_t flags;
-    uint32_t payload_len;
-    uint64_t session_id;
-    uint64_t request_id;
-    uint64_t generation;
-    int32_t  status;
-    uint32_t reserved;
-};
-```
-
-所有多字节字段在wire上使用little-endian。单条消息固定最大4096字节，单个NVMe
-请求最多64个segment，Ethernet frame字段最大2048字节。
-
-协议头定义了以下opcode：
-
-```text
-HELLO / HELLO_RSP
-DEVICE_OPEN / DEVICE_OPEN_RSP
-BAR_READ / BAR_READ_RSP
-BAR_WRITE / BAR_WRITE_RSP
-NVME_ENABLE / NVME_DISABLE
-NVME_SUBMIT / NVME_COMPLETE
-RESET / RESET_RSP
-KEEPALIVE / ERROR / CLOSE
-IXGBE_TX / IXGBE_TX_COMPLETE / IXGBE_RX / IXGBE_LINK
-```
-
-“在枚举中定义”不等于当前agent都实现：
-
-- NVMe agent实际处理`HELLO`、`DEVICE_OPEN`、`NVME_SUBMIT`、`KEEPALIVE`、`CLOSE`；
-- NIC agent实际处理`HELLO`、`DEVICE_OPEN`、`IXGBE_TX`、`CLOSE`，并主动发送
-  `IXGBE_RX`和`IXGBE_LINK`；
-- 当前NVMe和NIC运行路径都不使用远端物理`BAR_READ/BAR_WRITE`；
-- `NVME_ENABLE/DISABLE`和`RESET`不是当前端到端控制路径。
-
-### 4.3 会话检查
-
-接收端检查magic、major、minor上限、payload长度和reserved。首次`HELLO`之后还检查
-session ID与generation。QEMU另外按request ID匹配NVMe/TX completion，并对请求
-设置timeout。无法匹配的completion或CQ错误会把backend置为failed。
-
-当前协议没有加密和身份认证，安全模型是受信实验网络。
-
-## 5. Host A payload memory模式
-
-### 5.1 `host-staging`
-
-QEMU在Host A普通内存中分配page-aligned buffer：
-
-```c
-host_staging = qemu_memalign(4096, size);
-peer_mr = ibv_reg_mr(pd, host_staging, size,
-                     IBV_ACCESS_LOCAL_WRITE |
-                     IBV_ACCESS_REMOTE_READ |
-                     IBV_ACCESS_REMOTE_WRITE);
-```
-
-该MR的base、length和rkey通过`HELLO`告诉Host B。NVMe请求提交前，QEMU把guest
-segment改写成Host A staging中的连续地址。
-
-NVMe WRITE：
-
-```text
-香山DDR
-  -> QEMU scope_guest_mem_read()/memcpy
-Host A staging MR
-  -> Host B发起RDMA READ
-Host B staging
-  -> pwrite(O_DIRECT)
-远端NVMe namespace
-```
-
-NVMe READ：
-
-```text
-远端NVMe namespace
-  -> pread(O_DIRECT)
-Host B staging
-  -> Host B发起RDMA WRITE
-Host A staging MR
-  -> QEMU scope_guest_mem_write()/memcpy
-香山DDR
-```
-
-所以当前NVMe `host-staging`路径确实是Host A和Host B各有一个staging。Host A
-staging负责把FPGA BAR窗口转换成RNIC容易注册的普通RAM；Host B staging同时是
-RDMA本地buffer和`pread/pwrite`的userspace buffer。
-
-QEMU把`host-staging` backend限制为一个in-flight请求。Host B NVMe agent当前也
-向QEMU报告`max_inflight=1`。
-
-### 5.2 `peer-dmabuf`
-
-该模式只对远端NVMe开放。它的目标是去掉Host A staging，而不是去掉Host B
-staging，也不是让物理NVMe直接DMA香山DDR。
-
-XDMA驱动把BAR2 coherent-alias范围作为PCI P2PDMA资源导出：
-
-```text
-pci_p2pdma_add_resource()
- -> pci_p2pmem_alloc_sgl()
- -> dma_buf_export()
-```
-
-QEMU通过`/dev/xdmaN_peer`取得dma-buf fd，然后调用：
-
-```c
-ibv_reg_dmabuf_mr(pd, 0, export.length, export.guest_iova,
-                  export.dmabuf_fd, access);
-```
-
-注册成功时，Host B可以把经过验证的guest PA直接作为Host A MR中的RDMA address：
-
-```text
-NVMe WRITE: 香山DDR -> Host B RDMA READ -> Host B staging -> pwrite
-NVMe READ:  pread -> Host B staging -> Host B RDMA WRITE -> 香山DDR
-```
-
-直接模式成立需要：
-
-- XDMA模块包含当前`cdev_peer.c`并成功创建`/dev/xdmaN_peer`；
-- kernel启用PCI P2PDMA；
-- BAR index、offset、size和guest IOVA与QEMU配置完全一致；
-- FPGA与Host A RNIC的PCI拓扑通过`pci_p2pdma_distance()`检查；
-- RNIC provider支持`ibv_reg_dmabuf_mr()`和P2P SG mapping。
-
-任一步失败，QEMU启动失败。当前代码不会自动回退到`host-staging`。
-
-### 5.3 为什么不能直接对BAR mmap调用`ibv_reg_mr()`
-
-`/dev/xdmaN_bypass`的`mmap()`只是CPU访问FPGA PCIe BAR的窗口，不是普通Host A
-DRAM。普通`ibv_reg_mr()`面向可由RNIC pin和DMA-map的内存页；设备BAR需要上面的
-P2PDMA dma-buf importer/exporter路径。CPU能够读写BAR不代表RNIC能够经PCIe P2P
-访问该BAR。
-
-## 6. 远端NVMe实现
-
-### 6.1 Guest可见设备
-
-QEMU使用Host B `DEVICE_OPEN_RSP`提供的信息创建虚拟NVMe endpoint。当前Host B
-agent返回：
-
-- vendor/device：`8086:4802`；
-- class：`0x010802`；
-- BAR0 size：`0x4000`；
-- NVMe version：`1.4`；
-- controller page size：4096；
-- namespace容量和LBA shift：启动时Identify真实namespace得到；
-- max transfer：Host B staging size；
-- max in-flight：1。
-
-这些是虚拟endpoint能力，不等于把真实控制器配置空间原样透传。
-
-### 6.2 BAR语义
-
-远端NVMe BAR由QEMU本地维护：
-
-- `CAP/VS`来自agent在open时返回的能力；
-- `CC/AQA/ASQ/ACQ/INTMS/INTMC`由QEMU shadow；
-- `CSTS.RDY`根据guest `CC.EN`和remote failed状态合成；
-- 未实现的普通BAR读返回0；
-- 未实现的普通BAR写在remote模式下被接受，但不会写Host B物理NVMe BAR；
-- SQ doorbell被转换成语义化`NVME_SUBMIT`；
-- CQ doorbell只更新QEMU中的guest CQ head和INTx状态。
-
-因此远端NVMe的BAR访问延迟不是“香山到Host B真实NVMe BAR完成”的延迟。
-
-### 6.3 SQE与PRP处理
-
-香山写SQ tail后，QEMU：
-
-1. 从香山DDR稳定读取SQE；
-2. 根据qid/opcode计算数据方向和长度；
-3. 解析PRP1、PRP2和PRP list；
-4. 验证地址非零、页面对齐、长度不溢出且全部位于guest DDR窗口；
-5. 把连续页面合并成`{guest_pa, length}`segment；
-6. 限制segment数量不超过64；
-7. 在`host-staging`模式复制payload并改写segment地址；
-8. 发送包含原始64字节command和segment列表的`NVME_SUBMIT`。
-
-这里的“PRP转换”是把PRP编码展开成经过验证的segment列表，不是把guest PA转换成
-Host B物理NVMe的DMA地址。
-
-### 6.4 Host B执行路径
-
-Host B NVMe agent启动时：
-
-1. 以`O_RDWR|O_DIRECT`打开namespace；
-2. 以`O_RDWR`打开controller；
-3. 分配page-aligned staging；
-4. Identify namespace并得到容量与LBA格式；
-5. 建立RDMA listener；
-6. 接受一个连接；
-7. 注册control TX/RX MR和staging MR。
-
-当前没有自动检查namespace是否已挂载，也没有自动解绑Host B内核NVMe驱动。部署者
-必须保证测试namespace没有文件系统挂载、没有其他写入者，并明确接受原始I/O风险。
-
-普通I/O支持：
-
-| Guest opcode | Host B动作 |
-| --- | --- |
-| FLUSH `0x00` | `fsync(namespace_fd)` |
-| WRITE `0x01` | RDMA READ到B staging，再`pwrite(O_DIRECT)` |
-| READ `0x02` | `pread(O_DIRECT)`到B staging，再RDMA WRITE |
-| 其他I/O opcode | `INVALID_OPCODE` |
-
-Host B按namespace ID、LBA、NLB、LBA shift、staging上限和segment总长度做二次校验。
-
-### 6.5 Admin命令
-
-当前Admin处理分为三类：
-
-1. Create/Delete SQ/CQ：Host B直接返回成功，实际guest queue拓扑由QEMU维护；
-2. Number of Queues、Interrupt Coalescing、Interrupt Configuration、Async Event
-   Configuration：部分由agent虚拟化；
-3. Identify、Get Log Page及允许的Get/Set Features：通过
-   `NVME_IOCTL_ADMIN_CMD`交给Host B内核NVMe驱动。
-
-其他Admin opcode返回`INVALID_OPCODE`。当前实现不是任意NVMe Admin passthrough，
-也没有物理queue与guest queue一一对应。
-
-### 6.6 Completion
-
-Host B只有在RDMA payload和`pread/pwrite/ioctl/fsync`完成后才发送`NVME_COMPLETE`。
-QEMU按request ID、qid和cid匹配请求；READ在`host-staging`模式下还要先把Host A
-staging复制回香山DDR，然后才：
-
-1. 合成guest CQE；
-2. 写入香山guest CQ；
-3. 更新CQ phase/tail；
-4. 根据guest interrupt mask产生aggregate legacy INTx。
-
-这条完成语义覆盖整个远端NVMe命令，不是假完成。
-
-## 7. 远端Intel 82599实现
-
-### 7.1 设备模型边界
-
-QEMU维护最小82599 PF模型，包含：
-
-- 128 KiB BAR0寄存器数组；
-- 单TX queue和单RX queue；
-- descriptor base/length/head/tail；
-- TX/RX enable；
-- MAC、MTU和link状态；
-- EICR/EIMS和aggregate legacy INTx；
-- 满足Linux `ixgbe` probe的最小EEPROM、firmware、reset和I2C语义。
-
-香山所有82599 BAR读写首先在QEMU虚拟模型中处理。它们不会转发到Host B真实
-82599 BAR。
-
-### 7.2 TX路径
-
-```text
-guest写TDT
- -> QEMU把tail加入pending queue
- -> QEMU稳定双读TX descriptor
- -> QEMU通过scope_guest_mem_read()读取guest packet buffer
- -> 拼接完整frame到QEMU tx_frame
- -> RDMA SEND(IXGBE_TX，frame内嵌在control message)
- -> Host B agent从RDMA RECV buffer取出frame
- -> sendto(AF_PACKET, real 82599 netdev)
- -> IXGBE_TX_COMPLETE
- -> QEMU写回guest TX descriptor DD
- -> queue 0 legacy INTx
-```
-
-`IXGBE_TX_COMPLETE`表示Host B的`sendto()`成功接受完整帧，不保证帧已经从物理线缆
-发出，也不是Host B真实82599的PCIe completion。
-
-### 7.3 RX路径
-
-```text
-physical 82599 netdev收到frame
- -> Host B AF_PACKET recvfrom()
- -> RDMA SEND(IXGBE_RX，frame内嵌在control message)
- -> QEMU检查RX ring和可用descriptor
- -> scope_guest_mem_write()写guest RX buffer
- -> 写回DD/EOP和length
- -> queue 0 legacy INTx
-```
-
-Host B agent过滤`PACKET_OUTGOING`，避免把本机刚发送的frame当作RX回送。
-
-### 7.4 `host-staging`名称容易误解的地方
-
-配置和握手强制NIC使用`host-staging`，公共RDMA层也会在Host A分配并注册
-`host_staging`。但是当前NIC frame并不使用NVMe的segment + one-sided RDMA路径：
-
-- TX payload实际经过QEMU `tx_frame`和RDMA control TX buffer；
-- Host B从RDMA control RX buffer直接调用`sendto()`；
-- RX payload经过Host B control TX buffer和QEMU control RX buffer。
-
-因此NIC不能画成“香山DDR -> A staging MR -> B staging -> 82599 DMA”。更准确的
-描述是“香山DDR -> QEMU frame buffer -> RDMA SEND/RECV buffer -> AF_PACKET”。
-
-当前NIC agent没有NVMe agent那种专用Host B staging pool。
-
-### 7.5 当前限制
-
-- 固定单TX/RX queue；
-- 只支持legacy INTx，不支持MSI/MSI-X；
-- 不支持TSO和多队列/RSS；
-- wire frame字段最大2048字节，agent报告MTU范围576到1500；
-- 真实82599继续绑定Host B `ixgbe`；
-- Host B专用82599 netdev不得承载SSH或RDMA管理地址；
-- guest link跟随Host B物理carrier；当前代码没有强制虚拟link-up开关。
-
-## 8. BAR写完成语义与测量口径
-
-### 8.1 远端NVMe BAR
-
-普通寄存器由QEMU shadow或虚拟逻辑处理，SQ doorbell转化为`NVME_SUBMIT`。香山的
-BAR write response不会等待Host B物理NVMe BAR被修改，因为当前路径根本不写该
-物理BAR。
-
-### 8.2 远端82599 BAR
-
-普通寄存器写入QEMU的虚拟82599寄存器数组。TDT/RDT写只触发QEMU后续处理ring。
-BAR write response不等待frame到达Host B；TX descriptor的DD与中断则等待
-`IXGBE_TX_COMPLETE`。
-
-### 8.3 实验解释
-
-因此三种延迟不能混为一谈：
-
-| 测量 | 实际含义 |
-| --- | --- |
-| 本地物理设备BAR访问 | 香山到本地真实PCIe BAR的同步访问路径 |
-| 远端虚拟设备BAR访问 | 香山到FPGA/QEMU虚拟寄存器模型的响应路径 |
-| `fio`或真实收发包 | 包含Host A、RDMA、Host B agent和真实设备操作的端到端I/O路径 |
-
-要评价远端设备真实性能，应以NVMe实际I/O完成或NIC实际TX/RX完成为主，不能把远端
-虚拟BAR延迟直接当作Host B真实外设BAR延迟。
-
-## 9. 配置
-
-### 9.1 当前远端NVMe `host-staging`
+| NVMe semantic / shadow-queue | `host-staging` 或 `peer-dmabuf` | `vswitch-backends-remote-nvme.json` / `vswitch-backends-remote-nvme-shadow.json` |
+| 82599 packet | `host-staging` | `vswitch-backends-remote-82599.json` |
+| 82599 shadow-ring | `inline` | `vswitch-backends-remote-82599-shadow.json` |
+
+NVMe 不支持 inline；82599 不支持 peer-dmabuf。配置与 HELLO feature negotiation
+共同阻止模式误接，旧 semantic agent 不能代替 shadow-queue agent。
+
+“Host B 不绑定驱动”仅指目标 PCI function；agent 本身承担用户态设备管理职责，
+RDMA RNIC 仍需要其内核驱动和 verbs provider。
+
+## 3. 当前 NVMe 实验环境
+
+| 项目 | Host A | Host B |
+| --- | --- | --- |
+| 主机 | `debian-qdma-dev` | `master15` |
+| RDMA IPv4 | `10.128.157.132` | `10.30.19.15` |
+| RDMA device / netdev | `iwo3` / `eno3` | `iwo3` / `eno3` |
+| 本地 `0000:3b:00.0` | NM37 FPGA | Intel P4510 NVMe |
+| 控制组件 | QEMU `scope-fpga-vswitch` | raw NVMe agent，service `7473` |
+
+两台主机的 BDF 恰好相同，但设备完全不同，不能跨主机复用解绑命令。
+Host B 物理盘是 PCI `8086:0a54`、subsystem `8086:4802`、class `010802`；
+agent 明确校验这组身份。香山枚举出的 `8086:4802` 是虚拟 endpoint 身份，
+不是 Host B 物理 PCI device ID。
+
+agent 构建标识为 `nvme-shadow-cqe-order-v3`；QEMU 构建目录为
+`qemu-mount/build-rdma-repo17-review`。当前配置如下：
 
 ```json
 {
@@ -486,9 +63,10 @@ BAR write response不等待frame到达Host B；TX descriptor的DD与中断则等
     {
       "type": "nvme",
       "transport": "remote-rdma",
+      "remote-device-mode": "shadow-queue",
       "remote-host": "10.30.19.15",
-      "remote-service": "7471",
-      "remote-device-id": "remote-nvme0",
+      "remote-service": "7473",
+      "remote-device-id": "remote-nvme-shadow-0",
       "rdma-device": "iwo3",
       "rdma-memory-mode": "host-staging",
       "rdma-staging-size": 4194304,
@@ -498,214 +76,264 @@ BAR write response不等待frame到达Host B；TX descriptor的DD与中断则等
 }
 ```
 
-`rdma-staging-size`必须是4 KiB整数倍，范围为4 KiB到64 MiB。Host A staging不能
-小于Host B agent报告的max transfer。
-
-### 9.2 可选NVMe `peer-dmabuf`
-
-```json
-{
-  "version": 1,
-  "devices": [
-    {
-      "type": "nvme",
-      "transport": "remote-rdma",
-      "remote-host": "10.30.19.15",
-      "remote-service": "7471",
-      "remote-device-id": "remote-nvme0",
-      "rdma-device": "iwo3",
-      "rdma-memory-mode": "peer-dmabuf",
-      "peer-memory-device": "/dev/xdma0_peer",
-      "namespace-id": 1
-    }
-  ]
-}
-```
-
-`peer-memory-device`省略时默认`/dev/xdma0_peer`。该模式禁止配置
-`rdma-staging-size`，且不存在失败后的自动fallback。
-
-### 9.3 当前远端82599
-
-```json
-{
-  "version": 1,
-  "devices": [
-    {
-      "type": "ixgbe",
-      "transport": "remote-rdma",
-      "remote-host": "10.30.19.15",
-      "remote-service": "7472",
-      "remote-device-id": "remote-82599-0",
-      "rdma-device": "iwo3",
-      "rdma-memory-mode": "host-staging",
-      "rdma-staging-size": 4194304
-    }
-  ]
-}
-```
-
-远端82599禁止`namespace-id`和`peer-memory-device`。
-
-## 10. 启动和生命周期
-
-### 10.1 NVMe agent
-
-示例参数模型：
+## 4. Shadow-Queue 总体架构
 
 ```text
-scope-remote-agent
-  --listen 10.30.19.15
-  --service 7471
-  --rdma-device irdma0
-  --device-id remote-nvme0
-  --controller /dev/nvmeX
-  --namespace /dev/nvmeXn1
-  --namespace-id 1
-  --staging-size 4194304
+Host A:
+  XiangShan Linux nvme driver
+    -> FPGA virtual PCIe CFG/BAR + guest SQ/CQ/PRP in XiangShan DDR
+    -> QEMU: guest register/queue state, PRP validation, CQE/INTx
+             4 MiB host-staging MR
+    -> RNIC / RC RDMA connection
+
+Host B:
+  RNIC -> scope-remote-nvme-shadow-agent
+            sysfs PCI config/resource0, physical controller registers
+            2 MiB hugetlbfs identity-DMA pool
+              physical Admin SQ/CQ, I/O SQ/CQ, PRP list, payload
+            poll physical CQE -> RDMA transfer -> NVME_COMPLETE
+    -> unbound physical P4510
 ```
 
-agent当前只接受一个RDMA connection，连接退出后进程结束。它没有多租户、自动
-重连或设备owner仲裁。
+这是设备语义及 DMA 地址转换的中介，不是 PCIe 总线透明延伸。guest ASQ/ACQ 和
+数据地址属于香山 DDR，物理控制器只接收 Host B DMA pool 地址。
 
-### 10.2 NIC agent
+## 5. BAR 与初始化
 
-NIC部署脚本为：
+### 5.1 初始化流程
+
+Host B 启动时校验设备身份、无 driver symlink、hugetlbfs 和物理连续 PFN，要求
+显式 `--allow-unsafe-identity-dma`。agent 映射 BAR0、启用 PCI memory/bus master，
+用临时物理 Admin queue Identify namespace，再关闭控制器等待 guest。
 
 ```text
-tools/scope_remote_agent/setup_remote_82599_rdma.sh
+guest AQA / ASQ / ACQ writes
+  -> QEMU guest state + ordered BAR_WRITE RPC -> Host B guest shadows
+guest CC.EN=1
+  -> confirm old physical RDY=0 -> initialize Host B queues
+  -> program physical AQA / ASQ / ACQ with Host B DMA addresses -> physical CC
+guest CSTS polling
+  -> asynchronous physical CSTS refresh -> guest observes RDY
+Identify -> Create CQ/SQ -> I/O
 ```
 
-脚本检查Host A route、两端RDMA device、Host B RDMA netdev、真实82599 netdev和
-driver，并拒绝复用带有Host B全局IP的82599 netdev。随后复制并编译nic agent、
-启动agent并生成QEMU JSON。
+ASQ/ACQ 的 guest 数值传到 Host B 保存，但不直接写入物理 ASQ/ACQ。
+Create I/O CQ/SQ 的 PRP1 也替换为 B shadow queue bus address。物理 CQ 中断关闭，
+agent 轮询物理完成，QEMU 产生 guest 中断。
 
-### 10.3 QEMU停止与FPGA重烧
+### 5.2 当前寄存器语义
 
-重烧FPGA或重新加载XDMA会使BAR映射、peer dma-buf generation和正在运行的QEMU
-状态失效。安全顺序是先停止香山I/O和QEMU，再停止agent，之后重烧/重载，最后按
-agent -> QEMU -> 香山的顺序重新启动。当前代码不能在XDMA reset后透明恢复session。
+| 操作 | QEMU | Host B shadow agent |
+| --- | --- | --- |
+| CAP / VS read | 使用 DEVICE_OPEN 返回值 | 启动时读取物理能力 |
+| AQA / ASQ / ACQ write | 保存 guest 队列信息，异步 BAR RPC | 保存 guest shadow；启动时用 B 地址编程物理队列 |
+| CC write | guest 状态及待确认请求 | 控制物理 EN/SHN，回复携带物理 CSTS |
+| CSTS read | 返回最近缓存值并触发去重异步刷新 | 读取真实 CSTS |
+| INTMS / INTMC | guest mask / legacy INTx | guest mask shadow，不启用物理中断 |
+| SQ tail | 逐条 NVME_SUBMIT 后发送对应 BAR doorbell | stage 命令后写物理 SQ / doorbell |
+| CQ head | 更新 guest CQ head / INTx / 可用空间 | 物理 CQ head 由 agent 独立推进 |
+| 其他 BAR | 普通读通常为 0；非 doorbell 写进入 RPC | 部分 shadow 或拒绝，不是无条件真实 BAR 转发 |
 
-## 11. 失败和安全边界
+普通 guest BAR write response 表示本地处理/排队成功，不等待物理写完成。
+CSTS read 也不是每次同步往返，可能暂时返回旧值。对应 BAR RPC 回复才说明远端
+处理了控制请求；NVME_COMPLETE 才表示命令完成。因此不能将 guest BAR 延迟当成
+真实远端寄存器访问或端到端 I/O 延迟。
 
-当前实现提供：
+### 5.3 有序 RPC
 
-- MR范围检查；
-- guest PRP与segment范围检查；
-- namespace、LBA和长度检查；
-- session/generation/request ID检查；
-- QEMU request timeout；
-- CQ error和不匹配completion后fail backend；
-- memory mode不匹配时启动失败。
+TX FIFO 同时维护 SEND completion 与 BAR request/reply 状态；BAR 回复被消费并
+补充 receive WQE 之前，不放行后续控制消息。Host B 在同步发送回复前先 post receive，
+避免单 receive buffer 下连续 BAR SEND 使 iWARP 两端互等。
 
-当前尚未提供：
+QEMU 校验回复 request ID、opcode、offset、size、wstrb，维护 pending BAR 和
+timeout，成功回复后为排队请求更新超时预算。CC 失败恢复已确认状态并进入 failed。
+日志包括 POST、SEND_CQ、RECV_CQ、DONE、TIMEOUT。
 
-- RDMA连接认证或加密；
-- 自动重连；
-- 不确定WRITE状态的恢复协议；
-- Host B namespace自动卸载/独占；
-- 多session device arbitration；
-- peer-dmabuf失败后自动回退；
-- 远端设备reset的完整端到端状态机。
+## 6. NVMe 数据和完成路径
 
-实验环境必须自行保证：
+### 6.1 SQE / PRP
 
-- Host B namespace未挂载且无其他写入者；
-- Host B 82599 netdev是实验专用接口；
-- RDMA网络可信且隔离；
-- 不把rkey、payload或凭据写入公共日志；
-- FPGA重烧、XDMA卸载和QEMU运行不并发。
+QEMU 根据 SQ tail 稳定读取 Admin SQE，I/O SQE 双读比对；计算长度、解析 PRP、
+检查 guest DDR 范围、合并连续段，最多编码 64 segment。当前支持 PRP 而非 SGL；
+Identify Controller 返回 guest 前清零 `sgls`。
 
-## 12. 当前实现与未实现方案对照
+- PRP1 可以带页内偏移，首段长度受剩余页空间限制。
+- PRP2 直接指向第二个数据页时要求 controller-page 对齐。
+- PRP2 指向首张 PRP list 时要求 8 字节对齐，允许页内偏移。
+- list 中的数据页及后续 list 页地址要求 controller-page 对齐。
+- 首 list 位于页尾、只容纳一个链指针时也能解析；不跨页读取 list。
 
-| 功能 | 当前状态 |
+原故障中的 `PRP1=0x8297c000`、`PRP2=0x84ea3100`、131072 字节请求是合法
+small PRP list，不能因 PRP2 低 12 位非零拒绝。现在按首 list 到页尾的实际空间
+解析并加入复现用例。解析失败或不稳定 SQE 有 100 微秒间隔、100 毫秒上限的重试，
+提供 WAIT/READY/ERR 日志；重试不代替格式修正。
+
+每提交一条命令即推进 SQ cursor，避免重试重发。达到 inflight 上限或 CQ 空间不足时
+保留目标 tail 并延后恢复；CQ admission 计入未返回的 inflight completion，
+避免 guest 暂未消费 CQ 被误判为控制器故障。
+
+### 6.2 Host B 物理执行
+
+2 MiB DMA pool 布局：
+
+| 偏移 | 用途 | 预留大小 |
+| --- | --- | --- |
+| `0x00000` | Admin SQ | `0x10000` |
+| `0x10000` | Admin CQ | `0x04000` |
+| `0x14000` | I/O SQ | `0x10000` |
+| `0x24000` | I/O CQ | `0x04000` |
+| `0x28000` | 物理 PRP list | `0x01000` |
+| `0x40000` | payload | `0x1c0000`，1792 KiB |
+
+agent 暂存 NVME_SUBMIT；WRITE 先从 A staging RDMA READ。后续 SQ doorbell RPC
+将命令复制到物理 SQ，重建指向 B payload 的 PRP，通过屏障发布命令，再写物理 tail。
+物理 NVMe DMA B 内存，不访问 guest PA。
+
+Phase-1 限定 Admin QID 0、一组 I/O SQ/CQ（QID 1）、单物理 inflight、最大队列
+深度 1024、controller page size 4 KiB。Number of Queues 限制为一组；Create/Delete
+CQ/SQ 在物理控制器执行，成功后更新 agent 状态。AER 立即虚拟完成为 INVALID_OPCODE，
+避免占住唯一 inflight；metadata 不支持。不能描述为任意 Admin、多 namespace、
+多队列的完整透明 passthrough。
+
+### 6.3 Host-Staging
+
+```text
+WRITE:
+XiangShan DDR -> QEMU copy -> A staging MR
+  -> B initiated RDMA READ -> B DMA payload -> physical NVMe DMA read
+
+READ:
+physical NVMe DMA write -> B DMA payload
+  -> B initiated RDMA WRITE -> A staging MR -> QEMU copy -> XiangShan DDR
+```
+
+两端各有 staging。B 的同一 payload 同时用于物理 NVMe DMA 和 RNIC 传输，
+不再经过 Linux pread/pwrite；A 每个方向仍有一次 CPU payload copy。A MR 为 4 MiB，
+单次传输仍受 B payload 上限限制。
+
+### 6.4 完成顺序
+
+```text
+physical CQE phase visible
+  -> barrier -> read remaining CQE fields -> validate SQID/CID
+  -> READ payload RDMA WRITE completes (if applicable)
+  -> NVME_COMPLETE SEND
+  -> QEMU matches request ID / SQID / CID
+  -> copy READ data to guest / sanitize Identify
+  -> publish guest CQE -> advance tail/phase -> legacy INTx
+```
+
+先检查 phase 再读取其余字段，避免提前复制旧 CQE。物理失败 status 不伪装成成功，
+RDMA payload 回传失败转换为数据传输错误完成。QEMU 发布 CQE 前先完成数据发布。
+物理 CQ head 与 guest CQ head 分别推进。
+
+## 7. 可选 Peer-Dmabuf 和旧 Semantic 路径
+
+NVMe 两种 device mode 都有 peer-dmabuf 代码路径：XDMA 用 PCI P2PDMA 导出 BAR2
+coherent alias 的 dma-buf，QEMU 调用 `ibv_reg_dmabuf_mr()`。成功时 B 直接 RDMA
+香山 DDR 对应 MR，省去 A staging/copy；B payload 仍存在，物理 NVMe 仍只 DMA B
+内存。
+
+这需要 `/dev/xdmaN_peer`、正确 BAR/guest IOVA 范围、P2PDMA 拓扑及 RNIC provider
+支持。普通 BAR mmap 不能代替 DMA-BUF 注册，失败不会自动 fallback。
+当前实测 host-staging 不能作为 peer-dmabuf 已通过的证据。
+
+旧 NVMe semantic 模式继续使用 `scope-remote-agent`：内核 nvme 驱动管理物理设备，
+允许的 Admin 用 ioctl，READ/WRITE 用 pread/pwrite(O_DIRECT)，FLUSH 用 fsync；
+guest queue 创建由模型处理，不创建 raw shadow SQ/CQ，BAR 主要由 QEMU 合成。
+
+## 8. 82599 两种路径
+
+QEMU 维护 guest 82599 BAR0、单 TX/RX queue、descriptor 和 legacy INTx。
+本轮 NVMe BAR 代理没有为 82599 增加透明 BAR 转发；guest ring 地址不能直接写到
+真实 NIC。MAC/link 和完成按所选 agent 返回。
+
+| 路径 | packet | shadow-ring |
+| --- | --- | --- |
+| A payload MR | host-staging 会分配，但 frame 走控制消息 | inline 不分配独立 payload MR |
+| TX | 拼帧 -> RDMA SEND -> AF_PACKET sendto | 拼帧 -> RDMA SEND -> B DMA buffer -> 物理 TX descriptor |
+| TX_COMPLETE | sendto 接受完整帧，不保证物理发送完成 | 物理 TX descriptor DD 后返回 |
+| RX | AF_PACKET recvfrom -> RDMA SEND -> guest buffer/descriptor | 物理 RX buffer -> RDMA SEND -> guest buffer/descriptor |
+| B payload | socket / SEND/RECV buffers | 真实 ring 和 DMA buffer pool |
+| 目标驱动 | ixgbe | 无功能驱动，由 agent 管理 |
+
+inline 是帧内嵌 SEND/RECV 消息，不是零拷贝，也不是 one-sided RDMA guest packet
+buffer。两种路径均非所有 BAR 原样转发；guest/physical ring 与中断分别管理。
+frame 上限 2048 字节，通常 MTU 1500，单 TX/RX queue，不提供完整 TSO/RSS/MSI-X。
+
+详见 [82599 Shadow-Ring 架构](RDMA_82599_SHADOW_RING_ARCHITECTURE.md)。
+
+## 9. 协议与安全边界
+
+librdmacm/libibverbs 建立 RC QP，检查实际 verbs device，HELLO 后 DEVICE_OPEN，
+再进入 polling。wire 字段 little-endian，版本 `major=1, minor=2`，消息最大
+4096 字节，NVMe 最多 64 segment；两份 `scope_remote_proto.h` 必须完全一致。
+
+新增 feature bits 为 NVME_SHADOW_QUEUE、NVME_BAR_PROXY，与 STAGING 或
+ZERO_COPY/PEER_MR 组合协商。inline NIC 单独协商，不要求无用的 payload MR。
+
+raw NVMe agent 处理 HELLO、DEVICE_OPEN、NVME_SUBMIT、BAR_READ/WRITE、RESET、
+KEEPALIVE、CLOSE。NVME_ENABLE/DISABLE 虽有 opcode 定义，但启停路径实际使用 CC
+BAR RPC。不同 agent 不一定实现同样的 opcode。
+
+保护包括 session/generation/request ID、消息长度、MR 和 guest PRP 范围、
+segment 总长度、pending 请求及回复检查。不能把 semantic agent 的 LBA/opcode
+校验全部归于 raw agent。
+
+限制与风险：
+
+- 协议无应用层认证/加密，限定可信隔离实验网络。
+- raw 模式依赖显式允许的 identity-DMA；没有 VFIO/IOMMU DMA 隔离，不适合不可信 guest。
+- pagemap 物理地址不能在任意 IOMMU 配置下直接用作设备 DMA 地址。
+- 解绑前确认盘未挂载、无 swap/LVM/其他使用者；未知数据盘禁止破坏性测试。
+- 物理 CAP/Identify 能力未全部收敛为完整代理能力模型，枚举成功不等于支持所有命令。
+- 未实现自动重连、不确定 WRITE 恢复、多 session 仲裁及透明 failed-state 恢复。
+
+## 10. 生命周期
+
+按 agent -> QEMU -> 香山顺序启动。agent 只服务一个连接，退出后需要重启。
+功能驱动所有权按第 2 节区分，不能让内核与 raw agent 同时管理目标 function。
+
+CC.EN 从 1 变 0 时 agent 发起物理关闭，立即停用软件 pending/queue，但不立即清空
+可能仍被 DMA 使用的队列。下一次 start 确认 RDY=0 后才重建队列。enable 后不在 BAR
+handler 内等待新 RDY=1，由 guest CSTS polling 观察。
+
+PRP 失败、RPC 超时、CQ 错误或错误回复可使 QEMU backend failed，并暴露 CSTS.CFS。
+此时按 runbook 停止两端并恢复，不声称支持透明在线恢复。FPGA 重烧/XDMA 重载前
+也必须先停止 I/O 和 QEMU，避免失效 BAR/MR 映射。
+
+## 11. 代码与验证入口
+
+| 文件 | 职责 |
 | --- | --- |
-| `nvme + remote-rdma + host-staging` | 已实现，当前JSON使用 |
-| `nvme + remote-rdma + peer-dmabuf` | 代码已实现，运行依赖P2PDMA拓扑和RNIC provider |
-| Host A与Host B各一个NVMe staging | 当前host-staging模式成立 |
-| 去掉Host A staging | 仅peer-dmabuf成功时成立 |
-| 去掉Host B NVMe staging | 未实现 |
-| Host A发起RDMA WRITE推送NVMe WRITE payload | 未实现；当前由Host B发起RDMA READ |
-| Host B raw physical SQ/CQ engine | 未实现 |
-| `scope_remote_dma.ko`固定DMA pool | 未实现且当前不需要 |
-| 远端物理NVMe BAR映射/转发 | 未实现，当前使用QEMU虚拟BAR |
-| `ixgbe + remote-rdma`完整帧模式 | 已实现，当前JSON使用 |
-| NIC直接RDMA guest packet buffer | 未实现 |
-| NIC Host B staging pool | 未实现；当前使用RDMA消息buffer和AF_PACKET |
-| 真实82599 BAR透传 | 未实现 |
-| MSI/MSI-X、多队列、RSS、TSO | 未实现 |
-| `igb + remote-rdma` | 未实现 |
+| `qemu-mount/hw/misc/scope_fpga_vswitch.c` | 配置、guest memory、PRP、目标 SQ tail、CQ admission、BAR pending、completion/INTx |
+| `qemu-mount/hw/misc/scope_fpga_vswitch_nvme_backend.c` | BAR packet/RPC 桥接，区分 SQ/CQ doorbell |
+| `qemu-mount/hw/misc/scope_fpga_vswitch_rdma.c` | RC/MR、feature 协商、FIFO、有序 BAR RPC、CQ polling |
+| `qemu-mount/hw/misc/scope_fpga_vswitch_ixgbe_backend.c` | guest NIC 模型及 frame 收发 |
+| `qemu-mount/include/hw/misc/scope_remote_proto.h` | QEMU wire ABI |
+| `tools/scope_remote_agent/scope_remote_proto.h` | agent wire ABI |
+| `tools/scope_remote_agent/scope_remote_nvme_shadow_agent.c` | raw P4510、SQ/CQ、DMA pool、物理 PRP、RDMA completion |
+| `tools/scope_remote_agent/scope_remote_agent.c` | 兼容 semantic NVMe agent |
+| `tools/scope_remote_agent/scope_remote_nic_agent.c` | AF_PACKET NIC agent |
+| `tools/scope_remote_agent/scope_remote_ixgbe_shadow_agent.c` | raw 82599 shadow ring agent |
+| `shell/software/xdma_drv/XDMA/linux-kernel/xdma/cdev_peer.c` | 可选 P2PDMA dma-buf exporter |
 
-## 13. 代码位置
+在 NexST 根目录执行：
 
-| 位置 | 当前职责 |
-| --- | --- |
-| `qemu-mount/hw/misc/scope_fpga_vswitch.c` | JSON解析、guest内存访问、NVMe虚拟BAR/队列、PRP验证、completion/INTx |
-| `qemu-mount/hw/misc/scope_fpga_vswitch_rdma.c` | RC连接、control MR、Host A payload MR、消息发送队列和CQ polling |
-| `qemu-mount/hw/misc/scope_fpga_vswitch_ixgbe_backend.c` | 虚拟82599寄存器、单队列TX/RX、descriptor与INTx |
-| `qemu-mount/include/hw/misc/scope_remote_proto.h` | QEMU侧wire ABI |
-| `tools/scope_remote_agent/scope_remote_agent.c` | Host B NVMe agent、staging、one-sided RDMA、ioctl/pread/pwrite |
-| `tools/scope_remote_agent/scope_remote_nic_agent.c` | Host B 82599 AF_PACKET agent |
-| `tools/scope_remote_agent/scope_remote_proto.h` | agent侧wire ABI |
-| `shell/software/xdma_drv/XDMA/linux-kernel/xdma/cdev_peer.c` | BAR2 P2PDMA dma-buf exporter |
-| `tools/scope_remote_agent/scope_peer_mr_probe.c` | XDMA peer dma-buf MR注册探测 |
-| `tools/scope_remote_agent/setup_remote_82599_rdma.sh` | 远端82599检查、部署、启动与配置生成 |
-
-## 14. 验证建议
-
-### 14.1 NVMe
-
-分层确认：
-
-1. RDMA route和RC连接正常；
-2. `DEVICE_OPEN`返回的namespace容量/LBA格式正确；
-3. 香山`lspci`和NVMe probe完成；
-4. 小范围只读I/O正确；
-5. 在确认测试namespace无有效数据后再做破坏性WRITE测试；
-6. 对比QEMU日志中的`NVME SUBMIT/COMPLETE`和Host B agent状态；
-7. 使用`fio`或校验程序测真实端到端I/O，而不是用BAR microbenchmark替代。
-
-`host-staging`实验必须在结果中注明每个I/O方向都包含一次Host A侧CPU payload
-copy：WRITE时guest DDR复制到A staging，READ时A staging复制回guest DDR。
-
-### 14.2 82599
-
-分层确认：
-
-1. Host B RDMA netdev和82599 netdev角色没有混用；
-2. 真实82599 carrier状态符合实验要求；
-3. 香山`ixgbe`完成probe并看到预期MAC；
-4. QEMU出现`TX_SUBMIT`，Host B `sendto()`成功并返回`TX_COMPLETE`；
-5. 接上线缆和对端后验证真实TX/RX；当前实现不能在carrier down时强制guest
-   虚拟link-up。
-
-## 15. 最终数据路径摘要
-
-```text
-当前远端NVMe WRITE：
-XiangShan DDR -> QEMU copy -> A staging -> RDMA READ
-                -> B staging -> pwrite(O_DIRECT) -> NVMe
-
-当前远端NVMe READ：
-NVMe -> pread(O_DIRECT) -> B staging -> RDMA WRITE
-     -> A staging -> QEMU copy -> XiangShan DDR
-
-可选NVMe peer-dmabuf WRITE：
-XiangShan DDR -> RDMA READ -> B staging -> pwrite(O_DIRECT) -> NVMe
-
-可选NVMe peer-dmabuf READ：
-NVMe -> pread(O_DIRECT) -> B staging -> RDMA WRITE -> XiangShan DDR
-
-当前远端82599 TX：
-XiangShan DDR -> QEMU tx_frame -> RDMA SEND buffer
-                -> Host B RECV buffer -> AF_PACKET sendto -> 82599
-
-当前远端82599 RX：
-82599 -> AF_PACKET recvfrom -> Host B SEND buffer -> RDMA SEND
-      -> QEMU RECV buffer -> XiangShan DDR
+```sh
+cmp tools/scope_remote_agent/scope_remote_proto.h \
+    qemu-mount/include/hw/misc/scope_remote_proto.h
+bash qemu-mount/tests/unit/run-scope-remote-nvme.sh
+bash tools/scope_remote_agent/tests/run-nvme-completion.sh
+make -C tools/scope_remote_agent scope-remote-nvme-shadow-agent
+ninja -C qemu-mount/build-rdma-repo17-review qemu-system-x86_64
 ```
 
-最重要的边界是：当前系统实现的是设备语义中介，不是远端PCIe BAR/DMA透明映射。
-远端NVMe的真实完成由Host B实际I/O完成后返回；远端82599的TX完成表示Host B
-`AF_PACKET sendto()`接受帧。两者的虚拟BAR访问都不能解释成Host B真实外设BAR
-访问延迟。
+测试直接编译生产函数，默认 ASan/UBSan，模拟 guest memory 和 DMA/RDMA，不替代实际
+FPGA coherence、网络、INTx 或存储介质测试。临时恢复旧 PRP 页对齐条件会使原日志
+用例失败，恢复旧 CQE 预读取顺序会使 DMA 可见性用例失败。
+
+实机按 runbook 验证枚举、Identify、队列初始化、小范围 READ，再重复原始只读
+`dd if=/dev/nvme0n1 of=/dev/null bs=1M count=256 iflag=direct`。数据正确性需对同一
+未变更 LBA 比较哈希；性能另记 fio 配置、块大小、队列深度、CPU 占用、staging 模式和
+实际带宽。局部 BAR 响应、单个 SEND 完成或单次 READ 成功不能代替完整性能/可靠性结论。

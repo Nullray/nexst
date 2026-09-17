@@ -1,3 +1,5 @@
 /scope-peer-mr-probe
 /scope-remote-agent
 /scope-remote-nic-agent
+/scope-remote-ixgbe-shadow-agent
+/scope-remote-nvme-shadow-agent
