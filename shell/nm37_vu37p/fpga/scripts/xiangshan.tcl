@@ -298,7 +298,7 @@ proc create_root_design { parentCell } {
         incr i
   }
 
-  # Create instance: AXI interconnect for PCIe RP DMA 
+  # Create instance: AXI interconnect for PCIe RP DMA
   set axi_ic_pcie_rp_dma [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_ic_pcie_rp_dma ]
   set_property -dict [ list \
     CONFIG.NUM_MI {1} \
@@ -778,48 +778,6 @@ proc create_root_design { parentCell } {
 # ILA
 #=============================================
 
-  # FPGA XDMA EP bypass BAR 到 DDR 的 AXI-MM P2P 访问。
-  set system_ila_4 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_4 ]
-  set_property -dict [ list \
-    CONFIG.C_NUM_MONITOR_SLOTS {1} \
-    CONFIG.C_DATA_DEPTH {4096}
-   ] $system_ila_4
-
-  connect_bd_net [get_bd_pins xdma_ep/axi_aclk] [get_bd_pins system_ila_4/clk]
-  connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] [get_bd_pins system_ila_4/resetn]
-  # SLOT_0_AXI: x86/QEMU/真实 NVMe 通过 XDMA EP bypass BAR 访问 DDR。
-  connect_bd_intf_net [get_bd_intf_pins system_ila_4/SLOT_0_AXI] [get_bd_intf_pins xdma_ep/M_AXI_BYPASS]
-
-  # Role DDR/MMIO visibility.  All slots use xdma_ep/axi_aclk so the
-  # mem path and role IO path can be compared in the same capture.
-  set system_ila_6 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_6 ]
-  set_property -dict [ list \
-    CONFIG.C_NUM_MONITOR_SLOTS {3} \
-    CONFIG.C_DATA_DEPTH {2048}
-   ] $system_ila_6
-
-  connect_bd_net [get_bd_pins xdma_ep/axi_aclk] [get_bd_pins system_ila_6/clk]
-  connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] [get_bd_pins system_ila_6/resetn]
-  # SLOT_0_AXI: role transaction before axi_ic_ddr_mem_reg_slice_S01.
-  connect_bd_intf_net [get_bd_intf_pins system_ila_6/SLOT_0_AXI] [get_bd_intf_pins axi_ic_ddr_mem_reg_slice_S01/S_AXI]
-  # SLOT_1_AXI: transaction released by axi_ic_ddr_mem_reg_slice_S01.
-  connect_bd_intf_net [get_bd_intf_pins system_ila_6/SLOT_1_AXI] [get_bd_intf_pins axi_ic_ddr_mem_reg_slice_S01/M_AXI]
-  # SLOT_2_AXI: role MMIO/IO master before axi_ic_role_io_reg_slice_S00.
-  connect_bd_intf_net [get_bd_intf_pins system_ila_6/SLOT_2_AXI] [get_bd_intf_pins axi_ic_role_io_reg_slice_S00/S_AXI]
-
-  # Final virtual PCIe proxy C2H packet stream visibility.
-  set system_ila_5 [ create_bd_cell -type ip -vlnv xilinx.com:ip:system_ila:1.1 system_ila_5 ]
-  set_property -dict [ list \
-    CONFIG.C_NUM_MONITOR_SLOTS {1} \
-    CONFIG.C_MON_TYPE {INTERFACE} \
-    CONFIG.C_SLOT_0_INTF_TYPE {xilinx.com:interface:axis_rtl:1.0} \
-    CONFIG.C_DATA_DEPTH {2048}
-   ] $system_ila_5
-
-  connect_bd_net [get_bd_pins xdma_ep/axi_aclk] [get_bd_pins system_ila_5/clk]
-  connect_bd_net [get_bd_pins xdma_ep/axi_aresetn] [get_bd_pins system_ila_5/resetn]
-  connect_bd_intf_net [get_bd_intf_pins system_ila_5/SLOT_0_AXIS] [get_bd_intf_pins axis_rs_proxy_c2h_out/M_AXIS]
-
 
 
 #=============================================
@@ -857,7 +815,7 @@ proc create_root_design { parentCell } {
 
   ## Role address space
   create_bd_addr_seg -range 0x10000 -offset 0x10000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs bootrom_bram_ctrl/S_AXI/Mem0] ROLE_BOOTROM
-  create_bd_addr_seg -range 0x01000000 -offset 0x50000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs virtual_pcie_switch_proxy_0/s_mmio_axi/reg0] VPCIE_MMIO_WINDOW
+  create_bd_addr_seg -range 0x10000000 -offset 0x50000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs virtual_pcie_switch_proxy_0/s_mmio_axi/reg0] VPCIE_MMIO_WINDOW
   create_bd_addr_seg -range 0x01000000 -offset 0x60000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs virtual_pcie_switch_proxy_0/s_ecam_axi/reg0] VPCIE_ECAM_WINDOW
 
   create_bd_addr_seg -range 0x10000 -offset 0x30000000 [get_bd_addr_spaces u_role/m_axi_io] [get_bd_addr_segs role_uart/S_AXI/Reg] ROLE_UART

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "devices": [
+    {
+      "type": "nvme",
+      "real-host-bdf": "0000:e1:00.0"
+    }
+  ]
+}

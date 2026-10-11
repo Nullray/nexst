@@ -3,7 +3,7 @@
 module virtual_pcie_switch_proxy #(
     parameter ECAM_BASE = 32'h6000_0000,
     parameter MMIO_BASE = 32'h5000_0000,
-    parameter MMIO_SIZE = 32'h0100_0000
+    parameter MMIO_SIZE = 32'h1000_0000
 ) (
     input  wire         clk,
     input  wire         rst,
@@ -118,6 +118,8 @@ localparam PKT_BAR_READ  = 32'd3;
 localparam PKT_BAR_WRITE_DONE = 32'd4;
 localparam PKT_LEN = 32'd32;
 localparam MAX_BACKENDS = 13;
+localparam MAX_BARS_PER_BACKEND = 2;
+localparam MAX_ROUTES = MAX_BACKENDS * MAX_BARS_PER_BACKEND;
 localparam BDF_ROOT_PORT = 16'h0000;
 localparam BDF_SW_UP     = 16'h0100;
 localparam BAR_TAG_CFG   = 3'd7;
@@ -139,19 +141,25 @@ localparam ECAM_R_WAIT_R  = 2'd2;
 localparam ECAM_W_IDLE    = 1'd0;
 localparam ECAM_W_WAIT_ACK = 1'd1;
 
-localparam MMIO_IDLE = 2'd0;
-localparam MMIO_WAIT_WR = 2'd1;
-localparam MMIO_WAIT_RD = 2'd2;
-localparam MMIO_DONE_PKT = 2'd3;
+localparam MMIO_IDLE = 4'd0;
+localparam MMIO_WAIT_WR = 4'd1;
+localparam MMIO_WAIT_RD = 4'd2;
+localparam MMIO_DONE_PKT = 4'd3;
+localparam MMIO_SNAPSHOT = 4'd4;
+localparam MMIO_COMPARE = 4'd5;
+localparam MMIO_REDUCE = 4'd6;
+localparam MMIO_SELECT = 4'd7;
+localparam MMIO_DISPATCH = 4'd8;
 
 reg [31:0] seq_counter;
 
 reg [31:0] mbx_ack;
-reg [31:0] route_bar_lo [0:MAX_BACKENDS-1];
-reg [31:0] route_bar_hi [0:MAX_BACKENDS-1];
-reg [31:0] route_bar_size [0:MAX_BACKENDS-1];
-reg [15:0] route_bdf [0:MAX_BACKENDS-1];
-reg [31:0] route_ctrl [0:MAX_BACKENDS-1];
+reg [31:0] route_bar_lo [0:MAX_ROUTES-1];
+reg [31:0] route_bar_hi [0:MAX_ROUTES-1];
+reg [31:0] route_bar_size [0:MAX_ROUTES-1];
+reg [15:0] route_bdf [0:MAX_ROUTES-1];
+reg [31:0] route_ctrl [0:MAX_ROUTES-1];
+reg [2:0]  route_bar_index [0:MAX_ROUTES-1];
 reg [31:0] proxy_ctrl;
 reg [31:0] mbx_bar_resp_data_lo, mbx_bar_resp_data_hi;
 reg [31:0] mbx_bar_resp_seq, mbx_bar_resp_ctrl;
@@ -178,7 +186,7 @@ reg        ecam_w_pending;
 reg [31:0] ecam_wdata_hold;
 reg [3:0]  ecam_wstrb_hold;
 
-reg [1:0]  mmio_state;
+reg [3:0]  mmio_state;
 reg [31:0] mmio_active_seq;
 reg [31:0] mmio_active_flags;
 reg [31:0] mmio_active_off;
@@ -200,6 +208,45 @@ reg [31:0] bar_done_seq;
 reg [31:0] bar_done_off;
 integer reset_i;
 
+// A request owns this snapshot until dispatch. Payload registers need no reset:
+// they are overwritten before use; mmio_state is the validity token.
+reg lookup_write;
+reg [63:0] lookup_addr;
+reg [7:0] lookup_len;
+reg [2:0] lookup_size;
+reg [63:0] lookup_base [0:MAX_ROUTES-1];
+reg [63:0] lookup_limit [0:MAX_ROUTES-1];
+reg [MAX_ROUTES-1:0] lookup_enabled;
+reg [15:0] lookup_bdf [0:MAX_ROUTES-1];
+reg [2:0] lookup_bar [0:MAX_ROUTES-1];
+reg [31:0] lookup_hits;
+reg [1:0] lookup_count;
+reg [4:0] lookup_index;
+reg [15:0] lookup_selected_bdf;
+reg [2:0] lookup_selected_bar;
+reg [31:0] lookup_offset;
+integer lookup_i;
+
+// Balanced, saturating reduction: 26 entries padded to 32, five levels.
+// Do not reintroduce a loop-carried priority/count chain here.
+wire [1:0] hit_count_tree [1:63];
+wire [4:0] hit_index_tree [1:63];
+genvar hit_node;
+generate
+    for (hit_node = 0; hit_node < 32; hit_node = hit_node + 1) begin: hit_leaf
+        assign hit_count_tree[32+hit_node] = {1'b0, lookup_hits[hit_node]};
+        assign hit_index_tree[32+hit_node] = hit_node;
+    end
+    for (hit_node = 1; hit_node < 32; hit_node = hit_node + 1) begin: hit_branch
+        wire [2:0] total;
+        assign total = {1'b0, hit_count_tree[2*hit_node]} +
+                       {1'b0, hit_count_tree[2*hit_node+1]};
+        assign hit_count_tree[hit_node] = (total >= 3) ? 2'd3 : total[1:0];
+        assign hit_index_tree[hit_node] = (hit_count_tree[2*hit_node] != 0) ?
+            hit_index_tree[2*hit_node] : hit_index_tree[2*hit_node+1];
+    end
+endgenerate
+
 assign interrupt_out = intx_level;
 
 assign m_ecam_shadow_axi_awaddr = 32'd0;
@@ -211,40 +258,28 @@ assign m_ecam_shadow_axi_wvalid = 1'b0;
 assign m_ecam_shadow_axi_bready = 1'b1;
 
 assign s_ecam_axi_awready = !rst && (ecam_w_state == ECAM_W_IDLE) &&
-                            !s_ecam_axi_bvalid && !ecam_aw_pending &&
-                            (ecam_r_state == ECAM_R_IDLE) &&
-                            !s_ecam_axi_rvalid &&
-                            !m_ecam_shadow_axi_arvalid &&
-                            !m_ecam_shadow_axi_rready;
+                            !s_ecam_axi_bvalid && !ecam_aw_pending;
 assign s_ecam_axi_wready  = !rst && (ecam_w_state == ECAM_W_IDLE) &&
-                            !s_ecam_axi_bvalid && !ecam_w_pending &&
-                            (ecam_r_state == ECAM_R_IDLE) &&
-                            !s_ecam_axi_rvalid &&
-                            !m_ecam_shadow_axi_arvalid &&
-                            !m_ecam_shadow_axi_rready;
-/* Give writes priority so BAR readback cannot race QEMU's shadow update. */
+                            !s_ecam_axi_bvalid && !ecam_w_pending;
 assign s_ecam_axi_arready = !rst && (ecam_r_state == ECAM_R_IDLE) &&
                             !s_ecam_axi_rvalid && !m_ecam_shadow_axi_arvalid &&
-                            !m_ecam_shadow_axi_rready &&
-                            (ecam_w_state == ECAM_W_IDLE) &&
-                            !s_ecam_axi_bvalid &&
-                            !ecam_aw_pending && !ecam_w_pending &&
-                            !s_ecam_axi_awvalid && !s_ecam_axi_wvalid;
+                            !m_ecam_shadow_axi_rready;
 
 assign s_mbx_axi_awready = !rst && !s_mbx_axi_bvalid && !mbx_aw_pending;
 assign s_mbx_axi_wready  = !rst && !s_mbx_axi_bvalid && !mbx_w_pending;
 assign s_mbx_axi_arready = !rst && !s_mbx_axi_rvalid;
 
 assign s_mmio_axi_awready = !rst && (mmio_state == MMIO_IDLE) &&
-                            !s_mmio_axi_bvalid && !m_axis_c2h_tvalid &&
+                            !s_mmio_axi_bvalid && !s_mmio_axi_rvalid && !m_axis_c2h_tvalid &&
                             !mmio_aw_pending;
 assign s_mmio_axi_wready  = !rst && (mmio_state == MMIO_IDLE) &&
                             !s_mmio_axi_bvalid && !m_axis_c2h_tvalid &&
                             !mmio_w_pending;
 assign s_mmio_axi_arready = !rst && (mmio_state == MMIO_IDLE) &&
-                            !s_mmio_axi_rvalid && !m_axis_c2h_tvalid &&
+                            !s_mmio_axi_rvalid && !s_mmio_axi_bvalid && !m_axis_c2h_tvalid &&
                             !mmio_aw_pending && !mmio_w_pending &&
-                            !bar_done_pending;
+                            !bar_done_pending && !s_mmio_axi_awvalid && !s_mmio_axi_wvalid &&
+                            !(ecam_aw_pending && ecam_w_pending);
 
 function [31:0] apply_wstrb32;
     input [31:0] oldv;
@@ -354,13 +389,14 @@ function [31:0] mbx_read32;
     begin
         roff = addr[11:0];
         ridx = (roff - 12'h100) >> 5;
-        if ((roff >= 12'h100) && (roff < 12'h2a0) && (ridx < MAX_BACKENDS)) begin
+        if ((roff >= 12'h100) && (roff < 12'h440) && (ridx < MAX_ROUTES)) begin
             case (roff[4:0])
             5'h00: mbx_read32 = route_bar_lo[ridx];
             5'h04: mbx_read32 = route_bar_hi[ridx];
             5'h08: mbx_read32 = route_bar_size[ridx];
             5'h0c: mbx_read32 = {16'd0, route_bdf[ridx]};
             5'h10: mbx_read32 = route_ctrl[ridx];
+            5'h14: mbx_read32 = {29'd0, route_bar_index[ridx]};
             default: mbx_read32 = 32'd0;
             endcase
         end else case (roff)
@@ -384,7 +420,7 @@ endfunction
 
 function route_hit;
     input [63:0] addr;
-    input [3:0] idx;
+    input [4:0] idx;
     reg [63:0] bar_base;
     reg [63:0] bar_limit;
     begin
@@ -393,7 +429,6 @@ function route_hit;
         route_hit = proxy_ctrl[PROXY_CTRL_BAR_ROUTE_READY] &&
                        route_ctrl[idx][ROUTE_CTRL_VALID_BIT] &&
                        route_ctrl[idx][ROUTE_CTRL_MEM_ENABLE_BIT] &&
-                       (route_ctrl[idx][ROUTE_CTRL_BACKEND_LSB +: 4] == idx) &&
                        (route_bar_size[idx] != 32'd0) &&
                        (bar_limit > bar_base) &&
                        (addr >= bar_base) &&
@@ -401,16 +436,16 @@ function route_hit;
     end
 endfunction
 
-function [3:0] route_first_index;
+function [4:0] route_first_index;
     input [63:0] addr;
     integer i;
     reg found;
     begin
-        route_first_index = 4'd0;
+        route_first_index = 5'd0;
         found = 1'b0;
-        for (i = 0; i < MAX_BACKENDS; i = i + 1) begin
-            if (!found && route_hit(addr, i[3:0])) begin
-                route_first_index = i[3:0];
+        for (i = 0; i < MAX_ROUTES; i = i + 1) begin
+            if (!found && route_hit(addr, i[4:0])) begin
+                route_first_index = i[4:0];
                 found = 1'b1;
             end
         end
@@ -422,8 +457,8 @@ function [1:0] route_hit_count;
     integer i;
     begin
         route_hit_count = 2'd0;
-        for (i = 0; i < MAX_BACKENDS; i = i + 1)
-            if (route_hit(addr, i[3:0]) && route_hit_count != 2'd3)
+        for (i = 0; i < MAX_ROUTES; i = i + 1)
+            if (route_hit(addr, i[4:0]) && route_hit_count != 2'd3)
                 route_hit_count = route_hit_count + 1'b1;
     end
 endfunction
@@ -456,7 +491,7 @@ endfunction
 
 function [31:0] bar_offset32;
     input [63:0] addr;
-    input [3:0] idx;
+    input [4:0] idx;
     reg [63:0] bar_base;
     begin
         bar_base = {route_bar_hi[idx], route_bar_lo[idx]};
@@ -483,12 +518,13 @@ always @(posedge clk) begin
     if (rst) begin
         seq_counter <= 32'd0;
         mbx_ack <= 32'd0;
-        for (reset_i = 0; reset_i < MAX_BACKENDS; reset_i = reset_i + 1) begin
+        for (reset_i = 0; reset_i < MAX_ROUTES; reset_i = reset_i + 1) begin
             route_bar_lo[reset_i] <= 32'd0;
             route_bar_hi[reset_i] <= 32'd0;
             route_bar_size[reset_i] <= 32'd0;
             route_bdf[reset_i] <= 16'd0;
             route_ctrl[reset_i] <= 32'd0;
+            route_bar_index[reset_i] <= 3'd0;
         end
         proxy_ctrl <= 32'd0;
         mbx_bar_resp_data_lo <= 32'd0;
@@ -644,7 +680,8 @@ always @(posedge clk) begin
                 ecam_wdata_hold <= s_ecam_axi_wdata;
                 ecam_wstrb_hold <= s_ecam_axi_wstrb;
             end
-            if (ecam_aw_pending && ecam_w_pending && !m_axis_c2h_tvalid && !bar_done_pending) begin
+            if (ecam_aw_pending && ecam_w_pending && !m_axis_c2h_tvalid && !bar_done_pending &&
+                mmio_state < MMIO_SNAPSHOT) begin
                 ecam_aw_pending <= 1'b0;
                 ecam_w_pending <= 1'b0;
                 if (ecam_bdf_supported(ecam_bdf(ecam_awaddr_hold))) begin
@@ -686,7 +723,7 @@ always @(posedge clk) begin
             mbx_aw_pending <= 1'b0;
             mbx_w_pending <= 1'b0;
             if ((mbx_awaddr_hold[11:0] >= 12'h100) &&
-                (mbx_awaddr_hold[11:0] < 12'h2a0)) begin
+                (mbx_awaddr_hold[11:0] < 12'h440)) begin
                 case (mbx_awaddr_hold[4:0])
                 5'h00: route_bar_lo[(mbx_awaddr_hold[11:5] - 7'h08)] <=
                     apply_wstrb32(route_bar_lo[(mbx_awaddr_hold[11:5] - 7'h08)],
@@ -704,6 +741,8 @@ always @(posedge clk) begin
                     apply_wstrb32(route_ctrl[(mbx_awaddr_hold[11:5] - 7'h08)],
                                   mbx_wdata_hold, mbx_wstrb_hold) &
                     ROUTE_CTRL_VALID_MASK;
+                5'h14: route_bar_index[(mbx_awaddr_hold[11:5] - 7'h08)] <=
+                    mbx_wstrb_hold[0] ? mbx_wdata_hold[2:0] : route_bar_index[(mbx_awaddr_hold[11:5] - 7'h08)];
                 default: begin end
                 endcase
             end else case (mbx_awaddr_hold[11:0])
@@ -753,10 +792,61 @@ always @(posedge clk) begin
             mmio_wlast_hold <= s_mmio_axi_wlast;
         end
         if (mmio_state == MMIO_IDLE && mmio_aw_pending && mmio_w_pending &&
-            !s_mmio_axi_bvalid && !m_axis_c2h_tvalid && !bar_done_pending) begin
+            !s_mmio_axi_bvalid && !s_mmio_axi_rvalid && !m_axis_c2h_tvalid &&
+            !bar_done_pending && !(ecam_aw_pending && ecam_w_pending)) begin
             mmio_aw_pending <= 1'b0;
             mmio_w_pending <= 1'b0;
-            if ((route_hit_count(mmio_awaddr_hold) == 2'd1) &&
+            lookup_write <= 1'b1;
+            lookup_addr <= mmio_awaddr_hold;
+            lookup_len <= mmio_awlen_hold;
+            lookup_size <= mmio_awsize_hold;
+            mmio_state <= MMIO_SNAPSHOT;
+        end
+        if (s_mmio_axi_arvalid && s_mmio_axi_arready) begin
+            lookup_write <= 1'b0;
+            lookup_addr <= s_mmio_axi_araddr;
+            lookup_len <= s_mmio_axi_arlen;
+            lookup_size <= s_mmio_axi_arsize;
+            mmio_state <= MMIO_SNAPSHOT;
+        end
+        if (mmio_state == MMIO_SNAPSHOT) begin
+            for (lookup_i = 0; lookup_i < MAX_ROUTES; lookup_i = lookup_i + 1) begin
+                lookup_base[lookup_i] <= {route_bar_hi[lookup_i], route_bar_lo[lookup_i]};
+                lookup_limit[lookup_i] <= {route_bar_hi[lookup_i], route_bar_lo[lookup_i]} +
+                                         {32'd0, route_bar_size[lookup_i]};
+                lookup_enabled[lookup_i] <= proxy_ctrl[PROXY_CTRL_BAR_ROUTE_READY] &&
+                    route_ctrl[lookup_i][ROUTE_CTRL_VALID_BIT] &&
+                    route_ctrl[lookup_i][ROUTE_CTRL_MEM_ENABLE_BIT] &&
+                    (route_bar_size[lookup_i] != 0);
+                lookup_bdf[lookup_i] <= route_bdf[lookup_i];
+                lookup_bar[lookup_i] <= route_bar_index[lookup_i];
+            end
+            mmio_state <= MMIO_COMPARE;
+        end
+        if (mmio_state == MMIO_COMPARE) begin
+            lookup_hits <= 32'd0;
+            for (lookup_i = 0; lookup_i < MAX_ROUTES; lookup_i = lookup_i + 1)
+                lookup_hits[lookup_i] <= lookup_enabled[lookup_i] &&
+                    (lookup_limit[lookup_i] > lookup_base[lookup_i]) &&
+                    (lookup_addr >= lookup_base[lookup_i]) &&
+                    (lookup_addr < lookup_limit[lookup_i]);
+            mmio_state <= MMIO_REDUCE;
+        end
+        if (mmio_state == MMIO_REDUCE) begin
+            lookup_count <= hit_count_tree[1];
+            // A zero-hit tree selects padding leaf 31; never index the table with it.
+            lookup_index <= (hit_count_tree[1] == 0) ? 5'd0 : hit_index_tree[1];
+            mmio_state <= MMIO_SELECT;
+        end
+        if (mmio_state == MMIO_SELECT) begin
+            lookup_selected_bdf <= lookup_bdf[lookup_index];
+            lookup_selected_bar <= lookup_bar[lookup_index];
+            lookup_offset <= lookup_addr[31:0] - lookup_base[lookup_index][31:0];
+            mmio_state <= MMIO_DISPATCH;
+        end
+        if (mmio_state == MMIO_DISPATCH && !m_axis_c2h_tvalid && !bar_done_pending) begin
+          if (lookup_write) begin
+            if ((lookup_count == 2'd1) &&
                 (mmio_awlen_hold == 8'd0) &&
                 mmio_wlast_hold &&
                 (axsize_to_pkt_size(mmio_awsize_hold) != 4'd0)) begin
@@ -764,66 +854,67 @@ always @(posedge clk) begin
                 mmio_wstrb8 = pick_wstrb8(mmio_awaddr_hold, mmio_wstrb_hold);
                 seq_counter <= seq_counter + 1'b1;
                 mmio_active_seq <= seq_counter + 1'b1;
-                mmio_active_flags <= make_flags(route_bdf[route_first_index(mmio_awaddr_hold)], 3'd0,
+                mmio_active_flags <= make_flags(lookup_selected_bdf, lookup_selected_bar,
                                                 axsize_to_pkt_size(mmio_awsize_hold),
                                                 mmio_wstrb8);
-                mmio_active_off <= bar_offset32(mmio_awaddr_hold,
-                                                route_first_index(mmio_awaddr_hold));
+                mmio_active_off <= lookup_offset;
                 mmio_active_addr <= mmio_awaddr_hold;
                 mmio_active_done_req <= 1'b0;
                 send_packet(PKT_BAR_WRITE,
-                            make_flags(route_bdf[route_first_index(mmio_awaddr_hold)], 3'd0,
+                            make_flags(lookup_selected_bdf, lookup_selected_bar,
                                        axsize_to_pkt_size(mmio_awsize_hold),
                                        mmio_wstrb8),
                             seq_counter + 1'b1,
-                            bar_offset32(mmio_awaddr_hold,
-                                         route_first_index(mmio_awaddr_hold)),
+                            lookup_offset,
                             mmio_wlane[31:0], mmio_wlane[63:32]);
                 mmio_state <= MMIO_WAIT_WR;
             end else begin
-                if (route_hit_count(mmio_awaddr_hold) > 2'd1) begin
+                if (lookup_count > 2'd1) begin
                     route_error_sticky <= 1'b1;
-                    route_error_last_hits <= route_hit_count(mmio_awaddr_hold);
+                    route_error_last_hits <= lookup_count;
                     route_error_count <= route_error_count + 1'b1;
                     route_error_last_addr <= mmio_awaddr_hold;
                 end
-                s_mmio_axi_bresp <= (route_hit_count(mmio_awaddr_hold) > 2'd1) ?
+                s_mmio_axi_bresp <= (lookup_count > 2'd1) ?
                                     AXI_SLVERR : AXI_OKAY;
                 s_mmio_axi_bvalid <= 1'b1;
+                mmio_active_done_req <= 1'b0;
+                mmio_state <= MMIO_WAIT_WR;
             end
-        end
-        if (s_mmio_axi_arvalid && s_mmio_axi_arready && !bar_done_pending) begin
-            if ((route_hit_count(s_mmio_axi_araddr) == 2'd1) &&
-                (s_mmio_axi_arlen == 8'd0) &&
-                (axsize_to_pkt_size(s_mmio_axi_arsize) != 4'd0)) begin
+
+          end else begin
+            if ((lookup_count == 2'd1) &&
+                (lookup_len == 8'd0) &&
+                (axsize_to_pkt_size(lookup_size) != 4'd0)) begin
                 seq_counter <= seq_counter + 1'b1;
                 mmio_active_seq <= seq_counter + 1'b1;
-                mmio_active_flags <= make_flags(route_bdf[route_first_index(s_mmio_axi_araddr)], 3'd0,
-                                                axsize_to_pkt_size(s_mmio_axi_arsize), 8'd0);
-                mmio_active_off <= bar_offset32(s_mmio_axi_araddr,
-                                                route_first_index(s_mmio_axi_araddr));
-                mmio_active_addr <= s_mmio_axi_araddr;
+                mmio_active_flags <= make_flags(lookup_selected_bdf, lookup_selected_bar,
+                                                axsize_to_pkt_size(lookup_size), 8'd0);
+                mmio_active_off <= lookup_offset;
+                mmio_active_addr <= lookup_addr;
                 send_packet(PKT_BAR_READ,
-                            make_flags(route_bdf[route_first_index(s_mmio_axi_araddr)], 3'd0,
-                                       axsize_to_pkt_size(s_mmio_axi_arsize), 8'd0),
+                            make_flags(lookup_selected_bdf, lookup_selected_bar,
+                                       axsize_to_pkt_size(lookup_size), 8'd0),
                             seq_counter + 1'b1,
-                            bar_offset32(s_mmio_axi_araddr,
-                                         route_first_index(s_mmio_axi_araddr)),
+                            lookup_offset,
                             32'd0, 32'd0);
                 mmio_state <= MMIO_WAIT_RD;
             end else begin
-                if (route_hit_count(s_mmio_axi_araddr) > 2'd1) begin
+                if (lookup_count > 2'd1) begin
                     route_error_sticky <= 1'b1;
-                    route_error_last_hits <= route_hit_count(s_mmio_axi_araddr);
+                    route_error_last_hits <= lookup_count;
                     route_error_count <= route_error_count + 1'b1;
-                    route_error_last_addr <= s_mmio_axi_araddr;
+                    route_error_last_addr <= lookup_addr;
                 end
                 s_mmio_axi_rdata <= {4{32'hffff_ffff}};
-                s_mmio_axi_rresp <= (route_hit_count(s_mmio_axi_araddr) > 2'd1) ?
+                s_mmio_axi_rresp <= (lookup_count > 2'd1) ?
                                     AXI_SLVERR : AXI_OKAY;
                 s_mmio_axi_rlast <= 1'b1;
                 s_mmio_axi_rvalid <= 1'b1;
+                mmio_state <= MMIO_WAIT_RD;
             end
+
+          end
         end
 
         if (mbx_bar_resp_pending && (mbx_bar_resp_seq == mmio_active_seq)) begin

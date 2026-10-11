@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "devices": [
+    {
+      "type": "nvme",
+      "real-host-bdf": "0000:af:00.0"
+    },
+    {
+      "type": "nvme",
+      "real-host-bdf": "0000:d8:00.0"
+    },
+    {
+      "type": "nvme",
+      "real-host-bdf": "0000:5e:00.0"
+    },
+    {
+      "type": "igb",
+      "real-host-bdf": "0000:87:00.0"
+    }
+  ]
+}

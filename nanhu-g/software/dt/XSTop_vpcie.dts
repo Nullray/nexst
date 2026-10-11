@@ -50,17 +50,6 @@
 		device_type = "memory";
 		reg = <0x0 0x80000000 0x0 0x80000000>;
 	};
-	reserved-memory {
-		#address-cells = <2>;
-		#size-cells = <2>;
-		ranges;
-
-		/* Private ASQ/ACQ/I/O queues and PRP lists for SCOPE GIDS. */
-		scope_gids_control: gids-control@ffe00000 {
-			reg = <0x0 0xffe00000 0x0 0x00200000>;
-			no-map;
-		};
-	};
 	L15: soc {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -113,7 +102,7 @@
 			linux,pci-domain = <0>;
 			ranges = <0x02000000 0x00000000 0x50000000
 				  0x0 0x50000000
-				  0x00000000 0x01000000>;
+				  0x00000000 0x10000000>;
 			#interrupt-cells = <1>;
 			interrupt-parent = <&L4>;
 			interrupt-map-mask = <0 0 0 7>;
