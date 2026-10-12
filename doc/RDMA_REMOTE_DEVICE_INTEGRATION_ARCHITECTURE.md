@@ -19,6 +19,12 @@
 `type`、`transport`、`remote-device-mode` 和 `rdma-memory-mode` 是不同维度。
 `remote-rdma` 目前仅支持 `nvme`、`ixgbe`，不支持 `igb`、`vortex`。
 
+2026-10-11 新分支的主机侧 USB 使用物理 `xhci` local-p2p 后端，不走 RDMA。
+通过单 function 的 guest PCI DMA 映射统一转换 xHCI 的 ring/context/payload 地址，
+主机解绑真实 USB controller，香山标准驱动接管；没有增加 USB/IP 或虚拟 USB
+执行后端。拓扑前提、握手及验证步骤见
+[B650 USB / xHCI 接管](B650_USB_XHCI_OWNERSHIP.md)。当前尚未完成 B650 上板验证。
+
 | 设备 / remote-device-mode | Host B agent | 目标设备所有权 | 执行路径 |
 | --- | --- | --- | --- |
 | NVMe `semantic`（默认） | `scope-remote-agent` | 保留 Linux nvme 驱动 | ioctl / O_DIRECT + RDMA |

@@ -1,0 +1,5 @@
+{
+  "linux_baseline": "60f53740f75964f4313e84c6fa19ecf5ae64d8f2",
+  "xdma_baseline": "e63f5a117a5a2cd83738105ea6c7c4b5ac16f6a3",
+  "note": "Exported inherited USB changes from the original Nanhu-G worktree; NIC and hardware code remain unchanged."
+}

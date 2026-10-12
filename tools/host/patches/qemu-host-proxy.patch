@@ -1,0 +1,1164 @@
+diff --git a/hw/misc/scope_fpga_vswitch.c b/hw/misc/scope_fpga_vswitch.c
+index de110aa..a0bb11f 100644
+--- a/hw/misc/scope_fpga_vswitch.c
++++ b/hw/misc/scope_fpga_vswitch.c
+@@ -331,6 +331,7 @@ typedef enum ScopeBackendType {
+     SCOPE_BACKEND_IGB,
+     SCOPE_BACKEND_IXGBE,
+     SCOPE_BACKEND_VORTEX,
++    SCOPE_BACKEND_XHCI,
+ } ScopeBackendType;
+ 
+ typedef enum ScopeBackendTransport {
+@@ -369,6 +370,7 @@ typedef struct ScopeIgbState ScopeIgbState;
+ typedef struct ScopeIxgbeState ScopeIxgbeState;
+ typedef struct ScopeVortexState ScopeVortexState;
+ typedef struct ScopeGidsService ScopeGidsService;
++typedef struct ScopeXhciState ScopeXhciState;
+ typedef struct ScopeBackendOps ScopeBackendOps;
+ 
+ static bool scope_gids_service_realize(ScopeProxyState *s,
+@@ -452,6 +454,7 @@ typedef struct ScopeBackend {
+     ScopeIxgbeState *ixgbe;
+     ScopeVortexState *vortex;
+     ScopeGidsService *gids;
++    ScopeXhciState *xhci;
+ } ScopeBackend;
+ 
+ struct ScopeBackendOps {
+@@ -469,6 +472,10 @@ static const ScopeBackendOps scope_nvme_backend_ops;
+ static const ScopeBackendOps scope_igb_backend_ops;
+ static const ScopeBackendOps scope_ixgbe_backend_ops;
+ static const ScopeBackendOps scope_vortex_backend_ops;
++static const ScopeBackendOps scope_xhci_backend_ops;
++static void scope_vcfg_init_xhci_endpoint(ScopeProxyState *s,
++                                         ScopeVswitchConfigFn *fn,
++                                         ScopeBackend *be);
+ static bool scope_nvme_backend_realize(ScopeProxyState *s, Error **errp);
+ static void scope_nvme_backend_cleanup(ScopeProxyState *s, ScopeBackend *be);
+ static bool scope_recover_missing_bar_done(ScopeProxyState *s, int64_t now_us);
+@@ -508,6 +515,7 @@ struct ScopeProxyState {
+     uint64_t bypass_coherent_alias_base;
+     bool guest_mem_raw_fallback;
+     bool vortex_log;
++    bool allow_unsafe_xhci_p2p;
+     int fpga_bypass_bar_index;
+     uint32_t proxy_ctrl_shadow;
+     ScopeVswitchConfigFn vcfg[SCOPE_VSWITCH_ECAM_FUNC_COUNT];
+@@ -757,6 +765,8 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
+                     be->type = SCOPE_BACKEND_IXGBE;
+                 } else if (!strcmp(value, "vortex")) {
+                     be->type = SCOPE_BACKEND_VORTEX;
++                } else if (!strcmp(value, "xhci")) {
++                    be->type = SCOPE_BACKEND_XHCI;
+                 } else {
+                     error_setg(errp, "backend config: unsupported device type '%s'",
+                                value);
+@@ -2204,6 +2214,8 @@ static void scope_vcfg_init_all(ScopeProxyState *s, PCIDevice *pci_dev)
+             scope_vcfg_init_ixgbe_endpoint(ep, SCOPE_VSWITCH_EP_BDF(i));
+         } else if (be->type == SCOPE_BACKEND_VORTEX) {
+             scope_vcfg_init_vortex_endpoint(ep, SCOPE_VSWITCH_EP_BDF(i));
++        } else if (be->type == SCOPE_BACKEND_XHCI) {
++            scope_vcfg_init_xhci_endpoint(s, ep, be);
+         } else {
+             memset(ep, 0, sizeof(*ep));
+             ep->bdf = SCOPE_VSWITCH_EP_BDF(i);
+@@ -3164,6 +3176,7 @@ static bool scope_guest_mem_write(ScopeProxyState *s, uint64_t guest_pa,
+ 
+ #include "scope_fpga_vswitch_igb_backend.c"
+ #include "scope_fpga_vswitch_ixgbe_backend.c"
++#include "scope_fpga_vswitch_xhci_backend.c"
+ 
+ static void scope_capture_admin_seed(ScopeProxyState *s)
+ {
+@@ -5989,7 +6002,8 @@ static void scope_update_virtual_intx(ScopeProxyState *s)
+         bool backend_pending = false;
+         s->active = &s->backends[b];
+         if (s->active->type == SCOPE_BACKEND_IGB ||
+-            s->active->type == SCOPE_BACKEND_IXGBE) {
++            s->active->type == SCOPE_BACKEND_IXGBE ||
++            s->active->type == SCOPE_BACKEND_XHCI) {
+             pending |= s->active->intx_pending;
+             continue;
+         }
+@@ -6709,6 +6723,9 @@ static void scope_process_cfg_packet(ScopeProxyState *s, const struct scope_dma3
+                 scope_cfg_write_touches_bar_route(actual_addr, len);
+ 
+             scope_vcfg_write_masked(fn, actual_addr, val, len);
++            if (be->xhci) {
++                scope_xhci_config_changed(s, be, fn);
++            }
+ 
+             sync_ok = scope_sync_ecam_shadow_range(s, shadow_index,
+                                                    actual_addr, len,
+@@ -7242,6 +7259,8 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
+             be->ops = &scope_ixgbe_backend_ops;
+         } else if (be->type == SCOPE_BACKEND_VORTEX) {
+             be->ops = &scope_vortex_backend_ops;
++        } else if (be->type == SCOPE_BACKEND_XHCI) {
++            be->ops = &scope_xhci_backend_ops;
+         } else {
+             be->ops = &scope_nvme_backend_ops;
+         }
+@@ -7272,7 +7291,9 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
+         }
+         if (s->active->ops->requires_real_pci &&
+             !scope_backend_is_remote(s->active)) {
+-            if (!scope_enable_real_pci_bus_master(s, errp) ||
++            if (!(s->active->type == SCOPE_BACKEND_XHCI ?
++                  scope_xhci_prepare_pci(s, errp) :
++                  scope_enable_real_pci_bus_master(s, errp)) ||
+                 !scope_parse_real_bar0(s, errp)) {
+                 goto fail;
+             }
+@@ -7501,6 +7522,8 @@ static const Property scope_proxy_properties[] = {
+                      guest_mem_raw_fallback, false),
+     DEFINE_PROP_BOOL("vortex-log", ScopeProxyState,
+                      vortex_log, false),
++    DEFINE_PROP_BOOL("allow-unsafe-xhci-p2p", ScopeProxyState,
++                     allow_unsafe_xhci_p2p, false),
+     DEFINE_PROP_BOOL("intx-retry-pulse", ScopeProxyState,
+                      intx_retry_pulse, false),
+ };
+diff --git a/hw/misc/scope_fpga_vswitch_xhci_backend.c b/hw/misc/scope_fpga_vswitch_xhci_backend.c
+new file mode 100644
+index 0000000..685791e
+--- /dev/null
++++ b/hw/misc/scope_fpga_vswitch_xhci_backend.c
+@@ -0,0 +1,484 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Physical xHCI ownership. Included by scope_fpga_vswitch.c. */
++
++#define SCOPE_XHCI_DMA_CAP       0xb0U
++#define SCOPE_XHCI_DMA_CAP_LEN   40U
++#define SCOPE_XHCI_DMA_SIGNATURE 0x53435045U
++#define SCOPE_XHCI_DMA_FLAGS     3U /* translated DMA addresses, coherent */
++#define SCOPE_XHCI_DMA_READY     0x444d4150U
++#define SCOPE_XHCI_SBRN          0x60U
++#define SCOPE_XHCI_RS            (1U << 0)
++#define SCOPE_XHCI_INTE          (1U << 2)
++#define SCOPE_XHCI_HCH           (1U << 0)
++#define SCOPE_XHCI_EINT          (1U << 3)
++#define SCOPE_XHCI_CNR           (1U << 11)
++
++struct ScopeXhciState {
++    uint8_t pci_config[256];
++    int pci_fd;
++    uint32_t operational;
++    uint32_t runtime;
++    uint32_t doorbell;
++    uint32_t doorbell_end;
++    bool dma_ready;
++    bool initialized;
++    bool failed;
++    bool bus_master;
++    bool doorbell_pending;
++    int64_t doorbell_since_us;
++    struct scope_dma32_packet pending_doorbell;
++};
++
++static void scope_vcfg_init_xhci_endpoint(ScopeProxyState *s,
++                                         ScopeVswitchConfigFn *fn,
++                                         ScopeBackend *be)
++{
++    const uint8_t pcie = 0x70;
++    const uint8_t cap = SCOPE_XHCI_DMA_CAP;
++    uint64_t dma_start = s->fpga_bypass_bar_base +
++        s->bypass_coherent_alias_base + s->guest_ddr_base;
++
++    memset(fn, 0, sizeof(*fn));
++    fn->bdf = be->virtual_bdf;
++    memcpy(fn->config, be->xhci->pci_config, PCI_COMMAND);
++    memcpy(fn->config + PCI_REVISION_ID,
++           be->xhci->pci_config + PCI_REVISION_ID, 4);
++    memcpy(fn->config + PCI_SUBSYSTEM_VENDOR_ID,
++           be->xhci->pci_config + PCI_SUBSYSTEM_VENDOR_ID, 4);
++    /* xhci-pci reads the physical Serial Bus Release Number during setup. */
++    fn->config[SCOPE_XHCI_SBRN] = be->xhci->pci_config[SCOPE_XHCI_SBRN];
++    fn->config[PCI_INTERRUPT_PIN] = 1;
++    fn->config[PCI_INTERRUPT_LINE] = 0xff;
++    pci_set_long(fn->config + PCI_BASE_ADDRESS_0,
++                 PCI_BASE_ADDRESS_MEM_TYPE_64);
++    pci_set_word(fn->config + PCI_STATUS, PCI_STATUS_CAP_LIST);
++    fn->config[PCI_CAPABILITY_LIST] = pcie;
++    fn->config[pcie + PCI_CAP_LIST_ID] = PCI_CAP_ID_EXP;
++    fn->config[pcie + PCI_CAP_LIST_NEXT] = cap;
++    pci_set_word(fn->config + pcie + PCI_EXP_FLAGS,
++                 PCI_EXP_FLAGS_VER2 | (PCI_EXP_TYPE_ENDPOINT << 4));
++    pci_set_long(fn->config + pcie + PCI_EXP_LNKCAP,
++                 PCI_EXP_LNKCAP_SLS_2_5GB |
++                 QEMU_PCI_EXP_LNKCAP_MLW(QEMU_PCI_EXP_LNK_X1));
++    pci_set_word(fn->config + pcie + PCI_EXP_LNKSTA,
++                 PCI_EXP_LNKSTA_CLS_2_5GB |
++                 QEMU_PCI_EXP_LNKSTA_NLW(QEMU_PCI_EXP_LNK_X1));
++
++    /* Per-function firmware description consumed by guest PCI DMA setup. */
++    fn->config[cap] = PCI_CAP_ID_VNDR;
++    fn->config[cap + 2] = SCOPE_XHCI_DMA_CAP_LEN;
++    fn->config[cap + 3] = 1;
++    pci_set_long(fn->config + cap + 4, SCOPE_XHCI_DMA_SIGNATURE);
++    pci_set_long(fn->config + cap + 8, SCOPE_XHCI_DMA_FLAGS);
++    stq_le_p(fn->config + cap + 16, s->guest_ddr_base);
++    stq_le_p(fn->config + cap + 24, dma_start);
++    stq_le_p(fn->config + cap + 32, s->guest_ddr_size);
++
++    scope_vcfg_allow_range(fn, PCI_COMMAND, 2);
++    scope_vcfg_w1c_range(fn, PCI_STATUS, 2);
++    scope_vcfg_allow_range(fn, PCI_INTERRUPT_LINE, 1);
++    scope_vcfg_allow_range(fn, cap + 12, 4);
++    pci_set_long(fn->wmask + PCI_BASE_ADDRESS_0,
++                 ~(be->real_bar0_size - 1U) & PCI_BASE_ADDRESS_MEM_MASK);
++    pci_set_long(fn->wmask + PCI_BASE_ADDRESS_0 + 4, UINT32_MAX);
++    scope_vcfg_allow_range(fn, pcie + PCI_EXP_DEVCTL, 2);
++    scope_vcfg_w1c_range(fn, pcie + PCI_EXP_DEVSTA, 2);
++}
++
++static bool scope_xhci_halt(ScopeProxyState *s, Error **errp)
++{
++    ScopeXhciState *x = s->active->xhci;
++    uint32_t cmd, status;
++    int64_t deadline = g_get_monotonic_time() + 1000000;
++
++    if (!scope_real_bar_read32(s, x->operational, &cmd) ||
++        !scope_real_bar_write32(s, x->operational,
++                                cmd & ~(SCOPE_XHCI_RS | SCOPE_XHCI_INTE))) {
++        error_setg(errp, "xhci: cannot stop physical controller");
++        return false;
++    }
++    do {
++        if (!scope_real_bar_read32(s, x->operational + 4, &status)) {
++            break;
++        }
++        if (status & SCOPE_XHCI_HCH) {
++            return true;
++        }
++        g_usleep(100);
++    } while (g_get_monotonic_time() < deadline);
++    error_setg(errp, "xhci: physical controller did not halt");
++    return false;
++}
++
++static bool scope_xhci_set_pci_command(ScopeBackend *be, uint16_t command)
++{
++    uint8_t buf[2];
++    uint16_t verify;
++
++    stw_le_p(buf, command);
++    if (pwrite(be->xhci->pci_fd, buf, 2, PCI_COMMAND) != 2 ||
++        pread(be->xhci->pci_fd, buf, 2, PCI_COMMAND) != 2) {
++        return false;
++    }
++    verify = lduw_le_p(buf);
++    return (verify & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER |
++                      PCI_COMMAND_INTX_DISABLE)) == command;
++}
++
++static bool scope_xhci_prepare_pci(ScopeProxyState *s, Error **errp)
++{
++    ScopeBackend *be = s->active;
++
++    be->original_pci_command = lduw_le_p(be->xhci->pci_config + PCI_COMMAND);
++    be->pci_command_saved = true;
++    /* Do not enable DMA until guest firmware mapping has been acknowledged. */
++    if (!scope_xhci_set_pci_command(be, PCI_COMMAND_MEMORY |
++                                       PCI_COMMAND_INTX_DISABLE)) {
++        error_setg_errno(errp, errno,
++                         "xhci: cannot disable physical bus master");
++        return false;
++    }
++    return true;
++}
++
++static void scope_xhci_fail(ScopeProxyState *s)
++{
++    ScopeBackend *be = s->active;
++
++    be->xhci->failed = true;
++    be->xhci->doorbell_pending = false;
++    be->xhci->bus_master = false;
++    be->intx_pending = false;
++    if (!scope_xhci_set_pci_command(be, PCI_COMMAND_MEMORY |
++                                      PCI_COMMAND_INTX_DISABLE)) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "SCOPE xhci: failed to disable physical bus master\n");
++    }
++}
++
++static bool scope_xhci_preflight(ScopeProxyState *s, Error **errp)
++{
++    ScopeBackend *be = s->active;
++    ScopeXhciState *x = g_new0(ScopeXhciState, 1);
++    g_autofree char *base = g_strdup_printf("/sys/bus/pci/devices/%s",
++                                           be->real_host_bdf);
++    g_autofree char *driver = g_strdup_printf("%s/driver", base);
++    g_autofree char *group = g_strdup_printf("%s/iommu_group", base);
++    g_autofree char *config = g_strdup_printf("%s/config", base);
++    unsigned pos, count;
++
++    be->xhci = x;
++    x->pci_fd = -1;
++    if (!s->allow_unsafe_xhci_p2p) {
++        error_setg(errp, "physical xhci requires allow-unsafe-xhci-p2p=on "
++                   "and a verified FPGA P2P route");
++        return false;
++    }
++    if (!s->bypass_coherent_alias_base || s->guest_mem_raw_fallback ||
++        s->fpga_bypass_bar_base > UINT64_MAX - s->fpga_bypass_bar_size) {
++        error_setg(errp,
++                   "xhci requires a coherent FPGA BAR without raw fallback");
++        return false;
++    }
++    if (g_file_test(driver, G_FILE_TEST_EXISTS)) {
++        error_setg(errp, "xhci %s is still bound; "
++                   "unbind only the target function",
++                   be->real_host_bdf);
++        return false;
++    }
++    if (g_file_test(group, G_FILE_TEST_EXISTS)) {
++        g_autofree char *path = g_strdup_printf("%s/type", group);
++        g_autofree char *type = NULL;
++
++        if (!g_file_get_contents(path, &type, NULL, NULL) ||
++            strcmp(g_strstrip(type), "identity")) {
++            error_setg(errp, "xhci requires an identity host IOMMU domain "
++                       "or no active IOMMU; translated/unknown domain rejected");
++            return false;
++        }
++    }
++    x->pci_fd = open(config, O_RDWR | O_CLOEXEC);
++    if (x->pci_fd < 0 ||
++        pread(x->pci_fd, x->pci_config, sizeof(x->pci_config), 0) !=
++        sizeof(x->pci_config)) {
++        error_setg_errno(errp, errno, "xhci: cannot read PCI configuration");
++        return false;
++    }
++    if (x->pci_config[PCI_CLASS_PROG] != 0x30 ||
++        lduw_le_p(x->pci_config + PCI_CLASS_DEVICE) != PCI_CLASS_SERIAL_USB) {
++        error_setg(errp, "%s is not a PCI xHCI function", be->real_host_bdf);
++        return false;
++    }
++    /* Host IRQs must already have been released by the Linux driver. */
++    pos = x->pci_config[PCI_CAPABILITY_LIST] & ~3U;
++    for (count = 0; pos && count < 48; count++) {
++        uint16_t flags;
++        if (pos < 0x40 || pos > 0xfc) {
++            break;
++        }
++        flags = lduw_le_p(x->pci_config + pos + 2);
++        if ((x->pci_config[pos] == PCI_CAP_ID_MSI && (flags & 1)) ||
++            (x->pci_config[pos] == PCI_CAP_ID_MSIX && (flags & 0x8000))) {
++            error_setg(errp, "xhci host MSI/MSI-X is still enabled");
++            return false;
++        }
++        pos = x->pci_config[pos + 1] & ~3U;
++    }
++    if (pos) {
++        error_setg(errp, "xhci: malformed physical PCI capability chain");
++        return false;
++    }
++    return true;
++}
++
++static bool scope_xhci_realize(ScopeProxyState *s, Error **errp)
++{
++    ScopeXhciState *x = s->active->xhci;
++    uint32_t cap, hcc, hcs, runtime, doorbell, status;
++    uint32_t ext;
++    unsigned count;
++
++    if (!scope_real_bar_read32(s, 0, &cap) ||
++        !scope_real_bar_read32(s, 4, &hcs) ||
++        !scope_real_bar_read32(s, 0x10, &hcc) ||
++        !scope_real_bar_read32(s, 0x14, &doorbell) ||
++        !scope_real_bar_read32(s, 0x18, &runtime)) {
++        error_setg(errp, "xhci: cannot read physical capability registers");
++        return false;
++    }
++    x->operational = cap & 0xff;
++    x->runtime = runtime & ~0x1fU;
++    x->doorbell = doorbell & ~3U;
++    x->doorbell_end = x->doorbell + 4U * ((hcs & 0xff) + 1U);
++    if (!(hcc & 1) || x->operational < 0x20 ||
++        x->operational + 0x400U + ((hcs >> 24) * 16U) >
++            s->active->real_bar0_size ||
++        x->runtime < 0x20 ||
++        (uint64_t)x->runtime + 0x40U > s->active->real_bar0_size ||
++        x->doorbell < 0x20 ||
++        x->doorbell_end < x->doorbell ||
++        x->doorbell_end > s->active->real_bar0_size) {
++        error_setg(errp, "xhci: invalid BAR layout or no 64-bit DMA support");
++        return false;
++    }
++    if (!scope_real_bar_read32(s, x->operational + 4, &status) ||
++        (status & SCOPE_XHCI_CNR)) {
++        error_setg(errp, "xhci: physical controller is not ready");
++        return false;
++    }
++    /* Host Linux did handoff; do not force ownership away from firmware. */
++    ext = (hcc >> 16) * 4U;
++    for (count = 0; ext && count < 256; count++) {
++        uint32_t value;
++        if (!scope_real_bar_read32(s, ext, &value)) {
++            break;
++        }
++        if ((value & 0xff) == 1 && (value & (1U << 16))) {
++            error_setg(errp, "xhci: BIOS still owns the physical controller");
++            return false;
++        }
++        if ((value & 0xff) == 1) {
++            uint32_t control;
++            const uint32_t reserved = (7U << 1) | (0xffU << 5) | (7U << 17);
++
++            if (!scope_real_bar_read32(s, ext + 4, &control) ||
++                !scope_real_bar_write32(s, ext, value | (1U << 24)) ||
++                !scope_real_bar_write32(s, ext + 4,
++                                        (control & reserved) | (7U << 29))) {
++                error_setg(errp,
++                           "xhci: cannot assert OS ownership/disable SMI");
++                return false;
++            }
++        }
++        if (!(value & 0xff00)) {
++            ext = 0;
++            break;
++        }
++        ext += ((value >> 8) & 0xff) * 4U;
++    }
++    if (ext) {
++        error_setg(errp, "xhci: invalid extended capability chain");
++        return false;
++    }
++    /* Never touch USBCMD if firmware owns xHC or its layout is invalid. */
++    x->initialized = true;
++    if (!scope_xhci_halt(s, errp)) {
++        return false;
++    }
++    SCOPE_PRINTF("[SCOPE XHCI] physical %s -> guest backend=%u "
++                 "DMA bus base=0x%016" PRIx64 " legacy INTx\n",
++                 s->active->real_host_bdf, s->active->id,
++                 s->fpga_bypass_bar_base + s->bypass_coherent_alias_base +
++                 s->guest_ddr_base);
++    return true;
++}
++
++static void scope_xhci_config_changed(ScopeProxyState *s, ScopeBackend *be,
++                                     const ScopeVswitchConfigFn *fn)
++{
++    ScopeXhciState *x = be->xhci;
++    ScopeBackend *saved = s->active;
++    uint16_t command = PCI_COMMAND_MEMORY | PCI_COMMAND_INTX_DISABLE;
++    bool ready = ldl_le_p(fn->config + SCOPE_XHCI_DMA_CAP + 12) ==
++                 SCOPE_XHCI_DMA_READY;
++
++    if (ready && (lduw_le_p(fn->config + PCI_COMMAND) & PCI_COMMAND_MASTER)) {
++        command |= PCI_COMMAND_MASTER;
++    }
++    s->active = be;
++    if (x->bus_master && !(command & PCI_COMMAND_MASTER)) {
++        Error *err = NULL;
++        if (!scope_xhci_halt(s, &err)) {
++            error_report_err(err);
++            x->failed = true;
++        }
++        x->doorbell_pending = false;
++    }
++    if (x->failed) {
++        command &= ~PCI_COMMAND_MASTER;
++    }
++    if (!scope_xhci_set_pci_command(be, command)) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "SCOPE xhci: physical PCI command failed\n");
++        scope_xhci_fail(s);
++        command &= ~PCI_COMMAND_MASTER;
++    }
++    x->dma_ready = ready;
++    x->bus_master = !!(command & PCI_COMMAND_MASTER);
++    s->active = saved;
++}
++
++static bool scope_xhci_commit_write(ScopeProxyState *s,
++                                    const struct scope_dma32_packet *pkt)
++{
++    ScopeXhciState *x = s->active->xhci;
++    uint64_t value = ((uint64_t)pkt->guest_addr_lo << 32) | pkt->data;
++    uint32_t fence;
++
++    return scope_real_bar_write(s, pkt->bar_offset, value,
++                                SCOPE_VSWITCH_PKT_WSTRB(pkt->flags),
++                                SCOPE_VSWITCH_PKT_SIZE(pkt->flags)) &&
++           scope_real_bar_read32(s, x->operational + 4, &fence);
++}
++
++static void scope_xhci_process_bar_packet(
++    ScopeProxyState *s, const struct scope_dma32_packet *pkt)
++{
++    ScopeXhciState *x = s->active->xhci;
++    uint8_t size = SCOPE_VSWITCH_PKT_SIZE(pkt->flags);
++    uint8_t strobe = SCOPE_VSWITCH_PKT_WSTRB(pkt->flags);
++    uint64_t value = ((uint64_t)pkt->guest_addr_lo << 32) | pkt->data;
++    uint64_t data = UINT64_MAX;
++    bool read = pkt->type == SCOPE_PKT_TYPE_BAR_READ;
++    bool ok = false;
++
++    if (pkt->type == SCOPE_PKT_TYPE_BAR_WRITE_DONE) {
++        if (x->doorbell_pending && pkt->seq == x->pending_doorbell.seq &&
++            pkt->bar_offset == x->pending_doorbell.bar_offset) {
++            x->doorbell_pending = false;
++            if (!x->dma_ready || !x->bus_master ||
++                !scope_xhci_commit_write(s, &x->pending_doorbell)) {
++                scope_xhci_fail(s);
++                qemu_log_mask(LOG_GUEST_ERROR,
++                              "SCOPE xhci: deferred physical doorbell failed\n");
++            }
++        }
++        return;
++    }
++    if (!x->failed && (size == 4 || size == 8) &&
++        !(pkt->bar_offset & (size - 1U))) {
++        if (read) {
++            ok = scope_real_bar_read(s, pkt->bar_offset, size, &data);
++            /* Legacy mode uses only interrupter zero. */
++            if (ok && ((pkt->bar_offset == 4 && size == 4) ||
++                       (pkt->bar_offset == 0 && size == 8))) {
++                uint32_t hcs = (uint32_t)(data >> 32);
++                hcs = (hcs & ~(0x7ffU << 8)) | (1U << 8);
++                data = (data & UINT32_MAX) | ((uint64_t)hcs << 32);
++            }
++        } else if (x->dma_ready && x->bus_master) {
++            if (pkt->bar_offset >= x->doorbell &&
++                pkt->bar_offset < x->doorbell_end) {
++                if (!x->doorbell_pending && size == 4 &&
++                    strobe == scope_pack_wstrb4_for_offset(pkt->bar_offset)) {
++                    x->pending_doorbell = *pkt;
++                    x->doorbell_pending = true;
++                    x->doorbell_since_us = g_get_monotonic_time();
++                    /* Same ordering handshake used by the local NVMe path. */
++                    scope_write_bar_response(s, pkt->seq, 0, 0, false, true);
++                    return;
++                }
++            } else {
++                ok = scope_xhci_commit_write(s, pkt);
++            }
++        } else if (pkt->bar_offset == x->operational && size == 4 &&
++                   !(scope_extract_dword32(value, pkt->bar_offset) &
++                     SCOPE_XHCI_RS)) {
++            /* Halt/reset is allowed before mapping, but running/DMA is not. */
++            ok = scope_real_bar_write(s, pkt->bar_offset, value, strobe, size);
++        }
++    }
++    scope_write_bar_response(s, pkt->seq, ok ? 0 : 2,
++                             read ? data : 0, read, false);
++}
++
++static bool scope_xhci_poll(ScopeProxyState *s, int64_t now_us)
++{
++    ScopeXhciState *x = s->active->xhci;
++    uint32_t command, status, iman;
++    const ScopeVswitchConfigFn *fn =
++        &s->vcfg[SCOPE_VSWITCH_EP_SLOT(s->active->id)];
++
++    if (x->doorbell_pending && now_us - x->doorbell_since_us > 1000000) {
++        scope_xhci_fail(s);
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "SCOPE xhci: timed out waiting for BAR_WRITE_DONE\n");
++    }
++
++    s->active->intx_pending = !x->failed && x->dma_ready && x->bus_master &&
++        !(lduw_le_p(fn->config + PCI_COMMAND) & PCI_COMMAND_INTX_DISABLE) &&
++        scope_real_bar_read32(s, x->operational, &command) &&
++        (command & SCOPE_XHCI_INTE) &&
++        scope_real_bar_read32(s, x->operational + 4, &status) &&
++        (status & SCOPE_XHCI_EINT) &&
++        scope_real_bar_read32(s, x->runtime + 0x20, &iman) &&
++        ((iman & 3U) == 3U);
++    return false;
++}
++
++static void scope_xhci_cleanup(ScopeProxyState *s, ScopeBackend *be)
++{
++    ScopeXhciState *x = be->xhci;
++    ScopeBackend *saved = s->active;
++    Error *err = NULL;
++
++    if (!x) {
++        return;
++    }
++    s->active = be;
++    if (x->initialized && !scope_xhci_halt(s, &err)) {
++        error_report_err(err);
++    }
++    if (be->pci_command_saved && x->pci_fd >= 0) {
++        scope_xhci_set_pci_command(be, PCI_COMMAND_MEMORY |
++                                      PCI_COMMAND_INTX_DISABLE);
++        /* Never restore BME into a controller holding guest queue addresses. */
++        be->original_pci_command &= ~PCI_COMMAND_MASTER;
++    }
++    if (x->pci_fd >= 0) {
++        close(x->pci_fd);
++    }
++    g_free(x);
++    be->xhci = NULL;
++    s->active = saved;
++}
++
++static const ScopeBackendOps scope_xhci_backend_ops = {
++    .name = "xhci",
++    .requires_real_pci = true,
++    .preflight = scope_xhci_preflight,
++    .realize = scope_xhci_realize,
++    .cleanup = scope_xhci_cleanup,
++    .process_bar_packet = scope_xhci_process_bar_packet,
++    .poll = scope_xhci_poll,
++};
+diff --git a/tests/scope-usb/fake-xdma.c b/tests/scope-usb/fake-xdma.c
+new file mode 100644
+index 0000000..4648c10
+--- /dev/null
++++ b/tests/scope-usb/fake-xdma.c
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Test-only sysfs/XDMA shim. Never accesses real PCI functions. */
++#define _GNU_SOURCE
++#define _LARGEFILE64_SOURCE
++#include <dlfcn.h>
++#include <fcntl.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include "hw/misc/scope_fpga_proxy_abi.h"
++
++static const char *redirect(const char *path, char *buf)
++{
++    const char *prefix = "/sys/bus/pci/devices/fffe:";
++    const char *root = getenv("SCOPE_TEST_SYSFS");
++
++    if (root && path && !strncmp(path, prefix, strlen(prefix))) {
++        snprintf(buf, 4096, "%s/%s", root,
++                 path + strlen("/sys/bus/pci/devices/"));
++        return buf;
++    }
++    return path;
++}
++
++#define PATH_WRAPPER(name, result, args, callargs) \
++result name args { \
++    char buf[4096]; \
++    static result (*real_fn) args; \
++    if (!real_fn) real_fn = dlsym(RTLD_NEXT, #name); \
++    path = redirect(path, buf); \
++    return real_fn callargs; \
++}
++
++PATH_WRAPPER(fopen, FILE *, (const char *path, const char *mode), (path, mode))
++PATH_WRAPPER(fopen64, FILE *, (const char *path, const char *mode), (path, mode))
++PATH_WRAPPER(stat, int, (const char *path, struct stat *st), (path, st))
++PATH_WRAPPER(stat64, int, (const char *path, struct stat64 *st), (path, st))
++PATH_WRAPPER(access, int, (const char *path, int mode), (path, mode))
++
++#define OPEN_WRAPPER(name) \
++int name(const char *path, int flags, ...) { \
++    char buf[4096]; \
++    mode_t mode = 0; \
++    static int (*real_fn)(const char *, int, ...); \
++    if (flags & O_CREAT) { \
++        va_list ap; va_start(ap, flags); \
++        mode = va_arg(ap, int); va_end(ap); \
++    } \
++    if (!real_fn) real_fn = dlsym(RTLD_NEXT, #name); \
++    return real_fn(redirect(path, buf), flags, mode); \
++}
++OPEN_WRAPPER(open)
++OPEN_WRAPPER(open64)
++
++int ioctl(int fd, unsigned long request, ...)
++{
++    static int (*real_fn)(int, unsigned long, ...);
++    void *arg;
++    va_list ap;
++    char link[64], path[4096];
++    ssize_t len;
++    const char *ctrl = getenv("SCOPE_TEST_CTRL");
++
++    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
++    len = readlink(link, path, sizeof(path) - 1);
++    if (len > 0) {
++        path[len] = 0;
++        if (ctrl && !strcmp(path, ctrl)) {
++            if (request == XDMA_IOC_DMA32_DB_FREE) return 0;
++            if (request == XDMA_IOC_DMA32_DB_ALLOC) {
++                va_start(ap, request);
++                struct scope_xdma_dma32_doorbell *db = va_arg(ap, void *);
++                va_end(ap);
++                db->dma_addr = 0x40000000;
++                return 0;
++            }
++        }
++    }
++    va_start(ap, request);
++    arg = va_arg(ap, void *);
++    va_end(ap);
++    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "ioctl");
++    return real_fn(fd, request, arg);
++}
+diff --git a/tests/scope-usb/run.sh b/tests/scope-usb/run.sh
+new file mode 100755
+index 0000000..59e804e
+--- /dev/null
++++ b/tests/scope-usb/run.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++set -euo pipefail
++qemu_root=$(cd "$(dirname "$0")/../.." && pwd)
++qemu_binary=${1:-$qemu_root/build-rdma-repo17-review/qemu-system-x86_64}
++test_dir=$(mktemp -d)
++trap 'rm -rf "$test_dir"' EXIT
++cc -shared -fPIC -Wall -Wextra -Werror -I"$qemu_root" -I"$qemu_root/include" \
++  "$qemu_root/tests/scope-usb/fake-xdma.c" -ldl -o "$test_dir/fake-xdma.so"
++python3 "$qemu_root/tests/scope-usb/test-physical-xhci.py" \
++  "$qemu_binary" "$test_dir/fake-xdma.so"
++kernel_source=${SCOPE_GUEST_KERNEL:-$qemu_root/../work_farm/software/linux}
++mkdir -p "$test_dir/linux"
++touch "$test_dir/linux/dma-direct.h"
++for enabled in 1 0; do
++  cc -std=gnu11 -O2 -g -Wall -Wextra -Werror \
++    -fsanitize=address,undefined -fno-omit-frame-pointer \
++    -DCONFIG_SCOPE_PCIE_P2P_DMA="$enabled" \
++    -DSCOPE_DMA_HEADER="\"$kernel_source/drivers/pci/scope-p2p-dma.h\"" \
++    -I"$test_dir" "$qemu_root/tests/scope-usb/test-dma-window.c" \
++    -o "$test_dir/test-dma-window"
++  "$test_dir/test-dma-window"
++done
+diff --git a/tests/scope-usb/test-dma-window.c b/tests/scope-usb/test-dma-window.c
+new file mode 100644
+index 0000000..51acd91
+--- /dev/null
++++ b/tests/scope-usb/test-dma-window.c
+@@ -0,0 +1,165 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Compile the production guest PCI DMA helper with a mock config/devres API. */
++#include <assert.h>
++#include <errno.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++typedef uint64_t u64;
++typedef uint32_t u32;
++typedef uint8_t u8;
++typedef uint64_t phys_addr_t;
++typedef uint64_t dma_addr_t;
++#define IS_ENABLED(option) (option)
++#ifndef CONFIG_SCOPE_PCIE_P2P_DMA
++#define CONFIG_SCOPE_PCIE_P2P_DMA 1
++#endif
++#define U64_MAX UINT64_MAX
++#define PAGE_SIZE 4096U
++#define PFN_PHYS(pfn) ((u64)(pfn) * PAGE_SIZE)
++#define PCI_CAP_ID_VNDR 9
++#define PCI_CFG_SPACE_SIZE 256
++#define PCI_CLASS_SERIAL_USB_XHCI 0x0c0330
++#define GFP_KERNEL 0
++#define dev_err(dev, ...) ((void)(dev))
++#define dev_info(dev, ...) ((void)(dev))
++static unsigned long min_low_pfn = 0x80000000 / PAGE_SIZE;
++static unsigned long max_pfn = 0x100000000ULL / PAGE_SIZE;
++
++struct bus_dma_region { phys_addr_t cpu_start; dma_addr_t dma_start; u64 size, offset; };
++struct device {
++    const struct bus_dma_region *dma_range_map;
++    u64 bus_dma_limit;
++    void *ops, *allocation;
++    void (*release)(void *);
++    void *release_data;
++};
++struct pci_dev { struct device dev; u32 class; u8 cfg[256]; };
++static void *get_dma_ops(struct device *dev) { return dev->ops; }
++static void *devm_kzalloc(struct device *dev, size_t size, int flags)
++{
++    (void)flags;
++    return dev->allocation = calloc(1, size);
++}
++static int devm_add_action_or_reset(struct device *dev,
++                                    void (*release)(void *), void *data)
++{
++    dev->release = release;
++    dev->release_data = data;
++    return 0;
++}
++static int pci_read_config_byte(struct pci_dev *p, int off, u8 *value)
++{
++    if (off < 0 || off >= 256) return -1;
++    *value = p->cfg[off]; return 0;
++}
++static int pci_read_config_dword(struct pci_dev *p, int off, u32 *value)
++{
++    if (off < 0 || off > 252) return -1;
++    *value = (u32)p->cfg[off] | ((u32)p->cfg[off + 1] << 8) |
++             ((u32)p->cfg[off + 2] << 16) | ((u32)p->cfg[off + 3] << 24);
++    return 0;
++}
++static int pci_write_config_dword(struct pci_dev *p, int off, u32 value)
++{
++    if (off < 0 || off > 252) return -1;
++    for (unsigned i = 0; i < 4; i++) p->cfg[off + i] = value >> (8 * i);
++    return 0;
++}
++static int find_from(struct pci_dev *p, int start, int id)
++{
++    for (unsigned count = 0; start >= 0x40 && start <= 0xfc && count < 48; count++) {
++        if (p->cfg[start] == id) return start;
++        start = p->cfg[start + 1];
++    }
++    return 0;
++}
++static int pci_find_capability(struct pci_dev *p, int id)
++{
++    return find_from(p, p->cfg[0x34], id);
++}
++static int pci_find_next_capability(struct pci_dev *p, int pos, int id)
++{
++    /* Matches Linux: pos=0 means read offset 1, NOT capability-list head. */
++    return find_from(p, p->cfg[pos + 1], id);
++}
++
++#include SCOPE_DMA_HEADER
++
++static void write64(struct pci_dev *p, int off, u64 value)
++{
++    pci_write_config_dword(p, off, value);
++    pci_write_config_dword(p, off + 4, value >> 32);
++}
++static struct pci_dev fixture(void)
++{
++    struct pci_dev p = { .class = PCI_CLASS_SERIAL_USB_XHCI };
++    p.cfg[0] = 0x22; p.cfg[1] = 0x10;  /* physical AMD ID */
++    p.cfg[0x34] = 0x70;
++    p.cfg[0x70] = 0x10; p.cfg[0x71] = 0xb0;
++    p.cfg[0xb0] = PCI_CAP_ID_VNDR;
++    p.cfg[0xb2] = 40; p.cfg[0xb3] = 1;
++    pci_write_config_dword(&p, 0xb4, SCOPE_P2P_SIGNATURE);
++    pci_write_config_dword(&p, 0xb8, 3);
++    write64(&p, 0xc0, 0x80000000);
++    write64(&p, 0xc8, 0x980000000);
++    write64(&p, 0xd0, 0x80000000);
++    return p;
++}
++static void release(struct pci_dev *p)
++{
++    if (p->dev.release) p->dev.release(p->dev.release_data);
++    free(p->dev.allocation);
++    p->dev.release = NULL; p->dev.allocation = NULL;
++}
++
++int main(void)
++{
++    struct pci_dev p = fixture();
++    u32 ready;
++    if (!CONFIG_SCOPE_PCIE_P2P_DMA) {
++        assert(scope_p2p_dma_configure(&p) == -EOPNOTSUPP);
++        puts("PASS: disabled guest DMA helper rejects SCOPE controller");
++        return 0;
++    }
++    struct bus_dma_region old[] = {{ .size = 1 }, { 0 }};
++    p.dev.dma_range_map = old; p.dev.bus_dma_limit = 0xffffffff;
++    assert(scope_p2p_dma_configure(&p) == 0);
++    pci_read_config_dword(&p, 0xbc, &ready);
++    assert(ready == SCOPE_P2P_READY);
++    const struct bus_dma_region *m = p.dev.dma_range_map;
++    assert(m[0].cpu_start == 0x80000000 && m[0].dma_start == 0x980000000);
++    assert(m[0].size == 0x80000000 && m[1].size == 0);
++    for (u64 offset = 0; offset < 0x80000000; offset += 0x12345) {
++        u64 pa = m[0].cpu_start + offset;
++        u64 dma = pa - m[0].offset;
++        assert(dma == m[0].dma_start + offset && dma + m[0].offset == pa);
++    }
++    release(&p);
++    assert(p.dev.dma_range_map == old && p.dev.bus_dma_limit == 0xffffffff);
++    pci_read_config_dword(&p, 0xbc, &ready); assert(ready == 0);
++    assert(scope_p2p_dma_configure(&p) == 0); release(&p); /* rebind */
++    for (unsigned fault = 0; fault < 8; fault++) {
++        p = fixture();
++        switch (fault) {
++        case 0: p.class = 0x010802; break;
++        case 1: p.cfg[0xb2] = 32; break;
++        case 2: p.cfg[0xb3] = 2; break;
++        case 3: pci_write_config_dword(&p, 0xb8, 1); break;
++        case 4: p.dev.ops = &p; break;
++        case 5: write64(&p, 0xd0, 0x40000000); break;
++        case 6: write64(&p, 0xc8, UINT64_MAX - 1024); break;
++        case 7: write64(&p, 0xc0, 0x80000001); break;
++        }
++        assert(scope_p2p_dma_configure(&p) == -EINVAL);
++        assert(!p.dev.dma_range_map);
++    }
++    p = fixture(); p.cfg[0x34] = 0; p.class = 0x010802;
++    p.dev.dma_range_map = old;
++    assert(scope_p2p_dma_configure(&p) == 0 && p.dev.dma_range_map == old);
++    puts("PASS: guest DMA map, inverse, restore/rebind, 8 malformed descriptions, non-SCOPE device");
++    return 0;
++}
+diff --git a/tests/scope-usb/test-physical-xhci.py b/tests/scope-usb/test-physical-xhci.py
+new file mode 100755
+index 0000000..3a7d36b
+--- /dev/null
++++ b/tests/scope-usb/test-physical-xhci.py
+@@ -0,0 +1,254 @@
++#!/usr/bin/env python3
++"""Exercise production scope-fpga-vswitch against file-backed PCI/XDMA I/O.
++
++Checks control-plane behavior, never claims physical USB DMA works.
++"""
++import json
++import mmap
++import os
++from pathlib import Path
++import struct
++import subprocess
++import sys
++import tempfile
++import time
++
++QEMU = Path(sys.argv[1]).resolve()
++SHIM = Path(sys.argv[2]).resolve()
++FPGA = "fffe:00:01.0"
++XHCI = "fffe:00:02.0"
++MBX = 0x1000000
++ECAM = 0x1010000 + 3 * 4096
++RING_OFF = 0x100000000
++
++
++def put32(mem, off, value):
++    struct.pack_into("<I", mem, off, value)
++
++
++def get32(mem, off):
++    return struct.unpack_from("<I", mem, off)[0]
++
++
++def wait_until(predicate, proc, description):
++    deadline = time.monotonic() + 5
++    while time.monotonic() < deadline:
++        if predicate():
++            return
++        if proc.poll() is not None:
++            raise AssertionError(f"QEMU exited waiting for {description}")
++        time.sleep(0.001)
++    raise AssertionError(f"timed out waiting for {description}")
++
++
++def run_case(mode):
++    with tempfile.TemporaryDirectory(prefix="scope-xhci-test-") as tmp:
++        root = Path(tmp)
++        for bdf in (FPGA, XHCI):
++            (root / bdf).mkdir()
++        (root / FPGA / "resource").write_text(
++            "0 0 0\n0 0 0\n800000000 9ffffffff 200\n0 0 0\n0 0 0\n0 0 0\n")
++        (root / XHCI / "resource").write_text(
++            "10000000 1000ffff 200\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n")
++        config = bytearray(256)
++        struct.pack_into("<HH", config, 0, 0x1022, 0x43f7)
++        config[8:12] = bytes([1, 0x30, 3, 0x0c])
++        config[0x60] = 0x31  # physical Serial Bus Release Number
++        if mode == "wrong-class":
++            config[11] = 1
++        if mode == "msi":
++            config[0x34] = 0x40
++            config[0x40] = 5
++            config[0x42] = 1
++        (root / XHCI / "config").write_bytes(config)
++        if mode == "bound":
++            (root / XHCI / "driver").mkdir()
++        if mode == "iommu":
++            (root / XHCI / "iommu_group").mkdir()
++            (root / XHCI / "iommu_group/type").write_text("DMA\n")
++        regs = bytearray(65536)
++        put32(regs, 0, 0x1100040)
++        put32(regs, 4, (2 << 24) | (8 << 8) | 32)
++        put32(regs, 0x10, 0 if mode == "dma32" else 1)
++        put32(regs, 0x14, 0x2000)
++        put32(regs, 0x18, 0x1000)
++        put32(regs, 0x44, 1)
++        if mode == "bad-runtime":
++            put32(regs, 0x18, 0xffffffe0)
++        if mode == "not-ready":
++            put32(regs, 0x44, 1 | (1 << 11))
++            put32(regs, 0x40, 5)
++        if mode in ("legacy", "bios-owned"):
++            put32(regs, 0x10, 1 | (0xc00 << 16))
++            put32(regs, 0x3000, 1 | ((1 << 16) if mode == "bios-owned" else 0))
++            put32(regs, 0x3004, 0x1111)
++            put32(regs, 0x40, 5)
++        (root / XHCI / "resource0").write_bytes(regs)
++        (root / "backends.json").write_text(json.dumps({
++            "version": 1, "devices": [{"type": "xhci", "real-host-bdf": XHCI}]
++        }))
++        for name, size in (("user", 0x1030000), ("ctrl", RING_OFF + 65536),
++                           ("bypass", 0x200000000)):
++            with (root / name).open("wb") as handle:
++                handle.truncate(size)
++        env = dict(os.environ, LD_PRELOAD=str(SHIM),
++                   SCOPE_TEST_SYSFS=tmp, SCOPE_TEST_CTRL=str(root / "ctrl"))
++        device = (
++            f"scope-fpga-vswitch,id=scope,bus=rp,backend-config={root / 'backends.json'},"
++            f"fpga-host-bdf={FPGA},xdma-user-dev={root / 'user'},"
++            f"xdma-ctrl-dev={root / 'ctrl'},xdma-bypass-dev={root / 'bypass'},"
++            "guest-ddr-base=0x80000000,guest-ddr-size=0x80000000"
++        )
++        if mode != "no-opt-in":
++            device += ",allow-unsafe-xhci-p2p=on"
++        logfile = (root / "qemu.log").open("w+")
++        proc = subprocess.Popen(
++            [str(QEMU), "-machine", "q35", "-S", "-m", "128M",
++             "-display", "none", "-monitor", "none", "-serial", "none",
++             "-device", "pcie-root-port,id=rp", "-device", device],
++            env=env, stdout=logfile, stderr=subprocess.STDOUT)
++        mappings = []
++        try:
++            if mode not in ("normal", "legacy"):
++                proc.wait(timeout=6)
++                assert proc.returncode != 0, mode
++                logfile.seek(0)
++                message = logfile.read()
++                expected = {
++                    "bound": "still bound", "iommu": "identity host IOMMU",
++                    "wrong-class": "not a PCI xHCI", "msi": "MSI/MSI-X",
++                    "dma32": "64-bit DMA", "no-opt-in": "allow-unsafe-xhci",
++                    "bad-runtime": "invalid BAR layout", "not-ready": "not ready",
++                    "bios-owned": "BIOS still owns",
++                }[mode]
++                assert expected in message, message
++                if mode in ("bios-owned", "not-ready"):
++                    physical = (root / XHCI / "resource0").read_bytes()
++                    assert get32(physical, 0x40) == 5  # no USBCMD takeover
++                return
++            files = [(root / path).open("r+b") for path in
++                     ("user", "ctrl", f"{XHCI}/resource0", f"{XHCI}/config")]
++            user = mmap.mmap(files[0].fileno(), 0)
++            ring = mmap.mmap(files[1].fileno(), 65536, offset=RING_OFF)
++            bar = mmap.mmap(files[2].fileno(), 0)
++            pci = mmap.mmap(files[3].fileno(), 0)
++            mappings.extend((user, ring, bar, pci))
++            wait_until(lambda: get32(user, MBX + 0x30) & 3 == 3,
++                       proc, "proxy startup")
++            if mode == "legacy":
++                assert get32(bar, 0x3000) & (1 << 24)
++                assert get32(bar, 0x3004) == 0xe0001100  # reserved bits preserved
++                assert not get32(bar, 0x40) & 5
++            assert struct.unpack_from("<HH", user, ECAM) == (0x1022, 0x43f7)
++            assert get32(user, ECAM + 0xb4) == 0x53435045
++            assert struct.unpack_from("<QQQ", user, ECAM + 0xc0) == (
++                0x80000000, 0x980000000, 0x80000000)
++            assert user[ECAM + 0x70] == 0x10  # PCIe, no MSI capability
++            assert user[ECAM + 0x71] == 0xb0
++            assert user[ECAM + 0x60] == 0x31
++            seq = 1
++
++            def packet(kind, offset, value=0, size=4, cookie=None):
++                nonlocal seq
++                number = cookie if cookie is not None else seq
++                seq += 1
++                strobe = ((1 << size) - 1) << (offset & 7)
++                if kind == 3:
++                    strobe = 0
++                if kind == 1:
++                    strobe = 0xf  # config data uses a 32-bit lane
++                flags = 0x300 | ((7 if kind == 1 else 0) << 16) | (size << 20)
++                flags |= strobe << 24
++                lane_value = value if kind == 1 else value << (8 * (offset & 7))
++                old = get32(user, MBX + 0x3c)
++                wire = struct.pack("<8I", 0x5844504b, kind, flags, 32, number,
++                                   offset, lane_value & 0xffffffff, lane_value >> 32)
++                slot = ((seq - 1) % 128) * 32
++                ring[slot + 8:slot + 32] = wire[8:]
++                ring[slot:slot + 8] = wire[:8]
++                if kind == 1:
++                    wait_until(lambda: get32(user, MBX + 0x10) == number,
++                               proc, "CFG acknowledgement")
++                    return number
++                if kind == 4:
++                    return number
++                wait_until(lambda: get32(user, MBX + 0x38) == number and
++                           get32(user, MBX + 0x3c) != old,
++                           proc, "BAR response")
++                data = get32(user, MBX + 0x34) | (get32(user, MBX + 0x4c) << 32)
++                return number, get32(user, MBX + 0x3c), data >> (8 * (offset & 7))
++
++            packet(1, 0x10, 0x50000004)
++            packet(1, 4, 6)
++            assert not get32(pci, 4) & 4  # MASTER denied without guest DMA ready
++            _, response, _ = packet(2, 0x40, 5)
++            assert response & 3 == 2
++            _, response, _ = packet(2, 0x40, 2)  # reset is permitted
++            assert response & 3 == 0
++            packet(1, 0xbc, 0x444d4150)
++            assert get32(pci, 4) & 4
++            _, response, hcs = packet(3, 4)
++            assert response & 3 == 0 and (hcs >> 8) & 0x7ff == 1
++            _, response, _ = packet(2, 0x58, 0x980001001, size=8)
++            assert response & 3 == 0
++            assert struct.unpack_from("<Q", bar, 0x58)[0] == 0x980001001
++            # Linux xhci_write_64() uses two ordered dword stores, low then high.
++            pointer = 0x9a0002001
++            _, response, _ = packet(2, 0x58, pointer & 0xffffffff)
++            assert response & 3 == 0
++            _, response, _ = packet(2, 0x5c, pointer >> 32)
++            assert response & 3 == 0
++            assert struct.unpack_from("<Q", bar, 0x58)[0] == pointer
++            _, response, low = packet(3, 0x58)
++            assert response & 3 == 0 and low & 0xffffffff == pointer & 0xffffffff
++            _, response, high = packet(3, 0x5c)
++            assert response & 3 == 0 and high & 0xffffffff == pointer >> 32
++            _, response, _ = packet(2, 0x40, 5)
++            assert response & 3 == 0 and get32(bar, 0x40) == 5
++            number, response, _ = packet(2, 0x2004, 0x101)
++            assert response & 8 and get32(bar, 0x2004) == 0
++            packet(4, 0x2004, cookie=number)
++            wait_until(lambda: get32(bar, 0x2004) == 0x101, proc, "doorbell DONE")
++            put32(bar, 0x44, 9)
++            put32(bar, 0x1020, 3)
++            wait_until(lambda: get32(user, MBX + 0x50) == 1, proc, "INTx assertion")
++            packet(1, 4, 0x406)
++            wait_until(lambda: get32(user, MBX + 0x50) == 0, proc, "INTx mask")
++            packet(1, 4, 6)
++            wait_until(lambda: get32(user, MBX + 0x50) == 1, proc, "INTx unmask")
++            # File-backed registers have no hardware W1C; simulate xHC clearing IP.
++            put32(bar, 0x1020, 2)
++            wait_until(lambda: get32(user, MBX + 0x50) == 0, proc, "INTx clear")
++            packet(1, 0xb4, 0)  # firmware metadata is read-only
++            assert get32(user, ECAM + 0xb4) == 0x53435045
++            put32(bar, 0x44, 1)
++            packet(1, 0xbc, 0)
++            assert not get32(pci, 4) & 4 and not get32(bar, 0x40) & 1
++            packet(1, 0xbc, 0x444d4150)
++            assert get32(pci, 4) & 4
++            _, response, _ = packet(2, 0x2008, 0x102)  # no DONE
++            assert response & 8
++            wait_until(lambda: not get32(pci, 4) & 4, proc, "timeout DMA disable")
++            assert get32(bar, 0x2008) == 0
++            packet(1, 4, 6)
++            assert not get32(pci, 4) & 4  # failure cannot be re-enabled by config
++            for handle in files:
++                handle.close()
++        except Exception:
++            logfile.flush()
++            logfile.seek(0)
++            print(logfile.read(), file=sys.stderr)
++            raise
++        finally:
++            if proc.poll() is None:
++                proc.terminate()
++                proc.wait(timeout=6)
++            for mapping in mappings:
++                mapping.close()
++            logfile.close()
++
++
++for case in ("normal", "legacy", "bound", "iommu", "wrong-class", "msi",
++             "dma32", "no-opt-in", "bad-runtime", "not-ready", "bios-owned"):
++    run_case(case)
++    print(f"PASS: {case}")

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "devices": [
+    {
+      "type": "xhci",
+      "real-host-bdf": "0000:03:00.0"
+    }
+  ]
+}

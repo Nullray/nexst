@@ -1,0 +1,548 @@
+diff --git a/arch/riscv/configs/riscv_serve_defconfig b/arch/riscv/configs/riscv_serve_defconfig
+index c22514075878..45027ddf9a74 100644
+--- a/arch/riscv/configs/riscv_serve_defconfig
++++ b/arch/riscv/configs/riscv_serve_defconfig
+@@ -38,6 +38,7 @@ CONFIG_PCI=y
+ CONFIG_PCIEPORTBUS=y
+ CONFIG_PCI_HOST_GENERIC=y
+ CONFIG_PCIE_XDMA_PL=y
++CONFIG_SCOPE_PCIE_P2P_DMA=y
+ CONFIG_DEVTMPFS=y
+ CONFIG_DEVTMPFS_MOUNT=y
+ CONFIG_BLK_DEV_LOOP=y
+@@ -56,6 +57,15 @@ CONFIG_IXGBE=y
+ CONFIG_R8169=y
+ CONFIG_MICROSEMI_PHY=y
+ CONFIG_INPUT_MOUSEDEV=y
++CONFIG_INPUT_EVDEV=y
++CONFIG_HID=y
++CONFIG_HID_GENERIC=y
++CONFIG_USB_HID=y
++CONFIG_USB=y
++CONFIG_USB_XHCI_HCD=y
++CONFIG_USB_XHCI_PCI=y
++CONFIG_USB_STORAGE=y
++CONFIG_USB_UAS=y
+ CONFIG_SERIAL_8250=y
+ CONFIG_SERIAL_8250_CONSOLE=y
+ CONFIG_SERIAL_OF_PLATFORM=y
+diff --git a/drivers/pci/Kconfig b/drivers/pci/Kconfig
+index 43e615aa12ff..23fbf91ed272 100644
+--- a/drivers/pci/Kconfig
++++ b/drivers/pci/Kconfig
+@@ -23,6 +23,16 @@ menuconfig PCI
+ 
+ if PCI
+ 
++config SCOPE_PCIE_P2P_DMA
++	bool "SCOPE per-function coherent PCIe P2P DMA window"
++	depends on RISCV && 64BIT
++	help
++	  Read the SCOPE vendor capability describing the host-side FPGA
++	  coherent aperture. Configure DMA address translation for that PCI
++	  function before its driver probes. Currently used for physical xHCI
++	  ownership by XiangShan. Other PCI functions retain their DMA mappings.
++	  Host PCIe P2P routing must be verified separately.
++
+ config PCI_DOMAINS
+ 	bool
+ 	depends on PCI
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index 588588cfda48..d2da07c7ea58 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -22,6 +22,7 @@
+ #include <linux/dma-map-ops.h>
+ #include "pci.h"
+ #include "pcie/portdrv.h"
++#include "scope-p2p-dma.h"
+ 
+ struct pci_dynid {
+ 	struct list_head node;
+@@ -1605,6 +1606,8 @@ static int pci_dma_configure(struct device *dev)
+ 	}
+ 
+ 	pci_put_host_bridge_device(bridge);
++	if (!ret)
++		ret = scope_p2p_dma_configure(to_pci_dev(dev));
+ 	return ret;
+ }
+ 
+diff --git a/drivers/usb/storage/uas.c b/drivers/usb/storage/uas.c
+index a1e472d140d8..7f2944729ecd 100644
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -80,8 +80,6 @@ static int uas_try_complete(struct scsi_cmnd *cmnd, const char *caller);
+ static void uas_free_streams(struct uas_dev_info *devinfo);
+ static void uas_log_cmd_state(struct scsi_cmnd *cmnd, const char *prefix,
+ 				int status);
+-static struct urb *uas_alloc_cmd_urb(struct uas_dev_info *devinfo, gfp_t gfp,
+-					struct scsi_cmnd *cmnd);
+ 
+ /*
+  * This driver needs its own workqueue, as we need to control memory allocation.
+@@ -298,285 +296,18 @@ static bool uas_evaluate_response_iu(struct response_iu *riu, struct scsi_cmnd *
+ 	return response_code == RC_TMF_SUCCEEDED;
+ }
+ 
+-static void dummy_scsi_done(struct scsi_cmnd *cmnd)
+-{
+-	struct uas_cmd_info *cmdinfo = (void *)&cmnd->SCp;
+-	struct uas_dev_info *devinfo = (void *)cmnd->device->hostdata;
+-
+-	devinfo->cmnd[cmdinfo->uas_tag - 1] = NULL;
+-	kfree(scsi_cmd_to_rq(cmnd));
+-	kfree(cmnd);
+-}
+-
+-static void uas_workaround_cmplt(struct urb *urb)
+-{
+-	struct scsi_cmnd *cmnd;
+-	struct uas_cmd_info *cmdinfo;
+-
+-	if ((urb->context != NULL) && (urb->status == 0)) {
+-		cmnd = urb->context;
+-		cmdinfo = (struct uas_cmd_info *)&cmnd->SCp;
+-
+-		if (cmdinfo->data_in_urb != urb)
+-			cmnd->scsi_done(cmnd);
+-	}
+-
+-	usb_free_urb(urb);
+-}
+-
+-static struct urb *uas_workaround_cmnd(struct uas_dev_info *devinfo, gfp_t gfp,
+-				       struct scsi_cmnd *cmnd)
+-{
+-	struct scsi_device *sdev = cmnd->device;
+-	struct urb *urb;
+-	int err;
+-
+-	urb = uas_alloc_cmd_urb(devinfo, gfp, cmnd);
+-	if (!urb) {
+-		shost_printk(KERN_INFO, sdev->host,
+-			"%s: Failed to allocate cmnd URB\n", __func__);
+-		return NULL;
+-	}
+-
+-	err = usb_submit_urb(urb, gfp);
+-	if (err) {
+-		shost_printk(KERN_INFO, sdev->host,
+-			"%s: Failed to submit cmd, err=%d\n", __func__, err);
+-		goto free;
+-	}
+-	usb_anchor_urb(urb, &devinfo->cmd_urbs);
+-	return urb;
+-
+-free:
+-	usb_free_urb(urb);
+-	return NULL;
+-
+-}
+-
+-static struct urb *uas_workaround_data(struct uas_dev_info *devinfo, gfp_t gfp,
+-				       struct scsi_cmnd *cmnd)
+-{
+-	struct scsi_device *sdev = cmnd->device;
+-	struct usb_device *udev = devinfo->udev;
+-	struct uas_cmd_info *cmdinfo = (void *)&cmnd->SCp;
+-	struct urb *urb = usb_alloc_urb(0, gfp);
+-	struct scsi_data_buffer *sdb = NULL;
+-	void *temp_buf;
+-	unsigned int pipe;
+-	int err;
+-
+-	if (!urb) {
+-		shost_printk(KERN_INFO, sdev->host,
+-			"%s: Failed to allocate URB\n", __func__);
+-		return NULL;
+-	}
+-
+-	cmdinfo->data_in_urb = urb;
+-	sdb = &cmnd->sdb;
+-	pipe = devinfo->data_in_pipe;
+-	temp_buf = kzalloc(sdb->length, GFP_ATOMIC);
+-	if (!temp_buf) {
+-		shost_printk(KERN_INFO, sdev->host,
+-			"%s: Failed to allocate memory\n", __func__);
+-		goto free;
+-	}
+-
+-	usb_fill_bulk_urb(urb, udev, pipe, temp_buf, sdb->length,
+-			  uas_workaround_cmplt, cmnd);
+-	if (devinfo->use_streams)
+-		urb->stream_id = cmdinfo->uas_tag;
+-	urb->transfer_flags |= URB_FREE_BUFFER;
+-	err = usb_submit_urb(urb, GFP_ATOMIC);
+-	if (err) {
+-		shost_printk(KERN_INFO, sdev->host,
+-			"%s: Failed to submit Data In urb, err = %d\n",
+-			__func__, err);
+-		goto free;
+-	}
+-
+-	usb_anchor_urb(urb, &devinfo->data_urbs);
+-	return urb;
+-
+-free:
+-	usb_free_urb(urb);
+-	return NULL;
+-}
+-
+-static struct urb *uas_workaround_sense(struct uas_dev_info *devinfo, gfp_t gfp,
+-				       struct scsi_cmnd *cmnd)
+-{
+-	struct scsi_device *sdev = cmnd->device;
+-	struct usb_device *udev = devinfo->udev;
+-	struct uas_cmd_info *cmdinfo = (void *)&cmnd->SCp;
+-	struct urb *urb = usb_alloc_urb(0, gfp);
+-	struct sense_iu *iu;
+-	int err;
+-
+-	if (!urb) {
+-		shost_printk(KERN_INFO, sdev->host,
+-			"%s: Failed to allocate URB\n", __func__);
+-		return NULL;
+-	}
+-
+-	iu = kzalloc(sizeof(*iu), gfp);
+-	if (!iu) {
+-		shost_printk(KERN_INFO, sdev->host,
+-			"%s: Failed to allocate memory for sense_iu\n",
+-			__func__);
+-		goto free;
+-	}
+-
+-	usb_fill_bulk_urb(urb, udev, devinfo->status_pipe, iu, sizeof(*iu),
+-			  uas_workaround_cmplt, cmnd);
+-	if (devinfo->use_streams)
+-		urb->stream_id = cmdinfo->uas_tag;
+-	urb->transfer_flags |= URB_FREE_BUFFER;
+-	err = usb_submit_urb(urb, GFP_ATOMIC);
+-	if (err) {
+-		shost_printk(KERN_INFO, sdev->host,
+-			"%s: Failed to submit Sense urb, err = %d\n",
+-			__func__, err);
+-		goto free;
+-	}
+-	usb_anchor_urb(urb, &devinfo->sense_urbs);
+-	return urb;
+-
+-free:
+-	usb_free_urb(urb);
+-	return NULL;
+-}
+-
+-/*
+- * This function is called only if the DATA IN stream timer expired, which
+- * means xhci host controller has failed to process the TRB's present in the
+- * stream ring. As a part of recovery sequence, this function re-submits the
+- * previous stopped urb on which xhci failed to process data and along with
+- * that urb it prepares & submits sense, data and cmnd urb with scsi command
+- * set to standard inquiry request containing the next free stream id tag.
+- * Doing so will make the xhci start processing the previous stopped urb
+- * along with the urb that has standard inquiry scsi command.
+- */
+-static int uas_workaround(struct urb *urb)
+-{
+-	struct scsi_cmnd *cmnd = urb->context;
+-	struct scsi_device *sdev = cmnd->device;
+-	struct uas_dev_info *devinfo = (void *)cmnd->device->hostdata;
+-	struct scsi_cmnd *temp_cmnd;
+-	struct uas_cmd_info *temp_cmdinfo;
+-	struct urb *sense_urb, *data_urb, *cmnd_urb;
+-	struct request *temp_request;
+-	unsigned int idx;
+-	int err;
+-	char inquiry[16] = { 0x12, 0x0, 0x0, 0x0, 0x10, 0x0, 0x0, 0x0,
+-				0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 };
+-
+-
+-	/* Find a free uas-tag */
+-	for (idx = 0; idx < devinfo->qdepth; idx++) {
+-		if (!devinfo->cmnd[idx])
+-			break;
+-	}
+-
+-	if (idx == devinfo->qdepth) {
+-		shost_printk(KERN_INFO, sdev->host,
+-			"%s: Failed to find free tag\n", __func__);
+-		err = -EINVAL;
+-		goto free;
+-	}
+-
+-	/* Create a scsi_cmnd and send dummy inquiry data on the next
+-	 * available tag
+-	 */
+-	temp_cmnd = kzalloc(sizeof(struct scsi_cmnd), GFP_ATOMIC);
+-	if (!temp_cmnd) {
+-		shost_printk(KERN_INFO, sdev->host,
+-			"%s: Failed to allocate memory for scsi_cmnd\n",
+-			__func__);
+-		err = -ENOMEM;
+-		goto free;
+-	}
+-
+-	temp_request = kzalloc(sizeof(struct request), GFP_ATOMIC);
+-	if (!temp_cmnd) {
+-		shost_printk(KERN_INFO, sdev->host,
+-			"%s: Failed to allocate memory for request\n",
+-			__func__);
+-		err = -ENOMEM;
+-		goto free;
+-	}
+-
+-	temp_cmnd->device = cmnd->device;
+-	temp_cmnd->cmnd = inquiry;
+-	temp_cmnd->cmd_len = 16;
+-	temp_cmnd->sdb.length = 0x10;
+-	temp_cmnd->scsi_done = dummy_scsi_done;
+-	temp_request->tag = idx;
+-
+-	temp_cmdinfo = (struct uas_cmd_info *)&temp_cmnd->SCp;
+-	memset(temp_cmdinfo, 0, sizeof(struct uas_cmd_info));
+-
+-	temp_cmdinfo->uas_tag = idx + 1;
+-	devinfo->cmnd[idx] = temp_cmnd;
+-
+-	/* Submit previously stopped URB first */
+-	err = usb_submit_urb(urb, GFP_ATOMIC);
+-	if (err) {
+-		shost_printk(KERN_INFO, sdev->host,
+-			"%s: submit err %d\n", __func__, err);
+-		kfree(temp_cmnd);
+-		kfree(temp_request);
+-		goto free;
+-	}
+-	usb_anchor_urb(urb, &devinfo->data_urbs);
+-
+-	/* Allocate and submit SENSE urb for next available tag */
+-	sense_urb = uas_workaround_sense(devinfo, GFP_ATOMIC, temp_cmnd);
+-	if (!sense_urb) {
+-		kfree(temp_request);
+-		kfree(temp_cmnd);
+-		goto free;
+-	}
+-
+-	/* Allocate and submit DATA IN urb for next available tag */
+-	data_urb = uas_workaround_data(devinfo, GFP_ATOMIC, temp_cmnd);
+-	if (!data_urb) {
+-		/* Kill previously allocated sense urb */
+-		sense_urb->context = NULL;
+-		usb_kill_urb(sense_urb);
+-		usb_put_urb(sense_urb);
+-		kfree(temp_request);
+-		kfree(temp_cmnd);
+-		goto free;
+-	}
+-
+-	/* Allocate and submit CMND urb with dummy inquiry data */
+-	cmnd_urb = uas_workaround_cmnd(devinfo, GFP_ATOMIC, temp_cmnd);
+-	if (!cmnd_urb) {
+-		/* Kill previously allocated data urb */
+-		data_urb->context = NULL;
+-		usb_kill_urb(data_urb);
+-		usb_put_urb(data_urb);
+-		kfree(temp_request);
+-		kfree(temp_cmnd);
+-	}
+-
+-free:
+-	return err;
+-}
+-
+ static void uas_stat_cmplt(struct urb *urb)
+ {
+ 	struct iu *iu = urb->transfer_buffer;
+-	struct scsi_cmnd *cmnd = (struct scsi_cmnd *)urb->context;
+-	struct uas_dev_info *devinfo =
+-				(struct uas_dev_info *)cmnd->device->hostdata;
++	struct Scsi_Host *shost = urb->context;
++	struct uas_dev_info *devinfo = (struct uas_dev_info *)shost->hostdata;
+ 	struct urb *data_in_urb = NULL;
+ 	struct urb *data_out_urb = NULL;
++	struct scsi_cmnd *cmnd;
+ 	struct uas_cmd_info *cmdinfo;
+ 	unsigned long flags;
+ 	unsigned int idx;
+ 	int status = urb->status;
+-	int err;
+ 	bool success;
+ 
+ 	spin_lock_irqsave(&devinfo->lock, flags);
+@@ -585,21 +316,6 @@ static void uas_stat_cmplt(struct urb *urb)
+ 		goto out;
+ 
+ 	if (status) {
+-		if (status  == -EAGAIN) {
+-			/* We get here only if the xhci stream timer expires,
+-			 * call uas_workaround() with this urb as argument.
+-			 */
+-			err = uas_workaround(urb);
+-			if (err != 0) {
+-				dev_err(&urb->dev->dev,
+-					"%s: uas_workaround() failed, err=%d\n",
+-					__func__, err);
+-				goto out;
+-			}
+-			spin_unlock_irqrestore(&devinfo->lock, flags);
+-			return;
+-		}
+-
+ 		if (status != -ENOENT && status != -ECONNRESET && status != -ESHUTDOWN)
+ 			dev_err(&urb->dev->dev, "stat urb: status %d\n", status);
+ 		goto out;
+@@ -682,27 +398,10 @@ static void uas_data_cmplt(struct urb *urb)
+ 	struct uas_dev_info *devinfo = (void *)cmnd->device->hostdata;
+ 	struct scsi_data_buffer *sdb = &cmnd->sdb;
+ 	unsigned long flags;
+-	int err;
+ 	int status = urb->status;
+ 
+ 	spin_lock_irqsave(&devinfo->lock, flags);
+ 
+-	if ((status  == -EAGAIN) && (!devinfo->resetting) &&
+-					(cmdinfo->data_in_urb == urb)) {
+-		/* We get here only if the xhci stream timer expires,
+-		 * call uas_workaround() with this urb as argument.
+-		 */
+-		err = uas_workaround(urb);
+-		if (err != 0) {
+-			dev_err(&urb->dev->dev,
+-				"%s: uas_workaround() failed, err=%d\n",
+-				__func__, err);
+-			goto out;
+-		}
+-		spin_unlock_irqrestore(&devinfo->lock, flags);
+-		return;
+-	}
+-
+ 	if (cmdinfo->data_in_urb == urb) {
+ 		cmdinfo->state &= ~DATA_IN_URB_INFLIGHT;
+ 		cmdinfo->data_in_urb = NULL;
+@@ -781,7 +480,7 @@ static struct urb *uas_alloc_sense_urb(struct uas_dev_info *devinfo, gfp_t gfp,
+ 		goto free;
+ 
+ 	usb_fill_bulk_urb(urb, udev, devinfo->status_pipe, iu, sizeof(*iu),
+-			  uas_stat_cmplt, cmnd);
++			  uas_stat_cmplt, cmnd->device->host);
+ 	if (devinfo->use_streams)
+ 		urb->stream_id = cmdinfo->uas_tag;
+ 	urb->transfer_flags |= URB_FREE_BUFFER;
+diff --git a/drivers/pci/scope-p2p-dma.h b/drivers/pci/scope-p2p-dma.h
+new file mode 100644
+index 000000000000..55e635d6ab46
+--- /dev/null
++++ b/drivers/pci/scope-p2p-dma.h
+@@ -0,0 +1,111 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Firmware DMA description for a SCOPE physical xHCI endpoint. */
++#ifndef _PCI_SCOPE_P2P_DMA_H
++#define _PCI_SCOPE_P2P_DMA_H
++
++#include <linux/dma-direct.h>
++
++#define SCOPE_P2P_CAP_LEN   40
++#define SCOPE_P2P_SIGNATURE 0x53435045U
++#define SCOPE_P2P_READY     0x444d4150U
++
++struct scope_p2p_dma_state {
++	struct pci_dev *pdev;
++	const struct bus_dma_region *old_map;
++	u64 old_limit;
++	int cap;
++	struct bus_dma_region map[2];
++};
++
++static void scope_p2p_dma_release(void *data)
++{
++	struct scope_p2p_dma_state *state = data;
++
++	/* Driver remove has already stopped xHC and freed its DMA allocations. */
++	pci_write_config_dword(state->pdev, state->cap + 12, 0);
++	state->pdev->dev.dma_range_map = state->old_map;
++	state->pdev->dev.bus_dma_limit = state->old_limit;
++}
++
++static int scope_p2p_read64(struct pci_dev *pdev, int where, u64 *value)
++{
++	u32 lo, hi;
++
++	if (pci_read_config_dword(pdev, where, &lo) ||
++	    pci_read_config_dword(pdev, where + 4, &hi))
++		return -EIO;
++	*value = lo | ((u64)hi << 32);
++	return 0;
++}
++
++static int scope_p2p_dma_configure(struct pci_dev *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct scope_p2p_dma_state *state;
++	u64 cpu, bus, size;
++	u32 signature, flags, ready;
++	u8 len, version;
++	int cap, ret, count = 0;
++
++	cap = pci_find_capability(pdev, PCI_CAP_ID_VNDR);
++	while (cap && count++ < 48) {
++		if (pci_read_config_dword(pdev, cap + 4, &signature))
++			return -EIO;
++		if (signature == SCOPE_P2P_SIGNATURE)
++			break;
++		cap = pci_find_next_capability(pdev, cap, PCI_CAP_ID_VNDR);
++	}
++	if (count > 48)
++		return -EINVAL;
++	if (!cap)
++		return 0;
++	if (!IS_ENABLED(CONFIG_SCOPE_PCIE_P2P_DMA)) {
++		dev_err(dev, "SCOPE xHCI requires CONFIG_SCOPE_PCIE_P2P_DMA\n");
++		return -EOPNOTSUPP;
++	}
++	if (pdev->class != PCI_CLASS_SERIAL_USB_XHCI ||
++	    pci_read_config_byte(pdev, cap + 2, &len) ||
++	    pci_read_config_byte(pdev, cap + 3, &version) ||
++	    pci_read_config_dword(pdev, cap + 8, &flags) ||
++	    len != SCOPE_P2P_CAP_LEN || version != 1 || flags != 3 ||
++	    cap + len > PCI_CFG_SPACE_SIZE || get_dma_ops(dev)) {
++		dev_err(dev, "invalid SCOPE capability or non-direct DMA ops\n");
++		return -EINVAL;
++	}
++	if (scope_p2p_read64(pdev, cap + 16, &cpu) ||
++	    scope_p2p_read64(pdev, cap + 24, &bus) ||
++	    scope_p2p_read64(pdev, cap + 32, &size))
++		return -EIO;
++	if (!size || cpu > U64_MAX - size || bus > U64_MAX - size ||
++	    ((cpu | bus | size) & (PAGE_SIZE - 1)) ||
++	    cpu > PFN_PHYS(min_low_pfn) || cpu + size < PFN_PHYS(max_pfn)) {
++		dev_err(dev, "SCOPE DMA aperture does not cover guest RAM\n");
++		return -EINVAL;
++	}
++	state = devm_kzalloc(dev, sizeof(*state), GFP_KERNEL);
++	if (!state)
++		return -ENOMEM;
++	state->pdev = pdev;
++	state->old_map = dev->dma_range_map;
++	state->old_limit = dev->bus_dma_limit;
++	state->cap = cap;
++	state->map[0].cpu_start = cpu;
++	state->map[0].dma_start = bus;
++	state->map[0].size = size;
++	state->map[0].offset = cpu - bus;
++	dev->dma_range_map = state->map;
++	dev->bus_dma_limit = bus + size - 1;
++	ret = devm_add_action_or_reset(dev, scope_p2p_dma_release, state);
++	if (ret)
++		return ret;
++	/* The host refuses bus mastering/RUN until it sees this acknowledgement. */
++	if (pci_write_config_dword(pdev, cap + 12, SCOPE_P2P_READY) ||
++	    pci_read_config_dword(pdev, cap + 12, &ready) ||
++	    ready != SCOPE_P2P_READY)
++		return -EIO;
++	dev_info(dev, "SCOPE coherent P2P DMA: CPU %#llx -> bus %#llx, size %#llx\n",
++		 cpu, bus, size);
++	return 0;
++}
++
++#endif
