@@ -163,3 +163,5 @@ If you want to generate the device tree blob that specifies the PCIe root port, 
     ```sh
     sudo ./load_and_run.sh xdma<N>
     ```
+
+[Nanhu-G 主机外设接入与独立软件构建](doc/NANHU_G_HOST_PERIPHERALS.md)（沿用现有 SCOPE 硬件与网卡）。

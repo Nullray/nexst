@@ -3,6 +3,8 @@
 
 # Independent repositories
 /qemu-mount/
+/build/
+**/__pycache__/
 
 # Vivado and generated FPGA projects
 /.gen/
