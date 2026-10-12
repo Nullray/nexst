@@ -3,12 +3,14 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/../.." && pwd)
 qemu_root="$repo_root/qemu-mount"
 baseline=6a30be82ace2bb045fc75ab1a8815e8f56dd9ba5
+published=ca732b08d6fa2805c0fc81d56d295690155e3003
 if [[ ! -d "$qemu_root/.git" ]]; then
     git clone --no-checkout https://github.com/Nullray/qemu.git "$qemu_root"
-    git -C "$qemu_root" checkout --detach "$baseline"
+    git -C "$qemu_root" checkout --detach "$published"
 fi
-if [[ $(git -C "$qemu_root" rev-parse HEAD) != "$baseline" ]]; then
-    echo "Unsupported QEMU baseline; expected $baseline" >&2
+current=$(git -C "$qemu_root" rev-parse HEAD)
+if [[ "$current" != "$baseline" && "$current" != "$published" ]]; then
+    echo "Unsupported QEMU revision; expected $published or original baseline $baseline" >&2
     exit 1
 fi
 patch_file="$repo_root/tools/host/patches/qemu-host-proxy.patch"

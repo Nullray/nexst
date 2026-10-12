@@ -120,6 +120,10 @@ bash tools/build_nanhu_host_software.sh
 QEMU 独立仓库仍位于 `qemu-mount/`；原 USB 功能相对 QEMU 基线的补丁已导出到
 `tools/host/patches/qemu-host-proxy.patch`。`bootstrap.sh` 可识别补丁已存在，
 避免重复应用，也不会改写已有网卡后端。
+QEMU 实现已提交到公开仓库
+[Nullray/qemu 的 feature/nanhu-g-host-nic-usb 分支](https://github.com/Nullray/qemu/tree/feature/nanhu-g-host-nic-usb)，
+锁定提交 `ca732b08d6fa2805c0fc81d56d295690155e3003`。新 checkout 的恢复脚本直接
+使用该提交，也兼容原 `6a30be82ace2bb045fc75ab1a8815e8f56dd9ba5` 基线加保存的补丁。
 Linux 和 XDMA 的对应补丁位于 `tools/guest/patches/`；完整固件构建会先核对并
 恢复 Linux USB 补丁。恢复不会切换依赖版本，遇到不同基线或冲突会明确退出。
 

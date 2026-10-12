@@ -95,5 +95,10 @@
     "tools/testing/selftests/powerpc/stringloops/strlen_32.S",
     "tools/testing/selftests/powerpc/vphn/asm/lppaca.h",
     "tools/testing/selftests/powerpc/vphn/vphn.c"
-  ]
+  ],
+  "published_qemu": {
+    "repository": "https://github.com/Nullray/qemu",
+    "branch": "feature/nanhu-g-host-nic-usb",
+    "commit": "ca732b08d6fa2805c0fc81d56d295690155e3003"
+  }
 }
