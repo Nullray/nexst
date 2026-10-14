@@ -33,9 +33,13 @@ run() {
 }
 prefix=${CROSS_COMPILE:-riscv64-linux-gnu-}
 jobs=${JOBS:-8}
-flags=(-C "$kernel" "O=$out/linux" ARCH=riscv "CROSS_COMPILE=$prefix")
+# New binutils requires CSR/fence extensions to be explicit for this 5.16 tree.
+# The kernel Makefile still removes fd from C flags and retains it for assembly.
+flags=(-C "$kernel" "O=$out/linux" ARCH=riscv "CROSS_COMPILE=$prefix"
+    riscv-march-y=rv64imafdc_zicsr_zifencei)
 run bash "$repo_root/tools/guest/bootstrap.sh" --kernel-only
 run python3 "$repo_root/tools/guest/install_pci_dma.py" "$kernel"
+run python3 "$repo_root/tools/guest/install_xhci_start_fix.py" "$kernel"
 run python3 "$repo_root/tools/guest/prepare_initramfs.py" --output "$out/initramfs.txt"
 run make "${flags[@]}" riscv_serve_defconfig
 run env "KCONFIG_CONFIG=$out/linux/.config" bash "$kernel/scripts/kconfig/merge_config.sh" \

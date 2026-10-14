@@ -20,6 +20,23 @@ def install(kernel):
     driver_path = directory / "pci-driver.c"
     kconfig_path = directory / "Kconfig"
     header_path = directory / "scope-p2p-dma.h"
+    mm_init_path = kernel / "arch/riscv/mm/init.c"
+    mm_init = mm_init_path.read_text() if mm_init_path.is_file() else None
+    if mm_init is not None:
+        # This Nanhu kernel initializes phys_ram_base only for RV32, but
+        # derives min_low_pfn from it on RV64 too.  Preserve the actual DRAM
+        # lower bound so the per-device DMA coverage check remains strict.
+        old = ('\tphys_ram_end = memblock_end_of_DRAM();\n'
+               '#ifndef CONFIG_64BIT\n#ifndef CONFIG_XIP_KERNEL\n'
+               '\tphys_ram_base = memblock_start_of_DRAM();\n#endif\n')
+        new = ('\tphys_ram_end = memblock_end_of_DRAM();\n'
+               '#ifndef CONFIG_XIP_KERNEL\n'
+               '\tphys_ram_base = memblock_start_of_DRAM();\n#endif\n'
+               '#ifndef CONFIG_64BIT\n')
+        if old in mm_init:
+            if mm_init.count(old) != 1:
+                raise ValueError("ambiguous RISC-V boot memory initialization")
+            mm_init = mm_init.replace(old, new)
     driver, kconfig = driver_path.read_text(), kconfig_path.read_text()
     header = (Path(__file__).parent / "include/scope-p2p-dma.h").read_text()
     match = re.search(r"static int pci_dma_configure\(struct device \*dev\)\n\{.*?\n\}",
@@ -48,6 +65,8 @@ def install(kernel):
     driver_path.write_text(driver)
     kconfig_path.write_text(kconfig)
     header_path.write_text(header)
+    if mm_init is not None and mm_init_path.read_text() != mm_init:
+        mm_init_path.write_text(mm_init)
     print(f"Installed SCOPE PCI DMA helper: {kernel}")
 
 

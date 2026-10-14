@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import stat
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -23,9 +24,48 @@ def module(name, path):
 CONFIG = module("usb_config", "tools/host/add_usb_backend.py")
 LAUNCH = module("launch", "tools/host/run_host_proxy.py")
 RAMFS = module("ramfs", "tools/guest/prepare_initramfs.py")
+INSTALL = module("install", "tools/guest/install_pci_dma.py")
 
 
 class IntegrationChecks(unittest.TestCase):
+    def test_rv64_dma_ram_bounds_and_repeat_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            kernel = Path(directory)
+            pci = kernel / "drivers/pci"
+            pci.mkdir(parents=True)
+            (pci / "pci-driver.c").write_text(
+                '#include "pci.h"\nstatic int pci_dma_configure(struct device *dev)\n'
+                '{\n\tint ret = 0;\n\treturn ret;\n}\n')
+            (pci / "Kconfig").write_text('if PCI\nendif\n')
+            mm = kernel / "arch/riscv/mm/init.c"
+            mm.parent.mkdir(parents=True)
+            mm.write_text('\tphys_ram_end = memblock_end_of_DRAM();\n'
+                          '#ifndef CONFIG_64BIT\n#ifndef CONFIG_XIP_KERNEL\n'
+                          '\tphys_ram_base = memblock_start_of_DRAM();\n#endif\n'
+                          '#endif\n'
+                          '\tmin_low_pfn = phys_ram_base >> 12;\n'
+                          '\tmax_pfn = phys_ram_end >> 12;\n')
+            def bounds():
+                source = kernel / 'bounds.c'
+                source.write_text('#include <stdio.h>\n#define CONFIG_64BIT 1\n'
+                                  'static unsigned long memblock_start_of_DRAM(void) '
+                                  '{ return 0x80000000UL; }\n'
+                                  'static unsigned long memblock_end_of_DRAM(void) '
+                                  '{ return 0x100000000UL; }\n'
+                                  'int main(void) { unsigned long phys_ram_base = 0, '
+                                  'phys_ram_end, min_low_pfn, max_pfn;\n' + mm.read_text() +
+                                  'printf("%lx %lx\\n", min_low_pfn << 12, max_pfn << 12); }\n')
+                binary = kernel / 'bounds'
+                subprocess.run(['cc', str(source), '-o', str(binary)], check=True)
+                return subprocess.check_output([str(binary)], text=True).strip()
+            self.assertEqual(bounds(), '0 100000000')
+            INSTALL.install(kernel)
+            self.assertEqual(bounds(), '80000000 100000000')
+            before = {p: p.read_bytes() for p in [mm, pci / 'pci-driver.c',
+                                                  pci / 'Kconfig', pci / 'scope-p2p-dma.h']}
+            INSTALL.install(kernel)
+            self.assertEqual(before, {p: p.read_bytes() for p in before})
+
     def test_existing_configs_preserved(self):
         for path in sorted(ROOT.glob("vswitch-backends*.json")):
             config = json.loads(path.read_text())
@@ -47,6 +87,9 @@ class IntegrationChecks(unittest.TestCase):
         for group in ("unchanged_qemu", "unchanged_hardware"):
             for name, digest in manifest[group].items():
                 self.assertEqual(hashlib.sha256((ROOT / name).read_bytes()).hexdigest(), digest)
+        for name, record in manifest.get("modified_qemu", {}).items():
+            self.assertEqual(hashlib.sha256((ROOT / name).read_bytes()).hexdigest(),
+                             record["current_sha256"])
 
     def test_launch_uses_original_transport(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -90,6 +133,24 @@ class IntegrationChecks(unittest.TestCase):
             self.assertIn(str(rootfs), relocated)
             with self.assertRaises(ValueError):
                 RAMFS.relocate(manifest.replace("busybox", "missing"), rootfs)
+
+    def test_usb_console_uses_tracked_inputs_instead_of_missing_copied_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rootfs = Path(directory)
+            manifest = ("dir /etc 755 0 0\n"
+                        "file /init /old/nexst/nanhu-g/software/rootfs/initramfs/init 755 0 0\n"
+                        "file /etc/inittab /old/nexst/nanhu-g/software/rootfs/initramfs/etc/inittab 664 0 0\n")
+            result = RAMFS.relocate(RAMFS.usb_console_inputs(manifest), rootfs)
+            self.assertNotIn("/old/nexst", result)
+            inputs = {fields[1]: Path(fields[2]) for line in result.splitlines()
+                      if (fields := line.split())[0] == "file"}
+            init = inputs["/init"].read_text()
+            self.assertIn("exec </dev/hvc0 >/dev/hvc0 2>&1", init)
+            self.assertIn("exec /bin/busybox init", init)
+            self.assertIn("hvc0::respawn:-/bin/ash", inputs["/etc/inittab"].read_text())
+            subprocess.run(["sh", "-n", str(inputs["/init"])], check=True)
+            with self.assertRaises(ValueError):
+                RAMFS.usb_console_inputs(manifest + manifest)
 
 
 if __name__ == "__main__":

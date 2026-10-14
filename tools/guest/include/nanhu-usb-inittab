@@ -1,0 +1,2 @@
+hvc0::respawn:-/bin/ash
+::shutdown:/bin/sync

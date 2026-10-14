@@ -1,5 +1,7 @@
 # B650 USB 与香山物理 xHCI 接管
 
+**server48 当前实验入口：** 复制到 `/home/yanjiarun/nexst_usb` 与 `/home/yanjiarun/qemu_usb` 后，按 [USB 实验 Runbook](USB_EXPERIMENT_RUNBOOK_ZH.md) 启动。该文档已按 maxiangyu 的实际 history 更新路径、启动顺序、镜像及停机步骤。本机目标为 `2a:00.0` 的 NM37 和 `c2:00.0` 的 B650；下面 2026-10-11 的其他主机 BDF 与状态属于历史记录。
+
 更新时间：2026-10-11。实现分支：`usb-b650-xhci`。
 
 ## 目标及结论

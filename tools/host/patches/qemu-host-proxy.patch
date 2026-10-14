@@ -1,5 +1,17 @@
+diff --git a/.gitignore b/.gitignore
+index 558ebe33827639eb69de8842ffb033a22cf69779..35cff81d4f1b01da41766c50bc58f149183c2207 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -30,6 +30,7 @@ GTAGS
+ *.bak
+ 
+ # Local SCOPE proxy snapshots and experiments
++/build-nanhu-host/
+ /hw/misc/* copy.c
+ /hw/misc/*.pre_*.c
+ /hw/misc/*_[0-9][0-9][0-9][0-9][0-9][0-9].c
 diff --git a/hw/misc/scope_fpga_vswitch.c b/hw/misc/scope_fpga_vswitch.c
-index de110aa..a0bb11f 100644
+index de110aa2ccfb7e66b09150331378c4d70fe6b1c5..a0bb11f44bfe2a7c0d184393b6c88f8ab56082a3 100644
 --- a/hw/misc/scope_fpga_vswitch.c
 +++ b/hw/misc/scope_fpga_vswitch.c
 @@ -331,6 +331,7 @@ typedef enum ScopeBackendType {
@@ -122,12 +134,13 @@ index de110aa..a0bb11f 100644
  };
 diff --git a/hw/misc/scope_fpga_vswitch_xhci_backend.c b/hw/misc/scope_fpga_vswitch_xhci_backend.c
 new file mode 100644
-index 0000000..685791e
+index 0000000000000000000000000000000000000000..241637cfb17e0b00b8e4b17fa4cd1bd669b3fee8
 --- /dev/null
 +++ b/hw/misc/scope_fpga_vswitch_xhci_backend.c
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,530 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/* Physical xHCI ownership. Included by scope_fpga_vswitch.c. */
++#include "qemu/error-report.h"
 +
 +#define SCOPE_XHCI_DMA_CAP       0xb0U
 +#define SCOPE_XHCI_DMA_CAP_LEN   40U
@@ -139,6 +152,8 @@ index 0000000..685791e
 +#define SCOPE_XHCI_INTE          (1U << 2)
 +#define SCOPE_XHCI_HCH           (1U << 0)
 +#define SCOPE_XHCI_EINT          (1U << 3)
++#define SCOPE_XHCI_HSE           (1U << 2)
++#define SCOPE_XHCI_HCE           (1U << 12)
 +#define SCOPE_XHCI_CNR           (1U << 11)
 +
 +struct ScopeXhciState {
@@ -269,9 +284,24 @@ index 0000000..685791e
 +    return true;
 +}
 +
-+static void scope_xhci_fail(ScopeProxyState *s)
++static void scope_xhci_fail(ScopeProxyState *s, const char *reason)
 +{
 +    ScopeBackend *be = s->active;
++    ScopeXhciState *x = be->xhci;
++
++    /* Failures must be visible even without -d guest_errors. Preserve the
++     * pending request's identity before clearing it for shutdown.
++     */
++    if (!x->failed) {
++        error_report("SCOPE xhci: backend=%u host=%s %s; "
++                     "pending=%d seq=%u off=0x%x elapsed_us=%" PRId64
++                     "; disabling physical DMA",
++                     be->id, be->real_host_bdf, reason,
++                     x->doorbell_pending, x->pending_doorbell.seq,
++                     x->pending_doorbell.bar_offset,
++                     x->doorbell_pending ?
++                         g_get_monotonic_time() - x->doorbell_since_us : 0);
++    }
 +
 +    be->xhci->failed = true;
 +    be->xhci->doorbell_pending = false;
@@ -279,8 +309,7 @@ index 0000000..685791e
 +    be->intx_pending = false;
 +    if (!scope_xhci_set_pci_command(be, PCI_COMMAND_MEMORY |
 +                                      PCI_COMMAND_INTX_DISABLE)) {
-+        qemu_log_mask(LOG_GUEST_ERROR,
-+                      "SCOPE xhci: failed to disable physical bus master\n");
++        error_report("SCOPE xhci: failed to disable physical bus master");
 +    }
 +}
 +
@@ -458,7 +487,7 @@ index 0000000..685791e
 +        Error *err = NULL;
 +        if (!scope_xhci_halt(s, &err)) {
 +            error_report_err(err);
-+            x->failed = true;
++            scope_xhci_fail(s, "physical controller did not halt");
 +        }
 +        x->doorbell_pending = false;
 +    }
@@ -466,9 +495,7 @@ index 0000000..685791e
 +        command &= ~PCI_COMMAND_MASTER;
 +    }
 +    if (!scope_xhci_set_pci_command(be, command)) {
-+        qemu_log_mask(LOG_GUEST_ERROR,
-+                      "SCOPE xhci: physical PCI command failed\n");
-+        scope_xhci_fail(s);
++        scope_xhci_fail(s, "physical PCI command failed");
 +        command &= ~PCI_COMMAND_MASTER;
 +    }
 +    x->dma_ready = ready;
@@ -501,14 +528,23 @@ index 0000000..685791e
 +    bool ok = false;
 +
 +    if (pkt->type == SCOPE_PKT_TYPE_BAR_WRITE_DONE) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "SCOPE xhci: DONE backend=%u seq=%u off=0x%x "
++                      "pending=%d expected_seq=%u expected_off=0x%x\n",
++                      s->active->id, pkt->seq, pkt->bar_offset,
++                      x->doorbell_pending, x->pending_doorbell.seq,
++                      x->pending_doorbell.bar_offset);
 +        if (x->doorbell_pending && pkt->seq == x->pending_doorbell.seq &&
 +            pkt->bar_offset == x->pending_doorbell.bar_offset) {
-+            x->doorbell_pending = false;
 +            if (!x->dma_ready || !x->bus_master ||
 +                !scope_xhci_commit_write(s, &x->pending_doorbell)) {
-+                scope_xhci_fail(s);
++                scope_xhci_fail(s, "deferred physical doorbell failed");
++            } else {
++                x->doorbell_pending = false;
 +                qemu_log_mask(LOG_GUEST_ERROR,
-+                              "SCOPE xhci: deferred physical doorbell failed\n");
++                              "SCOPE xhci: doorbell committed backend=%u "
++                              "seq=%u off=0x%x\n",
++                              s->active->id, pkt->seq, pkt->bar_offset);
 +            }
 +        }
 +        return;
@@ -533,7 +569,15 @@ index 0000000..685791e
 +                    x->doorbell_pending = true;
 +                    x->doorbell_since_us = g_get_monotonic_time();
 +                    /* Same ordering handshake used by the local NVMe path. */
-+                    scope_write_bar_response(s, pkt->seq, 0, 0, false, true);
++                    qemu_log_mask(LOG_GUEST_ERROR,
++                                  "SCOPE xhci: waiting for DONE backend=%u "
++                                  "seq=%u off=0x%x value=0x%x\n",
++                                  s->active->id, pkt->seq, pkt->bar_offset,
++                                  scope_extract_dword32(value, pkt->bar_offset));
++                    if (!scope_write_bar_response(s, pkt->seq, 0, 0,
++                                                  false, true)) {
++                        scope_xhci_fail(s, "doorbell acknowledgement failed");
++                    }
 +                    return;
 +                }
 +            } else {
@@ -546,6 +590,12 @@ index 0000000..685791e
 +            ok = scope_real_bar_write(s, pkt->bar_offset, value, strobe, size);
 +        }
 +    }
++    qemu_log_mask(LOG_GUEST_ERROR,
++                  "SCOPE xhci: BAR %s backend=%u seq=%u off=0x%x size=%u "
++                  "resp=%u data=0x%" PRIx64 " failed=%d\n",
++                  read ? "read" : "write", s->active->id, pkt->seq,
++                  pkt->bar_offset, size, ok ? 0 : 2,
++                  read ? data : value, x->failed);
 +    scope_write_bar_response(s, pkt->seq, ok ? 0 : 2,
 +                             read ? data : 0, read, false);
 +}
@@ -558,18 +608,26 @@ index 0000000..685791e
 +        &s->vcfg[SCOPE_VSWITCH_EP_SLOT(s->active->id)];
 +
 +    if (x->doorbell_pending && now_us - x->doorbell_since_us > 1000000) {
-+        scope_xhci_fail(s);
-+        qemu_log_mask(LOG_GUEST_ERROR,
-+                      "SCOPE xhci: timed out waiting for BAR_WRITE_DONE\n");
++        scope_xhci_fail(s, "timed out waiting for BAR_WRITE_DONE");
 +    }
 +
++    /* A stopped xHC may retain EINT/IP during guest initialization.  Do not
++     * turn those into a virtual interrupt storm before the guest starts it.
++     * Hardware errors must still reach the driver even if the xHC halted
++     * itself and cleared RUN.  Leave event/interrupt status for guest ACKs.
++     */
 +    s->active->intx_pending = !x->failed && x->dma_ready && x->bus_master &&
 +        !(lduw_le_p(fn->config + PCI_COMMAND) & PCI_COMMAND_INTX_DISABLE) &&
 +        scope_real_bar_read32(s, x->operational, &command) &&
++        command != UINT32_MAX &&
 +        (command & SCOPE_XHCI_INTE) &&
 +        scope_real_bar_read32(s, x->operational + 4, &status) &&
++        status != UINT32_MAX &&
++        (((command & SCOPE_XHCI_RS) && !(status & SCOPE_XHCI_HCH)) ||
++         (status & (SCOPE_XHCI_HSE | SCOPE_XHCI_HCE))) &&
 +        (status & SCOPE_XHCI_EINT) &&
 +        scope_real_bar_read32(s, x->runtime + 0x20, &iman) &&
++        iman != UINT32_MAX &&
 +        ((iman & 3U) == 3U);
 +    return false;
 +}
@@ -612,7 +670,7 @@ index 0000000..685791e
 +};
 diff --git a/tests/scope-usb/fake-xdma.c b/tests/scope-usb/fake-xdma.c
 new file mode 100644
-index 0000000..4648c10
+index 0000000000000000000000000000000000000000..4648c10c34e5805c7d52e9ee86763d079b191ff9
 --- /dev/null
 +++ b/tests/scope-usb/fake-xdma.c
 @@ -0,0 +1,87 @@
@@ -705,7 +763,7 @@ index 0000000..4648c10
 +}
 diff --git a/tests/scope-usb/run.sh b/tests/scope-usb/run.sh
 new file mode 100755
-index 0000000..59e804e
+index 0000000000000000000000000000000000000000..59e804e38a1b410ed3629bed1e97df840d9ae971
 --- /dev/null
 +++ b/tests/scope-usb/run.sh
 @@ -0,0 +1,22 @@
@@ -733,7 +791,7 @@ index 0000000..59e804e
 +done
 diff --git a/tests/scope-usb/test-dma-window.c b/tests/scope-usb/test-dma-window.c
 new file mode 100644
-index 0000000..51acd91
+index 0000000000000000000000000000000000000000..51acd919cd93f9d50716d020c6d1992254e7ce03
 --- /dev/null
 +++ b/tests/scope-usb/test-dma-window.c
 @@ -0,0 +1,165 @@
@@ -904,10 +962,10 @@ index 0000000..51acd91
 +}
 diff --git a/tests/scope-usb/test-physical-xhci.py b/tests/scope-usb/test-physical-xhci.py
 new file mode 100755
-index 0000000..3a7d36b
+index 0000000000000000000000000000000000000000..d50046a7197356d505b09b255575e97334324738
 --- /dev/null
 +++ b/tests/scope-usb/test-physical-xhci.py
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,338 @@
 +#!/usr/bin/env python3
 +"""Exercise production scope-fpga-vswitch against file-backed PCI/XDMA I/O.
 +
@@ -917,6 +975,7 @@ index 0000000..3a7d36b
 +import mmap
 +import os
 +from pathlib import Path
++import signal
 +import struct
 +import subprocess
 +import sys
@@ -1018,8 +1077,9 @@ index 0000000..3a7d36b
 +             "-device", "pcie-root-port,id=rp", "-device", device],
 +            env=env, stdout=logfile, stderr=subprocess.STDOUT)
 +        mappings = []
++        files = []
 +        try:
-+            if mode not in ("normal", "legacy"):
++            if mode not in ("normal", "legacy", "single-slot", "packet-ring"):
 +                proc.wait(timeout=6)
 +                assert proc.returncode != 0, mode
 +                logfile.seek(0)
@@ -1058,7 +1118,7 @@ index 0000000..3a7d36b
 +            assert user[ECAM + 0x60] == 0x31
 +            seq = 1
 +
-+            def packet(kind, offset, value=0, size=4, cookie=None):
++            def packet(kind, offset, value=0, size=4, cookie=None, wait=True):
 +                nonlocal seq
 +                number = cookie if cookie is not None else seq
 +                seq += 1
@@ -1073,9 +1133,16 @@ index 0000000..3a7d36b
 +                old = get32(user, MBX + 0x3c)
 +                wire = struct.pack("<8I", 0x5844504b, kind, flags, 32, number,
 +                                   offset, lane_value & 0xffffffff, lane_value >> 32)
-+                slot = ((seq - 1) % 128) * 32
++                # The old cyclic XDMA setup has one descriptor, so each TLAST
++                # reuses slot zero. The fixed setup gives every packet a
++                # separate 64-byte descriptor (C2H minimum buffer length).
++                slot = (0 if mode == "single-slot" else
++                        ((seq - 1) % 1024) * 64 if mode == "packet-ring" else
++                        ((seq - 1) % 128) * 32)
 +                ring[slot + 8:slot + 32] = wire[8:]
 +                ring[slot:slot + 8] = wire[:8]
++                if not wait:
++                    return number
 +                if kind == 1:
 +                    wait_until(lambda: get32(user, MBX + 0x10) == number,
 +                               proc, "CFG acknowledgement")
@@ -1119,13 +1186,58 @@ index 0000000..3a7d36b
 +            assert response & 8 and get32(bar, 0x2004) == 0
 +            packet(4, 0x2004, cookie=number)
 +            wait_until(lambda: get32(bar, 0x2004) == 0x101, proc, "doorbell DONE")
++            # Pending port events must not interrupt an unstarted controller,
++            # including the transient RUN=0/HCHalted=0 state during stopping.
++            packet(2, 0x40, 4)
++            put32(bar, 0x44, 8)
++            put32(bar, 0x1020, 3)
++
++            def assert_no_intx(description):
++                deadline = time.monotonic() + 0.03
++                while time.monotonic() < deadline:
++                    assert get32(user, MBX + 0x50) == 0, description
++                    assert proc.poll() is None
++                    time.sleep(0.001)
++
++            assert_no_intx("RUN=0 with pending port event")
 +            put32(bar, 0x44, 9)
++            packet(2, 0x40, 5)
++            assert_no_intx("RUN=1 while physical HCHalted is still set")
++            # Preserve genuine error reporting when hardware halts itself.
++            packet(2, 0x40, 4)
++            for error in (1 << 2, 1 << 12):
++                put32(bar, 0x44, 9 | error)
++                wait_until(lambda: get32(user, MBX + 0x50) == 1,
++                           proc, "halted controller error interrupt")
++                put32(bar, 0x44, 9)
++                wait_until(lambda: get32(user, MBX + 0x50) == 0,
++                           proc, "error interrupt cleared")
++            # An inaccessible BAR reads as all ones, not a valid error IRQ.
++            for register in (0x40, 0x44, 0x1020):
++                put32(bar, 0x1020, 2)
++                wait_until(lambda: get32(user, MBX + 0x50) == 0,
++                           proc, "interrupter temporarily masked")
++                put32(bar, 0x44, 8)
++                packet(2, 0x40, 5)
++                put32(bar, register, 0xffffffff)
++                if register != 0x1020:
++                    put32(bar, 0x1020, 3)
++                assert_no_intx(f"inaccessible register {register:#x}")
++            put32(bar, 0x1020, 2)
++            put32(bar, 0x44, 8)
++            packet(2, 0x40, 5)
 +            put32(bar, 0x1020, 3)
 +            wait_until(lambda: get32(user, MBX + 0x50) == 1, proc, "INTx assertion")
 +            packet(1, 4, 0x406)
 +            wait_until(lambda: get32(user, MBX + 0x50) == 0, proc, "INTx mask")
 +            packet(1, 4, 6)
 +            wait_until(lambda: get32(user, MBX + 0x50) == 1, proc, "INTx unmask")
++            packet(2, 0x40, 4)
++            wait_until(lambda: get32(user, MBX + 0x50) == 0,
++                       proc, "stopping controller deasserts INTx")
++            packet(2, 0x40, 5)
++            wait_until(lambda: get32(user, MBX + 0x50) == 1,
++                       proc, "restarting controller preserves pending event")
 +            # File-backed registers have no hardware W1C; simulate xHC clearing IP.
 +            put32(bar, 0x1020, 2)
 +            wait_until(lambda: get32(user, MBX + 0x50) == 0, proc, "INTx clear")
@@ -1136,14 +1248,42 @@ index 0000000..3a7d36b
 +            assert not get32(pci, 4) & 4 and not get32(bar, 0x40) & 1
 +            packet(1, 0xbc, 0x444d4150)
 +            assert get32(pci, 4) & 4
-+            _, response, _ = packet(2, 0x2008, 0x102)  # no DONE
++            number, response, _ = packet(2, 0x2008, 0x102)
 +            assert response & 8
++            if mode in ("single-slot", "packet-ring"):
++                # Pause only this file-backed QEMU, then publish the hardware
++                # order DONE -> readback before its polling thread resumes.
++                # This makes loss in the single-descriptor layout deterministic.
++                proc.send_signal(signal.SIGSTOP)
++                _, stopped = os.waitpid(proc.pid, os.WUNTRACED)
++                assert os.WIFSTOPPED(stopped)
++                try:
++                    packet(4, 0x2008, cookie=number)
++                    read_number = packet(3, 0x2008, wait=False)
++                finally:
++                    proc.send_signal(signal.SIGCONT)
++                wait_until(lambda: get32(user, MBX + 0x38) == read_number,
++                           proc, "back-to-back doorbell readback")
++                if mode == "packet-ring":
++                    wait_until(lambda: get32(bar, 0x2008) == 0x102,
++                               proc, "retained DONE commits physical doorbell")
++                    assert get32(pci, 4) & 4
++                    return
++            # Missing or overwritten DONE must stop DMA without ringing xHC.
 +            wait_until(lambda: not get32(pci, 4) & 4, proc, "timeout DMA disable")
 +            assert get32(bar, 0x2008) == 0
++            logfile.seek(0)
++            failure_log = logfile.read()
++            assert "timed out waiting for BAR_WRITE_DONE" in failure_log
++            assert "off=0x2008" in failure_log and "disabling physical DMA" in failure_log
 +            packet(1, 4, 6)
 +            assert not get32(pci, 4) & 4  # failure cannot be re-enabled by config
-+            for handle in files:
-+                handle.close()
++            _, response, hcs = packet(3, 4)
++            assert response & 3 == 2 and hcs & 0xffffffff == 0xffffffff
++            assert hcs & 0xff == 255  # guest's misleading MaxSlots diagnostic
++            _, response, crcr = packet(3, 0x58, size=8)
++            assert response & 3 == 2 and crcr == 0xffffffffffffffff
++            assert get32(bar, 4) & 0xff == 32  # physical xHC is still accessible
 +        except Exception:
 +            logfile.flush()
 +            logfile.seek(0)
@@ -1155,10 +1295,12 @@ index 0000000..3a7d36b
 +                proc.wait(timeout=6)
 +            for mapping in mappings:
 +                mapping.close()
++            for handle in files:
++                handle.close()
 +            logfile.close()
 +
 +
-+for case in ("normal", "legacy", "bound", "iommu", "wrong-class", "msi",
++for case in ("normal", "legacy", "single-slot", "packet-ring", "bound", "iommu", "wrong-class", "msi",
 +             "dma32", "no-opt-in", "bad-runtime", "not-ready", "bios-owned"):
 +    run_case(case)
 +    print(f"PASS: {case}")

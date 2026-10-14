@@ -1,0 +1,106 @@
+diff --git a/XDMA/linux-kernel/xdma/cdev_ctrl.c b/XDMA/linux-kernel/xdma/cdev_ctrl.c
+index d4711beab611143918a40004ff174e6c84a39290..71dcbbbe208f1904eea4188531add806c029400b 100644
+--- a/XDMA/linux-kernel/xdma/cdev_ctrl.c
++++ b/XDMA/linux-kernel/xdma/cdev_ctrl.c
+@@ -30,6 +30,7 @@
+ // ------------------------------------
+ 
+ #include "cdev_ctrl.h"
++#include "nexst_dma32_ring.h"
+ 
+ 
+ 
+@@ -317,8 +318,6 @@
+                 struct xdma_engine *engine;
+                 struct xdma_transfer *transfer;
+                 int num_desc;
+-                int i;
+-                int max_len = 4 * 1024 * 1024; // 4MB
+                 void *desc_virt;
+                 dma_addr_t desc_bus;
+                 u64 tmp_sys_dma_mask = dev->dma_mask ? *dev->dma_mask : 0;
+@@ -327,8 +326,11 @@
+                 if (xdev->c2h_channel_max <= 1) break;
+                 engine = &xdev->engine_c2h[1];
+ 
+-                num_desc = size / max_len;
+-                if (size % max_len != 0) num_desc++;
++                /* One descriptor per TLAST packet. A single 64 KiB cyclic
++                 * descriptor restarts at offset zero for every packet and
++                 * loses unacknowledged BAR_WRITE_DONE messages.
++                 */
++                num_desc = size / NEXST_PROXY_RX_SLOT_BYTES;
+ 
+                 if (dev->dma_mask)
+                         dma_set_mask(dev, DMA_BIT_MASK(32));
+@@ -353,17 +355,7 @@
+                 transfer->desc_virt = desc_virt;
+                 transfer->desc_bus = desc_bus;
+ 
+-                transfer_desc_init(transfer, num_desc);
+-
+-                for (i = 0; i < num_desc; i++) {
+-                        struct xdma_desc *desc = transfer->desc_virt + i;
+-                        dma_addr_t rc_bus_addr = dma_addr + i * max_len;
+-                        int desc_len = (i == num_desc - 1) ? (size - i * max_len) : max_len;
+-                        xdma_desc_set(desc, rc_bus_addr, 0, desc_len, engine->dir);
+-                }
+-
+-                xdma_desc_control_set(transfer->desc_virt, 0); // Disable Stop and Interrupts
+-                xdma_desc_link(transfer->desc_virt + num_desc - 1, transfer->desc_virt, transfer->desc_bus);
++                nexst_dma32_ring_init(transfer, dma_addr);
+                 transfer->cyclic = 1;
+ 
+ #if HAS_SWAKE_UP
+@@ -384,7 +376,8 @@
+ 		}
+ 
+ 		g_c2h_cyclic_transfer = transfer;
+-		pr_info("NexST proxy cyclic DMA started on C2H channel 1!\n");
++		pr_info("NexST proxy cyclic DMA started on C2H channel 1: %d slots, %u bytes/slot!\n",
++			num_desc, NEXST_PROXY_RX_SLOT_BYTES);
+         } while(0);
+         // ----------------------------------------------
+ 
+diff --git a/XDMA/linux-kernel/xdma/nexst_dma32_ring.h b/XDMA/linux-kernel/xdma/nexst_dma32_ring.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4c27031b2457ea3b063315a3b9484c6437bd806
+--- /dev/null
++++ b/XDMA/linux-kernel/xdma/nexst_dma32_ring.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef NEXST_DMA32_RING_H
++#define NEXST_DMA32_RING_H
++
++/* The proxy sends a 32-byte AXI-Stream packet with TLAST. PG195 requires
++ * C2H descriptor buffers to have a length divisible by 64. TLAST closes
++ * the current descriptor, even if its buffer has unused space.
++ */
++#define NEXST_PROXY_PACKET_BYTES 32U
++#define NEXST_PROXY_RX_SLOT_BYTES 64U
++
++/* transfer_desc_init/xdma_desc_set/xdma_desc_link are supplied by libxdma.
++ * Keep C2H metadata inside the unused half of each slot, never at address 0.
++ * QEMU scans 32-byte records and ignores the metadata's different magic.
++ */
++static inline void nexst_dma32_ring_init(struct xdma_transfer *transfer,
++				       dma_addr_t buffer_bus)
++{
++	int i;
++
++	transfer_desc_init(transfer, transfer->desc_num);
++	for (i = 0; i < transfer->desc_num; i++) {
++		dma_addr_t slot_bus = buffer_bus +
++			(size_t)i * NEXST_PROXY_RX_SLOT_BYTES;
++
++		xdma_desc_set(transfer->desc_virt + i, slot_bus,
++			      slot_bus + NEXST_PROXY_PACKET_BYTES,
++			      NEXST_PROXY_RX_SLOT_BYTES, transfer->dir);
++		/* No stop or completion interrupts on the polling ring. */
++		xdma_desc_control_set(transfer->desc_virt + i, 0);
++	}
++	xdma_desc_link(transfer->desc_virt + transfer->desc_num - 1,
++		       transfer->desc_virt, transfer->desc_bus);
++}
++
++#endif

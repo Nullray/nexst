@@ -3,6 +3,10 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/../.." && pwd)
 qemu_binary=${1:-$repo_root/qemu-mount/build-nanhu-host/qemu-system-x86_64}
 python3 "$repo_root/tests/host-proxy/test-tools.py"
+python3 "$repo_root/tests/host-proxy/test-xhci-start.py"
+python3 "$repo_root/tests/host-proxy/test-p2p-probe.py"
+python3 "$repo_root/tests/host-proxy/test-dma32-ring.py"
+python3 "$repo_root/tests/host-proxy/test-driver-switch.py"
 bash "$repo_root/qemu-mount/tests/scope-usb/run.sh" "$qemu_binary"
 test_dir=$(mktemp -d)
 trap 'rm -rf "$test_dir"' EXIT

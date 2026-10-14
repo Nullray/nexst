@@ -43,8 +43,7 @@
   "unchanged_qemu": {
     "qemu-mount/hw/misc/scope_fpga_vswitch.c": "c826fd489d4a329c9b3df0df21db5c59230c7ab5fa53013ed0eb6844e1556543",
     "qemu-mount/hw/misc/scope_fpga_vswitch_igb_backend.c": "40fc21dd72259f1c84548e1c27a40945fe40aeffe31b5fe46a8cd2811c4a790c",
-    "qemu-mount/hw/misc/scope_fpga_vswitch_ixgbe_backend.c": "5db1b0c7141e0cbbd6ce8fa39993fc9648f1738c896e1e7b06b8cbc19eaa0ac0",
-    "qemu-mount/hw/misc/scope_fpga_vswitch_xhci_backend.c": "9f43d86ad9298fc547338b7efdb7203a704b82bc0d33054a88b664775e649843"
+    "qemu-mount/hw/misc/scope_fpga_vswitch_ixgbe_backend.c": "5db1b0c7141e0cbbd6ce8fa39993fc9648f1738c896e1e7b06b8cbc19eaa0ac0"
   },
   "unchanged_hardware": {
     "nanhu-g/fpga/wrapper/proto.tcl": "fec98d90ddcfeb26e80c14cb05bdfebfce7939cdb2bad299cc043df62663de13",
@@ -99,6 +98,14 @@
   "published_qemu": {
     "repository": "https://github.com/Nullray/qemu",
     "branch": "feature/nanhu-g-host-nic-usb",
-    "commit": "ca732b08d6fa2805c0fc81d56d295690155e3003"
+    "commit": "bbc8bbb7c1c7a2963a7e274f0ba1ad0df2e7c916",
+    "previous_commit": "ca732b08d6fa2805c0fc81d56d295690155e3003"
+  },
+  "modified_qemu": {
+    "qemu-mount/hw/misc/scope_fpga_vswitch_xhci_backend.c": {
+      "original_sha256": "9f43d86ad9298fc547338b7efdb7203a704b82bc0d33054a88b664775e649843",
+      "current_sha256": "d5659073e88c6f28fe9fa7eb4aca8cb46777fa8751f4f9672ffa93ec7ab0cd2f",
+      "reason": "2026-10-13/14: gate ordinary legacy INTx by RUN/HCHalted, reject all-ones reads, preserve HSE/HCE interrupts, report failed doorbell/DMA shutdown causes, and trace DONE/commit ordering; no proxy event/status ACK"
+    }
   }
 }
