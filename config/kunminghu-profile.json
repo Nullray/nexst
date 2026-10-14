@@ -1,6 +1,6 @@
 {
   "cpu_kind": "kunminghu",
-  "num_cores": 2,
+  "num_cores": 1,
   "config": "FpgaDefaultConfig",
   "board": "uvhs2",
   "upstream_main_commit": "8137ac2a299a354ba10acc89c731af90b6d8c8cb",

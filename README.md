@@ -1,4 +1,4 @@
-默认硬件配置：**普通双核 Kunminghu，VP1902 / UVHS2**（由 `config/kunminghu-profile.json` 固定）。
+默认硬件配置：**普通单核 Kunminghu，VP1902 / UVHS2**（由 `config/kunminghu-profile.json` 固定）。
 
 本目录是独立的普通昆明湖单/双核 **QDMA slave bridge 主机缓冲区** 实现。
 两版使用 `kunminghu` / `FpgaDefaultConfig`，保留 Nanhu 双 BAR SCOPE 前端，并接通 CPU coherent DMA。

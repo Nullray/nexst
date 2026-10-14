@@ -148,14 +148,7 @@ module xstop_wrapper (
 
     assign trace_mstatus = 64'b0;
   assign trace_valid = 3'b0;
-  wire [1:0] core_halt;
-  wire [1:0] core_critical_error;
-  assign riscv_halt = &core_halt;
-  assign riscv_critical_error = |core_critical_error;
-
 XSTop xstop (
-    .nmi_1_0(1'b0),
-    .nmi_1_1(1'b0),
     .nmi_0_0(1'b0),
     .nmi_0_1(1'b0),
     .dma_awready(dma_awready),
@@ -309,12 +302,9 @@ XSTop xstop (
     .io_cacheable_check_resp_1_instr(),
     .io_cacheable_check_resp_1_mmio(),
     .io_cacheable_check_resp_1_atomic(),
-    .io_riscv_halt_0(core_halt[0]),
-    .io_riscv_halt_1(core_halt[1]),
-    .io_riscv_critical_error_0(core_critical_error[0]),
-    .io_riscv_critical_error_1(core_critical_error[1]),
+    .io_riscv_halt_0(riscv_halt),
+    .io_riscv_critical_error_0(riscv_critical_error),
     .io_riscv_rst_vec_0(rst_vec),
-    .io_riscv_rst_vec_1(rst_vec),
     .io_traceCoreInterface_0_fromEncoder_enable(1'b0),
     .io_traceCoreInterface_0_fromEncoder_stall(1'b0),
     .io_traceCoreInterface_0_toEncoder_cause(trace_cause),
@@ -323,16 +313,7 @@ XSTop xstop (
     .io_traceCoreInterface_0_toEncoder_iaddr(trace_iaddr),
     .io_traceCoreInterface_0_toEncoder_itype(trace_itype),
     .io_traceCoreInterface_0_toEncoder_iretire(trace_iretire),
-    .io_traceCoreInterface_0_toEncoder_ilastsize(trace_ilastsize),
-    .io_traceCoreInterface_1_fromEncoder_enable(1'b0),
-    .io_traceCoreInterface_1_fromEncoder_stall(1'b0),
-    .io_traceCoreInterface_1_toEncoder_cause(),
-    .io_traceCoreInterface_1_toEncoder_tval(),
-    .io_traceCoreInterface_1_toEncoder_priv(),
-    .io_traceCoreInterface_1_toEncoder_iaddr(),
-    .io_traceCoreInterface_1_toEncoder_itype(),
-    .io_traceCoreInterface_1_toEncoder_iretire(),
-    .io_traceCoreInterface_1_toEncoder_ilastsize()
+    .io_traceCoreInterface_0_toEncoder_ilastsize(trace_ilastsize)
   );
 
 endmodule
