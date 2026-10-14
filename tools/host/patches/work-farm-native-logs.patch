@@ -1,0 +1,22 @@
+diff --git a/fpga/Makefile b/fpga/Makefile
+index 2fe7583..b08f21d 100755
+--- a/fpga/Makefile
++++ b/fpga/Makefile
+@@ -32,7 +32,16 @@ VIVADO_LOG_LOC := $(VIVADO_OUT)/$(TARGET_DIR)/run_log
+ 
+ DIR_GEN_OBJ := $(VIVADO_PRJ_LOC) $(VIVADO_LOG_LOC)
+ 
+-VIVADO_PRJ_FLAGS := -nojournal -nolog -mode $(VIVADO_MODE) \
++ifneq ($(strip $(VIVADO_NATIVE_LOG_DIR)),)
++VIVADO_NATIVE_LOG_LOC := $(VIVADO_NATIVE_LOG_DIR)/$(TARGET_DIR)
++DIR_GEN_OBJ += $(VIVADO_NATIVE_LOG_LOC)
++VIVADO_LOG_FLAGS := -log "$(VIVADO_NATIVE_LOG_LOC)/$(FPGA_ACT).vivado.log" \
++	-journal "$(VIVADO_NATIVE_LOG_LOC)/$(FPGA_ACT).vivado.jou"
++else
++VIVADO_LOG_FLAGS := -nojournal -nolog
++endif
++
++VIVADO_PRJ_FLAGS := $(VIVADO_LOG_FLAGS) -mode $(VIVADO_MODE) \
+ 	-source $(VIVADO_PRJ_TCL) -notrace \
+ 	-tclargs $(FPGA_ACT) "$(FPGA_VAL)" $(O) $(FPGA_BD) "$(TARGET_LOC) $(TARGET_PRJ) $(TARGET_DESIGN)"
+ 

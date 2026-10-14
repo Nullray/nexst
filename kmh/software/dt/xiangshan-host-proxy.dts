@@ -1,0 +1,37 @@
+#define SCOPE_HOST_PROXY 1
+#include "xiangshan.dts"
+
+/* Single-core bring-up profile matching the proto wrapper, not a new ISA list. */
+&cpu0 {
+    mmu-type = "riscv,sv48";
+};
+&mem {
+    reg = <0x0 0x80000000 0x0 0x80000000>;
+};
+&plic {
+    #address-cells = <0>;
+};
+&cpu0_intc {
+    #address-cells = <0>;
+};
+/ {
+    chosen {
+        bootargs = "earlycon console=ttyUL0";
+        stdout-path = "/soc/serial@40600000";
+    };
+    soc {
+        serial@30000000 {
+            status = "disabled";
+        };
+        serial@40600000 {
+            compatible = "xlnx,opb-uartlite-1.00.b";
+            reg = <0x0 0x40600000 0x0 0x10000>;
+            current-speed = <115200>;
+            clock-frequency = <50000000>;
+            interrupt-parent = <&plic>;
+            interrupts = <4>;
+            xlnx,data-bits = <8>;
+            xlnx,use-parity = <0>;
+        };
+    };
+};

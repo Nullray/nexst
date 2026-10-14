@@ -1,4 +1,18 @@
+默认硬件配置：**普通双核 Kunminghu，VP1902 / UVHS2**（由 `config/kunminghu-profile.json` 固定）。
+
+本目录是独立的普通昆明湖单/双核 **QDMA slave bridge 主机缓冲区** 实现。
+两版使用 `kunminghu` / `FpgaDefaultConfig`，保留 Nanhu 双 BAR SCOPE 前端，并接通 CPU coherent DMA。
+
+- GitHub 两版分支与克隆构建：[GITHUB_KUNMINGHU_BRANCHES.md](doc/GITHUB_KUNMINGHU_BRANCHES.md)。
+- 本地软件、镜像及日志：[LOCAL_SOFTWARE_RUN.md](doc/LOCAL_SOFTWARE_RUN.md)。
+- 41 后台构建与总日志：[NODE41_BUILD_RUN.md](doc/NODE41_BUILD_RUN.md)。
+- 软硬件实现、软件编译和运行：[KUNMINGHU_SCOPE_BRIDGE_IMPLEMENTATION.md](doc/KUNMINGHU_SCOPE_BRIDGE_IMPLEMENTATION.md)。
+- 主机 buffer / SCB1 ABI：[QDMA_HOST_BUFFER.md](doc/QDMA_HOST_BUFFER.md)。
+
 # NEXST with Kunminghu core
+
+旧 XSAI 与 C2H completion 的设计记录保留作历史参考；当前实现以以上三份文档为准。
+硬件连线、仿真及软件编译通过不等同于真实 B210 或手机 4G/5G 接入已验证。
 
 ## Prerequisites 环境要求
 

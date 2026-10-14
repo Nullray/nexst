@@ -1,0 +1,10 @@
+{
+  "cpu_kind": "kunminghu",
+  "num_cores": 2,
+  "config": "FpgaDefaultConfig",
+  "board": "uvhs2",
+  "upstream_main_commit": "8137ac2a299a354ba10acc89c731af90b6d8c8cb",
+  "cpu_commit": "4bbdccbb077840af5e1b65c7138d31af3966f625",
+  "cpu_repository": "https://github.com/OpenXiangShan/XiangShan.git",
+  "work_farm_commit": "42d3d45e76d8331d5a89ace8355f7abdfb348fe5"
+}

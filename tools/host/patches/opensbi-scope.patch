@@ -1,0 +1,63 @@
+diff --git a/platform/ict/core/kunminghu_scope.mk b/platform/ict/core/kunminghu_scope.mk
+new file mode 100644
+index 0000000..5791599
+--- /dev/null
++++ b/platform/ict/core/kunminghu_scope.mk
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: BSD-2-Clause
++# Native ordinary Kunminghu: 64 external IRQs, one BEU per hart and L3 IRQ.
++SCOPE_PLIC_SOURCES ?= $(shell expr 65 + $(HART_COUNT))
++platform-genflags-y += -DSERVE_CLINT_ADDR=0x38000000
++platform-genflags-y += -DSERVE_PLIC_ADDR=0x3c000000
++platform-genflags-y += -DSERVE_PLIC_NUM_SOURCES=$(SCOPE_PLIC_SOURCES)
++platform-genflags-y += -DSERVE_PLIC_SIZE=0x4000000
+diff --git a/platform/ict/plat/serve_scope.mk b/platform/ict/plat/serve_scope.mk
+new file mode 100644
+index 0000000..8d8c367
+--- /dev/null
++++ b/platform/ict/plat/serve_scope.mk
+@@ -0,0 +1,21 @@
++#
++# SPDX-License-Identifier: BSD-2-Clause
++#
++# Copyright (c) 2020 Institute of Computing Technology, Chinese Academy of Sciences.
++#
++# Authors:
++#   Yisong Chang <changyisong@ict.ac.cn>
++#
++
++# Blobs to build
++FW_TEXT_START=0x80000000
++FW_PAYLOAD_FDT_ADDR=0x88000000
++
++# platform-specific macro define for platform.c
++platform-genflags-y += -DSERVE_UART0_ADDR=0x40600000 \
++	-DUART_REG_RX_FIFO=0x00 \
++	-DUART_REG_TX_FIFO=0x04 \
++	-DUART_REG_CH_STAT=0x08 \
++	-DUART_TXFIFO_FULL_BIT=3 \
++	-DUART_RXFIFO_VALID_DATA_BIT=0 \
++	-DSERVE_ECALL_EXT=0
+diff --git a/platform/ict/platform.c b/platform/ict/platform.c
+index d2daa0b..631fa29 100644
+--- a/platform/ict/platform.c
++++ b/platform/ict/platform.c
+@@ -46,8 +46,10 @@
+ #define SERVE_HART_COUNT	1
+ #endif
+ 
++#ifndef SERVE_PLIC_SIZE
+ #define SERVE_PLIC_SIZE		(0x200000 + \
+ 					 (SERVE_HART_COUNT * 0x1000))
++#endif
+ #define SERVE_ACLINT_MTIMER_FREQ	10000000
+ #define SERVE_ACLINT_MSWI_ADDR	(SERVE_CLINT_ADDR + \
+ 					 CLINT_MSWI_OFFSET)
+@@ -150,6 +152,6 @@ const struct sbi_platform platform = {
+ 	.features		= SBI_PLATFORM_DEFAULT_FEATURES,
+ 	.hart_count		= SERVE_HART_COUNT,
+ 	.hart_stack_size	= SBI_PLATFORM_DEFAULT_HART_STACK_SIZE,
+-	.heap_size		= SBI_PLATFORM_DEFAULT_HEAP_SIZE(1),
++	.heap_size		= SBI_PLATFORM_DEFAULT_HEAP_SIZE(SERVE_HART_COUNT),
+ 	.platform_ops_addr	= (unsigned long)&platform_ops
+ };

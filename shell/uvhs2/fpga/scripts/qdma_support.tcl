@@ -190,6 +190,7 @@ proc create_hier_cell_qdma_ep_support { parentCell nameHier } {
     CONFIG.AXISTEN_IF_RQ_ALIGNMENT_MODE {DWORD_Aligned} \
     CONFIG.MSI_X_OPTIONS {MSI-X_External} \
     CONFIG.PF0_AER_CAP_ECRC_GEN_AND_CHECK_CAPABLE {false} \
+    CONFIG.pf0_pasid_cap_enabled {false} \
     CONFIG.PF0_DEVICE_ID {B048} \
     CONFIG.PF0_INTERRUPT_PIN {INTA} \
     CONFIG.PF0_LINK_STATUS_SLOT_CLOCK_CONFIG {true} \

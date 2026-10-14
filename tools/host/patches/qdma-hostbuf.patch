@@ -1,0 +1,495 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..7627f69
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,10 @@
++# QDMA kernel build outputs
++/QDMA/linux-kernel/bin/
++/QDMA/linux-kernel/driver/**/*.o
++/QDMA/linux-kernel/driver/**/.*.cmd
++/QDMA/linux-kernel/driver/**/Module.symvers
++/QDMA/linux-kernel/driver/**/modules.order
++/QDMA/linux-kernel/driver/src/*.ko
++/QDMA/linux-kernel/driver/src/*.mod
++/QDMA/linux-kernel/driver/src/*.mod.c
++/QDMA/linux-kernel/driver/src/libqdma
+diff --git a/QDMA/linux-kernel/driver/make_rules/kernel_check.mk b/QDMA/linux-kernel/driver/make_rules/kernel_check.mk
+index 16ee0f9..a0c57f0 100755
+--- a/QDMA/linux-kernel/driver/make_rules/kernel_check.mk
++++ b/QDMA/linux-kernel/driver/make_rules/kernel_check.mk
+@@ -173,6 +173,13 @@ else
+   endif
+ endif
+ modulesymfile ?= $(symverfile)
++ifeq ($(modulesymfile),)
++  # Linux 6.8 no longer uses either of the legacy modpost variable names.
++  ifneq ($(wildcard $(KOBJ)/Module.symvers),)
++    modulesymfile := Module.symvers
++    kernelsymfile := Module.symvers
++  endif
++endif
+ ifeq ($(modulesymfile),)
+   $(warning The parsing of $(KSRC)/scripts/Makefile.modpost \
+             is not making sense.)
+@@ -186,13 +193,17 @@ ifeq ($(shell echo '$(modulesymfile)' | $(grep) -c '^[[:alnum:]_]\+[[:space:]]*:
+   $(shell echo '$$(eval $$(modulesymfile))' > eval.mak)
+   include eval.mak
+ else
+-  modulesymfile =
++  ifneq ($(notdir $(modulesymfile)),Module.symvers)
++    modulesymfile =
++  endif
+ endif
+ ifeq ($(shell echo '$(kernelsymfile)' | $(grep) -c '^[[:alnum:]_]\+[[:space:]]*:\?=[[:space:]]*.\+'),1)
+   $(shell echo '$$(eval $$(kernelsymfile))' > eval.mak)
+   include eval.mak
+ else
+-  kernelsymfile =
++  ifneq ($(notdir $(kernelsymfile)),Module.symvers)
++    kernelsymfile =
++  endif
+ endif
+ modulesymfile := $(notdir $(modulesymfile))
+ kernelsymfile := $(notdir $(kernelsymfile))
+diff --git a/QDMA/linux-kernel/driver/src/Makefile b/QDMA/linux-kernel/driver/src/Makefile
+index bb309d9..8f6be40 100755
+--- a/QDMA/linux-kernel/driver/src/Makefile
++++ b/QDMA/linux-kernel/driver/src/Makefile
+@@ -99,7 +99,7 @@ else
+   override symverfile =
+ endif
+ 
+-DRV_OBJS := nl.o cdev.o qdma_mod.o
++DRV_OBJS := nl.o cdev.o qdma_mod.o scope_qdma_hostbuf.o
+ 
+ LIBQDMA_OBJS := libqdma/qdma_mbox.o libqdma/qdma_intr.o libqdma/qdma_st_c2h.o \
+ 	libqdma/qdma_thread.o libqdma/libqdma_export.o libqdma/qdma_context.o \
+diff --git a/QDMA/linux-kernel/driver/src/qdma_mod.c b/QDMA/linux-kernel/driver/src/qdma_mod.c
+index 4a94f57..ba9fc15 100755
+--- a/QDMA/linux-kernel/driver/src/qdma_mod.c
++++ b/QDMA/linux-kernel/driver/src/qdma_mod.c
+@@ -32,6 +32,7 @@
+ 
+ #include "nl.h"
+ #include "libqdma/xdev.h"
++#include "scope_qdma_hostbuf.h"
+ 
+ /* include early, to verify it depends only on the headers above */
+ #include "version.h"
+@@ -1629,6 +1630,9 @@ static int probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	}
+ 
+ 	dev_set_drvdata(&pdev->dev, xpdev);
++	rv = scope_qdma_hostbuf_init(xpdev);
++	if (rv < 0)
++		dev_warn(&pdev->dev, "SCOPE host notification interface unavailable: %d\n", rv);
+ 
+ 	return 0;
+ 
+@@ -1684,6 +1688,7 @@ static void remove_one(struct pci_dev *pdev)
+ 		sysfs_remove_group(&pdev->dev.kobj, &pci_device_attr_group);
+ 
+ 	qdma_cdev_device_cleanup(&xpdev->cdev_cb);
++	scope_qdma_hostbuf_remove(xpdev);
+ 
+ 	xpdev_device_cleanup(xpdev);
+ 
+diff --git a/QDMA/linux-kernel/driver/src/qdma_mod.h b/QDMA/linux-kernel/driver/src/qdma_mod.h
+index a683909..4067603 100755
+--- a/QDMA/linux-kernel/driver/src/qdma_mod.h
++++ b/QDMA/linux-kernel/driver/src/qdma_mod.h
+@@ -93,6 +93,7 @@ struct xlnx_pci_dev {
+ 	void __iomem *user_bar_regs;	/**< PCIe AXI Master Lite bar */
+ 	void __iomem *bypass_bar_regs;  /**< PCIe AXI Bridge Master bar*/
+ 	struct xlnx_qdata *qdata;	/**< queue data*/
++	struct scope_qdma_hostbuf *scope_hostbuf;
+ };
+ 
+ /*****************************************************************************/
+diff --git a/QDMA/linux-kernel/driver/src/scope_qdma_bridge_uapi.h b/QDMA/linux-kernel/driver/src/scope_qdma_bridge_uapi.h
+new file mode 100644
+index 0000000..162f976
+--- /dev/null
++++ b/QDMA/linux-kernel/driver/src/scope_qdma_bridge_uapi.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef SCOPE_QDMA_BRIDGE_UAPI_H
++#define SCOPE_QDMA_BRIDGE_UAPI_H
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++#define SCOPE_BRIDGE_ABI 1U
++#define SCOPE_BRIDGE_MAGIC 0x53434231U
++#define SCOPE_BRIDGE_CSR_OFFSET 0x240000U
++#define SCOPE_BRIDGE_HEADER_BYTES 64U
++#define SCOPE_BRIDGE_SLOT_BYTES 64U
++#define SCOPE_BRIDGE_PACKET_BYTES 32U
++#define SCOPE_BRIDGE_FEATURE_COHERENT 1U
++#define SCOPE_BRIDGE_FEATURE_FULL_DMA_ADDRESS 2U
++struct scope_bridge_start {
++    __u32 abi;
++    __u32 entries;
++    __u64 reserved;
++};
++struct scope_bridge_info {
++    __u32 abi;
++    __u32 entries;
++    __u32 slot_bytes;
++    __u32 header_bytes;
++    __u32 packet_bytes;
++    __u32 features;
++    __u64 mmap_bytes;
++    __u64 reserved;
++};
++struct scope_bridge_ack { __u32 entries; __u32 reserved; };
++#define SCOPE_BRIDGE_START _IOW('B', 0x70, struct scope_bridge_start)
++#define SCOPE_BRIDGE_INFO _IOR('B', 0x71, struct scope_bridge_info)
++#define SCOPE_BRIDGE_ACK _IOW('B', 0x72, struct scope_bridge_ack)
++#define SCOPE_BRIDGE_ARM _IO('B', 0x73)
++#endif
+diff --git a/QDMA/linux-kernel/driver/src/scope_qdma_hostbuf.c b/QDMA/linux-kernel/driver/src/scope_qdma_hostbuf.c
+new file mode 100644
+index 0000000..a750519
+--- /dev/null
++++ b/QDMA/linux-kernel/driver/src/scope_qdma_hostbuf.c
+@@ -0,0 +1,279 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// SCOPE slave-bridge host RAM ring. No QDMA payload/completion queue is used.
++#include <linux/dma-mapping.h>
++#include <linux/fs.h>
++#include <linux/io.h>
++#include <linux/jiffies.h>
++#include <linux/kref.h>
++#include <linux/miscdevice.h>
++#include <linux/mm.h>
++#include <linux/mutex.h>
++#include <linux/pci.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/delay.h>
++#include <linux/version.h>
++#include <linux/module.h>
++#include "qdma_mod.h"
++#include "scope_qdma_hostbuf.h"
++#include "scope_qdma_bridge_uapi.h"
++
++#define CSR_BASE_LO 0x08
++#define CSR_BASE_HI 0x0c
++#define CSR_ENTRIES 0x10
++#define CSR_CONTROL 0x14
++#define CSR_STATUS 0x18
++#define CSR_FEATURES 0x1c
++#define CSR_CREDITS 0x24
++#define STATUS_DRAINED 2U
++#define STATUS_ERROR 8U
++
++struct scope_qdma_hostbuf {
++    struct miscdevice misc;
++    struct kref ref;
++    struct mutex lock;
++    struct pci_dev *pdev;
++    void __iomem *csr;
++    struct address_space *mapping;
++    void *buffer;
++    dma_addr_t dma;
++    size_t bytes;
++    u32 entries, consumed;
++    bool opened, dead, armed, poisoned;
++    char name[48];
++};
++
++static void scope_free_buffer(struct scope_qdma_hostbuf *s)
++{
++    if (!s->buffer) return;
++    dma_free_coherent(&s->pdev->dev, s->bytes, s->buffer, s->dma);
++    s->buffer = NULL; s->bytes = 0; s->entries = 0;
++}
++
++static void scope_free(struct kref *ref)
++{
++    struct scope_qdma_hostbuf *s = container_of(ref, struct scope_qdma_hostbuf, ref);
++    if (s->buffer) {
++        /* A failed outbound fence cannot prove posted writes have retired.
++         * Preserve this allocation AND its device reference until reboot;
++         * never return possibly DMA-active pages to the host allocator.
++         */
++        dev_err(&s->pdev->dev, "SCOPE DMA fence failed; retaining %zu bytes until reboot\n", s->bytes);
++    } else pci_dev_put(s->pdev);
++    kfree(s);
++}
++
++static int scope_stop(struct scope_qdma_hostbuf *s)
++{
++    unsigned long deadline;
++    u32 status;
++    if (!s->buffer) return 0;
++    writel(0, s->csr + CSR_CONTROL);
++    deadline = jiffies + msecs_to_jiffies(1000);
++    do {
++        status = readl(s->csr + CSR_STATUS);
++        if (status == ~0U || (status & STATUS_ERROR)) break;
++        if (status & STATUS_DRAINED) {
++            s->armed = false;
++            scope_free_buffer(s);
++            return 0;
++        }
++        usleep_range(50, 100);
++    } while (time_before(jiffies, deadline));
++    s->poisoned = true;
++    dev_err(&s->pdev->dev, "SCOPE bridge did not drain; allocation retained until reboot\n");
++    return -EIO;
++}
++
++static int scope_open(struct inode *inode, struct file *file)
++{
++    struct miscdevice *misc = file->private_data;
++    struct scope_qdma_hostbuf *s = container_of(misc, struct scope_qdma_hostbuf, misc);
++    int rv = 0;
++    mutex_lock(&s->lock);
++    if (s->dead) rv = -ENODEV;
++    else if (s->poisoned) rv = -EIO;
++    else if (s->opened) rv = -EBUSY;
++    else {
++        s->opened = true; s->mapping = file->f_mapping;
++        kref_get(&s->ref); file->private_data = s;
++    }
++    mutex_unlock(&s->lock);
++    return rv;
++}
++
++static int scope_release(struct inode *inode, struct file *file)
++{
++    struct scope_qdma_hostbuf *s = file->private_data;
++    // The VMA holds a file reference until the final mapping is gone.
++    mutex_lock(&s->lock);
++    if (!s->dead) scope_stop(s);
++    s->opened = false; s->mapping = NULL;
++    mutex_unlock(&s->lock);
++    kref_put(&s->ref, scope_free);
++    return 0;
++}
++
++static int scope_start(struct scope_qdma_hostbuf *s, struct scope_bridge_start *request)
++{
++    u32 status;
++    int rv;
++    if (request->abi != SCOPE_BRIDGE_ABI || request->reserved ||
++        request->entries < 4 || request->entries > 65536 ||
++        !is_power_of_2(request->entries)) return -EINVAL;
++    if (s->buffer) return -EBUSY;
++    status = readl(s->csr + CSR_STATUS);
++    if (status != STATUS_DRAINED) return -EBUSY;
++    if (!(readl(s->csr + CSR_FEATURES) & SCOPE_BRIDGE_FEATURE_FULL_DMA_ADDRESS))
++        return -EOPNOTSUPP;
++    rv = dma_set_mask_and_coherent(&s->pdev->dev, DMA_BIT_MASK(64));
++    if (rv) return rv;
++    // Enforce ordering/coherence for this PF's outbound notifications.
++    rv = pcie_capability_clear_word(s->pdev, PCI_EXP_DEVCTL,
++                                    PCI_EXP_DEVCTL_RELAX_EN | PCI_EXP_DEVCTL_NOSNOOP_EN);
++    if (rv) return rv;
++    s->bytes = PAGE_ALIGN(SCOPE_BRIDGE_HEADER_BYTES +
++                         (size_t)request->entries * SCOPE_BRIDGE_SLOT_BYTES);
++    s->buffer = dma_alloc_coherent(&s->pdev->dev, s->bytes, &s->dma, GFP_KERNEL);
++    if (!s->buffer) { s->bytes = 0; return -ENOMEM; }
++    s->entries = request->entries; s->consumed = 0;
++    memset(s->buffer, 0, s->bytes);
++    dma_wmb();
++    // dma is an IOVA/bus address for the QDMA PF, not a CPU physical address.
++    writel(lower_32_bits(s->dma), s->csr + CSR_BASE_LO);
++    writel(upper_32_bits(s->dma), s->csr + CSR_BASE_HI);
++    writel(s->entries, s->csr + CSR_ENTRIES);
++    if (readl(s->csr + CSR_BASE_LO) != lower_32_bits(s->dma) ||
++        readl(s->csr + CSR_BASE_HI) != upper_32_bits(s->dma) ||
++        readl(s->csr + CSR_ENTRIES) != s->entries) {
++        scope_free_buffer(s); return -EIO; // ARM was never issued.
++    }
++    pci_set_master(s->pdev);
++    return 0;
++}
++
++static int scope_ack(struct scope_qdma_hostbuf *s, u32 count)
++{
++    u32 producer, pending;
++    if (!s->buffer || !s->armed || !count || count > s->entries) return -EINVAL;
++    producer = le32_to_cpu(READ_ONCE(*(__le32 *)s->buffer));
++    dma_rmb();
++    pending = producer - s->consumed; // unsigned arithmetic also covers wrap.
++    if (pending > s->entries) { s->poisoned = true; writel(0, s->csr + CSR_CONTROL); return -EIO; }
++    if (count > pending) return -EAGAIN;
++    s->consumed += count;
++    writel(count, s->csr + CSR_CREDITS); // one posted write per consumed batch
++    return 0;
++}
++
++static long scope_ioctl(struct file *file, unsigned int command, unsigned long arg)
++{
++    struct scope_qdma_hostbuf *s = file->private_data;
++    struct scope_bridge_start start;
++    struct scope_bridge_info info = {0};
++    struct scope_bridge_ack ack;
++    int rv = 0;
++    mutex_lock(&s->lock);
++    if (s->dead) { rv = -ENODEV; goto out; }
++    if (s->poisoned) { rv = -EIO; goto out; }
++    switch (command) {
++    case SCOPE_BRIDGE_START:
++        if (copy_from_user(&start, (void __user *)arg, sizeof(start))) rv = -EFAULT;
++        else rv = scope_start(s, &start);
++        break;
++    case SCOPE_BRIDGE_INFO:
++        if (!s->buffer) { rv = -ENODEV; break; }
++        info.abi = SCOPE_BRIDGE_ABI; info.entries = s->entries;
++        info.slot_bytes = SCOPE_BRIDGE_SLOT_BYTES; info.header_bytes = SCOPE_BRIDGE_HEADER_BYTES;
++        info.packet_bytes = SCOPE_BRIDGE_PACKET_BYTES;
++        info.features = readl(s->csr + CSR_FEATURES); info.mmap_bytes = s->bytes;
++        if (copy_to_user((void __user *)arg, &info, sizeof(info))) rv = -EFAULT;
++        break;
++    case SCOPE_BRIDGE_ARM:
++        if (!s->buffer || s->armed) { rv = -EINVAL; break; }
++        dma_wmb(); writel(1, s->csr + CSR_CONTROL);
++        {
++            u32 status = readl(s->csr + CSR_STATUS);
++            if (status == ~0U || (status & STATUS_ERROR) || !(status & 1U)) rv = -EIO;
++            else s->armed = true;
++        }
++        break;
++    case SCOPE_BRIDGE_ACK:
++        if (copy_from_user(&ack, (void __user *)arg, sizeof(ack))) rv = -EFAULT;
++        else if (ack.reserved) rv = -EINVAL;
++        else rv = scope_ack(s, ack.entries);
++        break;
++    default: rv = -ENOTTY;
++    }
++out:
++    mutex_unlock(&s->lock);
++    return rv;
++}
++
++static int scope_mmap(struct file *file, struct vm_area_struct *vma)
++{
++    struct scope_qdma_hostbuf *s = file->private_data;
++    int rv;
++    mutex_lock(&s->lock);
++    if (s->dead || !s->buffer) { rv = -ENODEV; goto out; }
++    if (vma->vm_pgoff || (vma->vm_flags & VM_WRITE) ||
++        vma->vm_end - vma->vm_start != s->bytes) { rv = -EINVAL; goto out; }
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
++    vm_flags_clear(vma, VM_MAYWRITE);
++    vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
++#else
++    vma->vm_flags &= ~VM_MAYWRITE;
++    vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
++#endif
++    rv = dma_mmap_coherent(&s->pdev->dev, vma, s->buffer, s->dma, s->bytes);
++out:
++    mutex_unlock(&s->lock);
++    return rv;
++}
++
++static const struct file_operations scope_fops = {
++    .owner = THIS_MODULE, .open = scope_open, .release = scope_release,
++    .unlocked_ioctl = scope_ioctl, .mmap = scope_mmap, .llseek = no_llseek,
++};
++
++int scope_qdma_hostbuf_init(struct xlnx_pci_dev *xpdev)
++{
++    struct scope_qdma_hostbuf *s;
++    int rv;
++    if (xpdev->pdev->is_virtfn || pci_resource_len(xpdev->pdev, 1) <
++        SCOPE_BRIDGE_CSR_OFFSET + 4096) return 0;
++    s = kzalloc(sizeof(*s), GFP_KERNEL);
++    if (!s) return -ENOMEM;
++    s->pdev = pci_dev_get(xpdev->pdev); kref_init(&s->ref); mutex_init(&s->lock);
++    s->csr = pci_iomap_range(s->pdev, 1, SCOPE_BRIDGE_CSR_OFFSET, 4096);
++    if (!s->csr || readl(s->csr) != SCOPE_BRIDGE_MAGIC || readl(s->csr + 4) != SCOPE_BRIDGE_ABI) {
++        if (s->csr) pci_iounmap(s->pdev, s->csr);
++        kref_put(&s->ref, scope_free); return 0;
++    }
++    if (readl(s->csr + CSR_STATUS) != STATUS_DRAINED) {
++        pci_iounmap(s->pdev, s->csr); kref_put(&s->ref, scope_free); return -EBUSY;
++    }
++    snprintf(s->name, sizeof(s->name), "scope-qdma-%s", pci_name(s->pdev));
++    s->misc.minor = MISC_DYNAMIC_MINOR; s->misc.name = s->name;
++    s->misc.fops = &scope_fops; s->misc.parent = &s->pdev->dev; s->misc.mode = 0600;
++    rv = misc_register(&s->misc);
++    if (rv) { pci_iounmap(s->pdev, s->csr); kref_put(&s->ref, scope_free); return rv; }
++    xpdev->scope_hostbuf = s;
++    dev_info(&s->pdev->dev, "SCOPE SCB1 slave-bridge host ring available; no QDMA queue setup required\n");
++    return 0;
++}
++
++void scope_qdma_hostbuf_remove(struct xlnx_pci_dev *xpdev)
++{
++    struct scope_qdma_hostbuf *s = xpdev->scope_hostbuf;
++    if (!s) return;
++    misc_deregister(&s->misc);
++    mutex_lock(&s->lock);
++    s->dead = true;
++    if (s->mapping) unmap_mapping_range(s->mapping, 0, 0, 1);
++    if (scope_stop(s)) pci_clear_master(s->pdev);
++    pci_iounmap(s->pdev, s->csr); s->csr = NULL;
++    mutex_unlock(&s->lock);
++    xpdev->scope_hostbuf = NULL;
++    kref_put(&s->ref, scope_free);
++}
+diff --git a/QDMA/linux-kernel/driver/src/scope_qdma_hostbuf.h b/QDMA/linux-kernel/driver/src/scope_qdma_hostbuf.h
+new file mode 100644
+index 0000000..f5bdb2c
+--- /dev/null
++++ b/QDMA/linux-kernel/driver/src/scope_qdma_hostbuf.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef SCOPE_QDMA_HOSTBUF_H
++#define SCOPE_QDMA_HOSTBUF_H
++struct xlnx_pci_dev;
++int scope_qdma_hostbuf_init(struct xlnx_pci_dev *xpdev);
++void scope_qdma_hostbuf_remove(struct xlnx_pci_dev *xpdev);
++#endif
+diff --git a/QDMA/linux-kernel/driver/src/scope_qdma_hostbuf_uapi.h b/QDMA/linux-kernel/driver/src/scope_qdma_hostbuf_uapi.h
+new file mode 100644
+index 0000000..20011bb
+--- /dev/null
++++ b/QDMA/linux-kernel/driver/src/scope_qdma_hostbuf_uapi.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef SCOPE_QDMA_HOSTBUF_UAPI_H
++#define SCOPE_QDMA_HOSTBUF_UAPI_H
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++#define SCOPE_QDMA_ABI 1U
++#define SCOPE_QDMA_CSR_MAGIC 0x53435131U
++#define SCOPE_QDMA_CSR_OFFSET 0x240000U
++#define SCOPE_QDMA_ENTRY_BYTES 64U
++#define SCOPE_QDMA_PACKET_OFFSET 8U
++#define SCOPE_QDMA_PACKET_BYTES 32U
++#define SCOPE_QDMA_COLOR_MASK 2U
++#define SCOPE_QDMA_ERROR_MASK 4U
++
++struct scope_qdma_start {
++    __u32 abi;
++    __u32 qidx;
++    __u32 ring_size_index;
++    __u32 reserved;
++};
++struct scope_qdma_info {
++    __u32 abi;
++    __u32 entries;
++    __u32 entry_bytes;
++    __u32 packet_offset;
++    __u32 packet_bytes;
++    __u32 hardware_qid;
++    __u32 initial_cidx;
++    __u32 initial_color;
++    __u64 mmap_bytes;
++};
++struct scope_qdma_ack {
++    __u32 entries;
++    __u32 reserved;
++};
++#define SCOPE_QDMA_START _IOW('Q', 0x70, struct scope_qdma_start)
++#define SCOPE_QDMA_INFO _IOR('Q', 0x71, struct scope_qdma_info)
++#define SCOPE_QDMA_ACK _IOW('Q', 0x72, struct scope_qdma_ack)
++#define SCOPE_QDMA_ARM _IO('Q', 0x73)
++#endif

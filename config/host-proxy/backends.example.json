@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "devices": [
+    { "type": "host-net", "tap-name": "xsai0" },
+    { "type": "xhci", "transport": "local-p2p", "real-host-bdf": "0000:03:00.0" }
+  ]
+}

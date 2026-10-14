@@ -1,16 +1,19 @@
 [submodule "work_farm"]
 	path = work_farm
-	url = ../work_farm.git
-  branch = d91dd38c
+	url = https://github.com/NEXST-TOOL/work_farm.git
+	branch = master
 [submodule "nanhu-g/software/opensbi"]
 	path = kmh/software/opensbi
-	url = ../opensbi.git
+	url = https://github.com/NEXST-TOOL/opensbi.git
 [submodule "nanhu-g/hardware/xs-gen"]
 	path = kmh/hardware/xs-gen
 	url = https://github.com/OpenXiangShan/XiangShan.git
 [submodule "shell/software/xdma_drv"]
 	path = tools/driver/xdma_drv
-	url = ../dma_ip_drivers.git
+	url = https://github.com/NEXST-TOOL/dma_ip_drivers.git
 [submodule "nanhu-g/software/rootfs"]
 	path = kmh/software/rootfs
-	url = ../rootfs.git
+	url = https://github.com/NEXST-TOOL/rootfs.git
+[submodule "host-qemu"]
+	path = tools/host/qemu
+	url = https://github.com/Nullray/qemu.git

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${VP1902_TOOL_CACHE:?set VP1902_TOOL_CACHE to the migrated tool cache}"
+exec "$VP1902_TOOL_CACHE/mill/0.12.3" "$@"

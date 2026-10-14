@@ -1,3 +1,6 @@
 .metals/
 .vscode/
 **/sw_plat
+/build/
+/.node41-migration-owner.json
+__pycache__/

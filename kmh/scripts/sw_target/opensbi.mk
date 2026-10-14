@@ -6,15 +6,14 @@ OPENSBI_SRC := $(NANHU_G_SW_LOC)/opensbi
 OPENSBI_LOC := $(abspath $(NANHU_G_SW_LOC)/riscv-opensbi)
 
 RV_BOOT_BIN_LOC := $(OPENSBI_LOC)/platform/ict/firmware
-# OPENSBI_PAYLOAD := $(abspath $(INSTALL_LOC)/Image)
-OPENSBI_PAYLOAD := /home/liushiqi/workspace/linux/arch/riscv/boot/Image
-DT_TARGET ?= XSTop
+OPENSBI_PAYLOAD ?= $(abspath $(INSTALL_LOC)/Image)
+DT_TARGET ?= kunminghu-scope
 OPENSBI_DTB := $(abspath $(INSTALL_LOC)/$(DT_TARGET).dtb)
 
 # sub platform-specific OpenSBI compilation flags 
-USER_FLAGS := SERVE_PLAT=h \
+USER_FLAGS := SERVE_PLAT=scope \
               HART_COUNT=$(NUM_CORES) \
-              RV_TARGET=xiangshan \
+              RV_TARGET=kunminghu_scope \
               WITH_SM=n
 
 # OpenSBI cross compile flags
@@ -31,7 +30,7 @@ RV_BOOT_BIN := $(INSTALL_LOC)/RV_BOOT.bin
 #=================================================
 # OpenSBI Compilation
 #=================================================
-opensbi:
+opensbi: target_dt
 	@mkdir -p $(OPENSBI_LOC)
 	$(EXPORT_CC_PATH) && \
 		$(MAKE) -C $(OPENSBI_SRC) \

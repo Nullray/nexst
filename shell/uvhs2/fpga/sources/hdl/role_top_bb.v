@@ -97,11 +97,11 @@ module role_top (
   output [31:0]  m_axi_mem_wstrb,
   output        m_axi_mem_wvalid,
 
-  input  [19:0] s_axi_ctrl_araddr,
+  input  [23:0] s_axi_ctrl_araddr,
   input  [2:0]  s_axi_ctrl_arprot,
   output        s_axi_ctrl_arready,
   input         s_axi_ctrl_arvalid,
-  input  [19:0] s_axi_ctrl_awaddr,
+  input  [23:0] s_axi_ctrl_awaddr,
   input  [2:0]  s_axi_ctrl_awprot,
   output        s_axi_ctrl_awready,
   input         s_axi_ctrl_awvalid,

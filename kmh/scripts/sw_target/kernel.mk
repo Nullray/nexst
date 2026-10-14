@@ -61,9 +61,16 @@ $(KERN_IMAGE_GEN): $(KERN_LOC)/$(OS)/.config FORCE
 	$(EXPORT_CC_PATH) && $(MAKE) -C $(KERN_SRC) \
 		$(KERN_COMPILE_FLAGS) $(KERN_TARGET) -j 10
 
-$(KERN_LOC)/%/.config: $(KERN_CONFIG_LOC)/$($(OS)-kern-config) $(INITRAMFS_TXT)
+scope_guest_prepare: FORCE
+	python3 $(NANHU_G_SW_LOC)/../../tools/guest/install_pci_dma.py $(KERN_SRC)
+	python3 $(NANHU_G_SW_LOC)/../../tools/guest/install_xhci_start_fix.py $(KERN_SRC)
+
+$(KERN_LOC)/%/.config: $(KERN_CONFIG_LOC)/$($(OS)-kern-config) $(INITRAMFS_TXT) scope_guest_prepare
 	$(EXPORT_CC_PATH) && $(MAKE) -C $(KERN_SRC) \
 		$(KERN_COMPILE_FLAGS) $($(OS)-kern-config) olddefconfig
+	cd $(KERN_SRC) && scripts/kconfig/merge_config.sh -m -O $(KERN_LOC)/$(OS) \
+		$(KERN_LOC)/$(OS)/.config $(realpath $(NANHU_G_SW_LOC)/../../tools/guest/scope_kernel.config)
+	$(EXPORT_CC_PATH) && $(MAKE) -C $(KERN_SRC) $(KERN_COMPILE_FLAGS) olddefconfig
 
 linux_clean: $(obj-modules-clean-y)
 	$(MAKE) -C $(KERN_SRC) O=$(KERN_LOC)/$(OS) clean 

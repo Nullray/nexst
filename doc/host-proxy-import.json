@@ -1,0 +1,121 @@
+{
+  "source_nexst": "f6ea6828bdbd04bb10b97df3cdc84736760b487f",
+  "source_qemu": "6a30be82ace2bb045fc75ab1a8815e8f56dd9ba5",
+  "note": "Original files/source_* record the early import snapshot; software_sync records the current upstream USB synchronization.",
+  "files": {
+    "qemu-mount/hw/misc/scope_fpga_vswitch.c": {
+      "sha256": "c826fd489d4a329c9b3df0df21db5c59230c7ab5fa53013ed0eb6844e1556543"
+    },
+    "qemu-mount/hw/misc/scope_fpga_vswitch_xhci_backend.c": {
+      "sha256": "9f43d86ad9298fc547338b7efdb7203a704b82bc0d33054a88b664775e649843"
+    },
+    "qemu-mount/tests/scope-usb/run.sh": {
+      "sha256": "ac6d90014823e27ed78f2e1168acaf635b1231242c4d21704f7789a7f7c6f2c0"
+    },
+    "qemu-mount/tests/scope-usb/test-dma-window.c": {
+      "sha256": "68d9d5fc73ef5f4d402e3a89e42e13b9dcb467d68d59cd7d0923073dcec1b445"
+    },
+    "qemu-mount/tests/scope-usb/test-physical-xhci.py": {
+      "sha256": "29b4bc73376bf57643562e88790203482fea445c10b32b9e64d6cac52d82be6a"
+    },
+    "qemu-mount/tests/scope-usb/fake-xdma.c": {
+      "sha256": "212060de1d692c59e3384815a72d279b9c1894b6335bf046f5c6971f2fa01767"
+    },
+    "tools/scope_usb_preflight.py": {
+      "sha256": "6f61e6994d5cc6d3e3a1d721545a64e0c54b286a3d89177be805dd1503639543"
+    },
+    "shell/nm37_vu37p/fpga/sources/hdl/recorder/virtual_pcie_switch_proxy.v": {
+      "sha256": "527a959fd056da2c1e15b262602aa7c413a6fd34c3fc06cb43eaaddd749f7efa"
+    }
+  },
+  "software_sync": {
+    "updated_at": "2026-10-14T12:42:15.534972+08:00",
+    "source_nexst": {
+      "repository": "https://github.com/Nullray/nexst",
+      "branch": "feature/nanhu-g-host-nic-usb",
+      "commit": "4f2d7660b9c853766ba08a3956dccc0789480dc9"
+    },
+    "source_qemu": {
+      "repository": "https://github.com/Nullray/qemu",
+      "branch": "feature/nanhu-g-host-nic-usb",
+      "commit": "bbc8bbb7c1c7a2963a7e274f0ba1ad0df2e7c916"
+    },
+    "qemu_gitlink_base": "6a30be82ace2bb045fc75ab1a8815e8f56dd9ba5",
+    "preserved": [
+      "QDMA completion ring, CIDX/credits and shutdown marker",
+      "existing NIC backends",
+      "hardware sources and ongoing VP1902 synthesis"
+    ],
+    "kernel": {
+      "version": "6.6",
+      "xhci_startup_protection": "already present; installer verifies without source changes",
+      "rv64_phys_ram_base": "already initialized; exact legacy fix remains available"
+    },
+    "not_ported": [
+      "NM37 XDMA DMA32 driver/switch/probe/snapshot",
+      "Nanhu Linux 5.16 IRQ diagnostics",
+      "Nanhu initramfs and reset/load scripts"
+    ],
+    "sha256": {
+      "tools/host/qemu/hw/misc/scope_fpga_vswitch_xhci_backend.c": "d5659073e88c6f28fe9fa7eb4aca8cb46777fa8751f4f9672ffa93ec7ab0cd2f",
+      "tools/host/qemu/hw/misc/scope_fpga_vswitch.c": "d073b8b8df5d09c0a5db4e87b9ed710fb594e1ae62684cb8635dbb85addfe89b",
+      "tools/host/qemu/tests/scope-usb/test-physical-xhci.py": "362178fb6d1e8fd614780ce733756c3282fe98240f83641a9fda2b74aa5ebeef",
+      "tools/guest/install_pci_dma.py": "bd71ee67d7c957efbb172b89cae24df0973f52457e39f393305c4e10af1e3a34",
+      "tools/guest/install_xhci_start_fix.py": "9f32339997e8e162d83f0ab70dac60d3adf552be2ca076e79e09ba966e94c953",
+      "tests/host-proxy/test-guest-tools.py": "7aa18957a81cf4e9263237468624797505a8f13e00ec762704776612e71a111a",
+      "tests/host-proxy/test-xhci-start.py": "a6e7865540ccfcaff657e95c5e3e67c5db02655ecd38e9d0f06894fa1ae89f5d",
+      "tests/host-proxy/run.sh": "0ece65e19e4db3a20f669cfadd181c164963c82bb7301938d2138945e60cf0b9",
+      "tools/host/patches/qemu-host-proxy.patch": "4c66bcdcd51a04a1d08d7b0922011f077a41c3ee8dece7d3b942438fbca86cdc"
+    },
+    "patch_reverse_check": true,
+    "patch_clean_base_reconstruction": true,
+    "board_validation": false,
+    "validation": {
+      "qemu_build": "passed",
+      "host_proxy_regression": "passed",
+      "bootstrap_idempotency": "passed",
+      "record": "build/UPSTREAM_USB_SYNC_VALIDATION.json"
+    }
+  },
+  "ordinary_kunminghu_bridge": {
+    "source_nexst_commit": "8137ac2a299a354ba10acc89c731af90b6d8c8cb",
+    "source_cpu_commit": "4bbdccbb077840af5e1b65c7138d31af3966f625",
+    "cpu_kind": "kunminghu",
+    "num_cores": [
+      1,
+      2
+    ],
+    "transport": "qdma-bridge",
+    "host_abi": "SCB1",
+    "native_qdma_queue_library_unchanged": true,
+    "driver_uses_dma_alloc_coherent": true,
+    "legacy_vswitch_sha256": "527a959fd056da2c1e15b262602aa7c413a6fd34c3fc06cb43eaaddd749f7efa",
+    "patches": {
+      "qemu-host-proxy.patch": {
+        "reverse_check": true,
+        "clean_base_reconstruction": true,
+        "sha256": "ac4dd99cfe0d824113f33a4994f84ff110ac717672a61e5c6c98655cb939d5dc",
+        "files": 10
+      },
+      "qdma-hostbuf.patch": {
+        "reverse_check": true,
+        "clean_base_reconstruction": true,
+        "sha256": "4146f11f6c77a2fe4d9346b19c2a62527be47d77b17de7cb92fe9124dbaa8aff",
+        "files": 9
+      },
+      "opensbi-scope.patch": {
+        "reverse_check": true,
+        "clean_base_reconstruction": true,
+        "sha256": "8463453ad9a9013e6caaf1e9ebc21d311ddc53e84a9f6ec4ee03487bb58fce64",
+        "files": 3
+      }
+    },
+    "hardware_board_validated": false,
+    "validation_record": "build/verification/SOFTWARE_VALIDATION.json",
+    "published_qemu": {
+      "repository": "https://github.com/Nullray/qemu",
+      "branch": "feature/kunminghu-scope-qdma-bridge",
+      "commit": "37f30b540884ce43c46756ce7c9f7278d8bbfb26"
+    }
+  }
+}

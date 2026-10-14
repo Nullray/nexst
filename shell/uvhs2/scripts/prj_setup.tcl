@@ -1,6 +1,12 @@
 # add custom_cpu source HDL files
 add_files -fileset sources_1 ${design_dir}/../fpga/sources/hdl/
 
+# Opt-in host proxy control plane (Vivado inherits this environment variable).
+if {[info exists ::env(SCOPE_HOST_PROXY)] && $::env(SCOPE_HOST_PROXY) eq "1"} {
+  add_files -fileset sources_1 [file normalize ${design_dir}/../../common/fpga]
+  source [file normalize ${design_dir}/../../common/fpga/host_proxy.tcl]
+}
+
 # setup block design
 set bd_design xiangshan
 source ${design_dir}/../fpga/scripts/${bd_design}.tcl

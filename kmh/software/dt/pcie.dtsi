@@ -1,6 +1,22 @@
 / {
 	soc {
-#if defined(FPGA_VP19A)
+#if defined(SCOPE_HOST_PROXY)
+        pcie@60000000 {
+            compatible = "pci-host-ecam-generic";
+            device_type = "pci";
+            reg = <0 0x60000000 0 0x01000000>;
+            #address-cells = <3>;
+            #size-cells = <2>;
+            #interrupt-cells = <1>;
+            bus-range = <0 15>;
+            ranges = <0x02000000 0 0x50000000 0 0x50000000 0 0x01000000>;
+            dma-coherent;
+            interrupt-parent = <&plic>;
+            interrupt-map-mask = <0 0 0 7>;
+            interrupt-map = <0 0 0 1 &plic 34>, <0 0 0 2 &plic 34>,
+                            <0 0 0 3 &plic 34>, <0 0 0 4 &plic 34>;
+        };
+#elif defined(FPGA_VP19A)
 		pcie@60000000 {
 			compatible = "xlnx,xdma-host-3.00";
 			device_type = "pci";
