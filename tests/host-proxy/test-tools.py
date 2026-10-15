@@ -28,6 +28,25 @@ INSTALL = module("install", "tools/guest/install_pci_dma.py")
 
 
 class IntegrationChecks(unittest.TestCase):
+    def test_runtime_overlay_keeps_console_and_rejects_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            overlay = Path(directory)
+            tool = overlay / 'opt/uhd/bin/uhd_usrp_probe'
+            tool.parent.mkdir(parents=True)
+            tool.write_text('fixture')
+            tool.chmod(0o755)
+            (overlay / 'usr/bin').mkdir(parents=True)
+            (overlay / 'usr/bin/uhd_usrp_probe').symlink_to('/opt/uhd/bin/uhd_usrp_probe')
+            original = 'dir /usr 755 0 0\ndir /usr/bin 755 0 0\nfile /init /saved/init 755 0 0\n'
+            result = RAMFS.add_overlay(original, overlay)
+            self.assertEqual(result.count('dir /usr/bin '), 1)
+            self.assertIn('file /init /saved/init 755 0 0', result)
+            self.assertIn(f'file /opt/uhd/bin/uhd_usrp_probe {tool} 755 0 0', result)
+            self.assertIn('slink /usr/bin/uhd_usrp_probe /opt/uhd/bin/uhd_usrp_probe', result)
+            (overlay / 'init').write_text('replacement')
+            with self.assertRaisesRegex(ValueError, 'conflicts.* /init'):
+                RAMFS.add_overlay(original, overlay)
+
     def test_rv64_dma_ram_bounds_and_repeat_install(self):
         with tempfile.TemporaryDirectory() as directory:
             kernel = Path(directory)

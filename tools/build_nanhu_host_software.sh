@@ -6,17 +6,25 @@ kernel="$repo_root/work_farm/software/linux"
 out="$repo_root/build/nanhu-host"
 dry_run=0
 kernel_check=0
-for option in "$@"; do
+overlay=
+while (( $# )); do
+    option=$1
     case "$option" in
         --dry-run) dry_run=1 ;;
         --kernel-check) kernel_check=1 ;;
         --help|-h)
-            echo "Usage: $0 [--dry-run] [--kernel-check]"
+            echo "Usage: $0 [--dry-run] [--kernel-check] [--output DIR] [--overlay DIR]"
             echo "Default: build Linux Image, DTB and OpenSBI fw_payload.bin."
             echo "--kernel-check: compile only the PCI DMA integration object."
             exit 0 ;;
+        --output|--overlay)
+            (( $# >= 2 )) || { echo "Missing argument for $option" >&2; exit 2; }
+            if [[ $option == --output ]]; then out=$(realpath -m "$2");
+            else overlay=$(realpath -m "$2"); fi
+            shift ;;
         *) echo "Unknown option: $option" >&2; exit 2 ;;
     esac
+    shift
 done
 if (( ! dry_run )); then
     mkdir -p "$out" "$repo_root/build/software-logs"
@@ -40,7 +48,9 @@ flags=(-C "$kernel" "O=$out/linux" ARCH=riscv "CROSS_COMPILE=$prefix"
 run bash "$repo_root/tools/guest/bootstrap.sh" --kernel-only
 run python3 "$repo_root/tools/guest/install_pci_dma.py" "$kernel"
 run python3 "$repo_root/tools/guest/install_xhci_start_fix.py" "$kernel"
-run python3 "$repo_root/tools/guest/prepare_initramfs.py" --output "$out/initramfs.txt"
+ramfs_args=(--output "$out/initramfs.txt")
+if [[ -n $overlay ]]; then ramfs_args+=(--overlay "$overlay"); fi
+run python3 "$repo_root/tools/guest/prepare_initramfs.py" "${ramfs_args[@]}"
 run make "${flags[@]}" riscv_serve_defconfig
 run env "KCONFIG_CONFIG=$out/linux/.config" bash "$kernel/scripts/kconfig/merge_config.sh" \
     -m -O "$out/linux" "$out/linux/.config" "$repo_root/config/host-proxy/usb.config"

@@ -4,6 +4,11 @@
 `/home/yanjiarun/qemu_usb` 的当前工作树，以及现有 guest 内核配置、initramfs。
 本次只做代码和官方资料分析，未启动香山、未接入或实测 B210，也未构建 UHD。
 
+后续软件准备已完成：本工作区交叉构建 UHD 4.11.0.0/libusb 1.0.30，生成
+独立 `build/nanhu-b210` 固件并验证 RV64 CLI、运行库闭包及 initramfs 集成。
+用户随后完成了 B210 probe 与接收测试；当前启动、测试命令和结果统一见
+[运行 runbook](USB_QEMU_RESTART_FIXED_START_ZH.md#51-香山内的-b210-初始化和接收测试)。
+
 ## 结论
 
 **B210 的基本接入原则上可以复用现有 SCOPE 物理 xHCI 后端，无需新增射频设备后端。**
