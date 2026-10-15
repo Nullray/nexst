@@ -6,6 +6,7 @@ python3 "$repo_root/tests/host-proxy/test-tools.py"
 python3 "$repo_root/tests/host-proxy/test-xhci-start.py"
 python3 "$repo_root/tests/host-proxy/test-p2p-probe.py"
 python3 "$repo_root/tests/host-proxy/test-dma32-ring.py"
+python3 "$repo_root/tests/host-proxy/test-dma32-lifecycle.py"
 python3 "$repo_root/tests/host-proxy/test-driver-switch.py"
 bash "$repo_root/qemu-mount/tests/scope-usb/run.sh" "$qemu_binary"
 test_dir=$(mktemp -d)

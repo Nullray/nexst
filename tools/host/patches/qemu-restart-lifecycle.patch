@@ -1,0 +1,421 @@
+diff --git a/hw/misc/scope_fpga_vswitch.c b/hw/misc/scope_fpga_vswitch.c
+index a0bb11f..467a3f3 100644
+--- a/hw/misc/scope_fpga_vswitch.c
++++ b/hw/misc/scope_fpga_vswitch.c
+@@ -8,6 +8,7 @@
+ #include "qemu/main-loop.h"
+ #include "qemu/thread.h"
+ #include "qemu/atomic.h"
++#include "system/system.h"
+ #include "block/nvme.h"
+ #include "hw/net/igb_regs.h"
+ #include "net/checksum.h"
+@@ -18,6 +19,7 @@
+ #include "hw/misc/scope_vortex_gids_queue.h"
+ 
+ #include <fcntl.h>
++#include <sys/file.h>
+ #include <sys/mman.h>
+ #include <sys/socket.h>
+ #include <sys/un.h>
+@@ -491,6 +493,9 @@ struct ScopeProxyState {
+     void *dma32_db_map;
+     void *ecam_shadow_map;
+     struct scope_xdma_dma32_doorbell dma32_db;
++    bool dma32_db_owned;
++    Notifier exit_notifier;
++    bool exit_notifier_registered;
+ 
+     QemuMutex xdma_lock;
+     bool xdma_lock_inited;
+@@ -6851,25 +6856,27 @@ static void *scope_proxy_rx_thread(void *opaque)
+ static bool scope_alloc_dma32_ring(ScopeProxyState *s, Error **errp)
+ {
+     off_t mmap_offset;
++    struct scope_xdma_dma32_doorbell request = { 0 };
+ 
+     if (s->dma32_ring_size < 0x1000 || s->dma32_ring_size > 0x400000 ||
+         (s->dma32_ring_size & 0xfff)) {
+         error_setg(errp, "dma32-ring-size must be page aligned and in [4KiB, 4MiB]");
+         return false;
+     }
+-    s->dma32_db.size = s->dma32_ring_size;
+-    if (ioctl(s->xdma_ctrl_fd, XDMA_IOC_DMA32_DB_ALLOC, &s->dma32_db) < 0) {
++    request.size = s->dma32_ring_size;
++    if (ioctl(s->xdma_ctrl_fd, XDMA_IOC_DMA32_DB_ALLOC, &request) < 0) {
+         error_setg_errno(errp, errno, "XDMA_IOC_DMA32_DB_ALLOC failed");
+         return false;
+     }
++    /* FREE is device-wide, so failed ALLOC must never confer ownership. */
++    s->dma32_db = request;
++    s->dma32_db_owned = true;
+ 
+     mmap_offset = (off_t)XDMA_DMA32_DB_MMAP_PGOFF * (off_t)s->host_page_size;
+     s->dma32_db_map = mmap(NULL, s->dma32_db.size, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, s->xdma_ctrl_fd, mmap_offset);
+     if (s->dma32_db_map == MAP_FAILED) {
+         s->dma32_db_map = NULL;
+-        ioctl(s->xdma_ctrl_fd, XDMA_IOC_DMA32_DB_FREE);
+-        memset(&s->dma32_db, 0, sizeof(s->dma32_db));
+         error_setg_errno(errp, errno, "Failed to mmap DMA32 ring buffer");
+         return false;
+     }
+@@ -7140,6 +7147,10 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
+ {
+     unsigned int i;
+ 
++    if (s->exit_notifier_registered) {
++        qemu_remove_exit_notifier(&s->exit_notifier);
++        s->exit_notifier_registered = false;
++    }
+     if (s->rx_thread_started) {
+         qatomic_set(&s->rx_thread_stop, 1);
+         qemu_thread_join(&s->rx_thread);
+@@ -7168,6 +7179,18 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
+         scope_gds_clear_restore_pages(&s->gds);
+     }
+ 
++    /* Stop physical producers before releasing the XDMA receive transport. */
++    if (s->backends) {
++        for (i = 0; i < SCOPE_VSWITCH_MAX_BACKENDS; i++) {
++            ScopeBackend *be = &s->backends[i];
++
++            if (be->ops && be->ops->cleanup) {
++                be->ops->cleanup(s, be);
++            }
++            scope_restore_real_pci_command(be);
++        }
++    }
++
+     if (s->dma32_db_map) {
+         munmap(s->dma32_db_map, s->dma32_db.size);
+         s->dma32_db_map = NULL;
+@@ -7176,18 +7199,18 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
+         munmap(s->ecam_shadow_map, HOST_ECAM_SHADOW_SIZE);
+         s->ecam_shadow_map = NULL;
+     }
+-    if (s->xdma_ctrl_fd >= 0 && s->dma32_db.size) {
+-        ioctl(s->xdma_ctrl_fd, XDMA_IOC_DMA32_DB_FREE);
++    if (s->xdma_ctrl_fd >= 0 && s->dma32_db_owned) {
++        if (ioctl(s->xdma_ctrl_fd, XDMA_IOC_DMA32_DB_FREE) < 0) {
++            error_report("SCOPE: failed to release owned DMA32 ring: %s",
++                         strerror(errno));
++        }
++        s->dma32_db_owned = false;
+         memset(&s->dma32_db, 0, sizeof(s->dma32_db));
+     }
+ 
+     if (s->backends) {
+         for (i = 0; i < SCOPE_VSWITCH_MAX_BACKENDS; i++) {
+             ScopeBackend *be = &s->backends[i];
+-            if (be->ops && be->ops->cleanup) {
+-                be->ops->cleanup(s, be);
+-            }
+-            scope_restore_real_pci_command(be);
+             if (be->real_bar0_map) munmap(be->real_bar0_map, be->real_bar0_size);
+             if (be->real_bar_fd >= 0) close(be->real_bar_fd);
+             g_free(be->pending_admin_ops);
+@@ -7229,6 +7252,13 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
+     s->backend_count = 0;
+ }
+ 
++static void scope_proxy_process_exit(Notifier *notifier, void *data)
++{
++    ScopeProxyState *s = container_of(notifier, ScopeProxyState, exit_notifier);
++
++    scope_proxy_cleanup(s);
++}
++
+ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
+ {
+     ScopeProxyState *s = SCOPE_PROXY(pci_dev);
+@@ -7280,6 +7310,32 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
+     s->xdma_lock_inited = true;
+     qemu_mutex_init(&s->state_lock);
+     s->state_lock_inited = true;
++    /* Claim the transport before touching any physical backend. The kernel
++     * ring is device-wide and survives SIGKILL with the current XDMA driver.
++     */
++    s->xdma_ctrl_fd = open(xdma_ctrl_dev, O_RDWR);
++    if (s->xdma_ctrl_fd < 0) {
++        error_setg_errno(errp, errno, "Failed to open %s", xdma_ctrl_dev);
++        goto fail;
++    }
++    if (flock(s->xdma_ctrl_fd, LOCK_EX | LOCK_NB) < 0) {
++        error_setg_errno(errp, errno, "XDMA control is owned by another proxy");
++        goto fail;
++    }
++    {
++        struct scope_xdma_dma32_doorbell existing = { 0 };
++
++        if (ioctl(s->xdma_ctrl_fd, XDMA_IOC_DMA32_DB_QUERY, &existing) == 0) {
++            error_setg(errp, "XDMA DMA32 ring is still allocated; stop the "
++                       "previous session and verify DMA is stopped before "
++                       "explicit recovery (no automatic FREE)");
++            goto fail;
++        }
++        if (errno != ENODATA) {
++            error_setg_errno(errp, errno, "XDMA_IOC_DMA32_DB_QUERY failed");
++            goto fail;
++        }
++    }
+     if (!scope_parse_fpga_bypass_bar(s, errp)) {
+         goto fail;
+     }
+@@ -7342,12 +7398,6 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
+         goto fail;
+     }
+ 
+-    s->xdma_ctrl_fd = open(xdma_ctrl_dev, O_RDWR);
+-    if (s->xdma_ctrl_fd < 0) {
+-        error_setg_errno(errp, errno, "Failed to open %s", xdma_ctrl_dev);
+-        goto fail;
+-    }
+-
+     s->xdma_bypass_fd = open(xdma_bypass_dev, O_RDWR | O_SYNC);
+     if (s->xdma_bypass_fd < 0) {
+         error_setg_errno(errp, errno, "Failed to open %s", xdma_bypass_dev);
+@@ -7450,6 +7500,9 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
+                s->xdma_event_dev);
+     }
+     SCOPE_PRINTF("[SCOPE PROXY] DMA32 CFG/BAR RX thread started.\n\n");
++    s->exit_notifier.notify = scope_proxy_process_exit;
++    qemu_add_exit_notifier(&s->exit_notifier);
++    s->exit_notifier_registered = true;
+     return;
+ 
+ fail:
+diff --git a/tests/scope-usb/fake-xdma.c b/tests/scope-usb/fake-xdma.c
+index 4648c10..f15367e 100644
+--- a/tests/scope-usb/fake-xdma.c
++++ b/tests/scope-usb/fake-xdma.c
+@@ -3,6 +3,7 @@
+ #define _GNU_SOURCE
+ #define _LARGEFILE64_SOURCE
+ #include <dlfcn.h>
++#include <errno.h>
+ #include <fcntl.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+@@ -69,8 +70,36 @@ int ioctl(int fd, unsigned long request, ...)
+     if (len > 0) {
+         path[len] = 0;
+         if (ctrl && !strcmp(path, ctrl)) {
+-            if (request == XDMA_IOC_DMA32_DB_FREE) return 0;
++            const char *mode = getenv("SCOPE_TEST_RING_MODE");
++            const char *trace = getenv("SCOPE_TEST_IOCTL_LOG");
++            if (request == XDMA_IOC_DMA32_DB_FREE) {
++                if (trace) {
++                    FILE *log = fopen(trace, "a");
++                    if (log) {
++                        fprintf(log, "FREE\n");
++                        fclose(log);
++                    }
++                }
++                return 0;
++            }
++            if (request == XDMA_IOC_DMA32_DB_QUERY) {
++                if (mode && !strcmp(mode, "stale")) {
++                    va_start(ap, request);
++                    struct scope_xdma_dma32_doorbell *db = va_arg(ap, void *);
++                    va_end(ap);
++                    db->size = 65536;
++                    db->dma_addr = 0x40000000;
++                    return 0;
++                }
++                errno = ENODATA;
++                return -1;
++            }
+             if (request == XDMA_IOC_DMA32_DB_ALLOC) {
++                if (mode && (!strcmp(mode, "busy") ||
++                             !strcmp(mode, "stale"))) {
++                    errno = EBUSY;
++                    return -1;
++                }
+                 va_start(ap, request);
+                 struct scope_xdma_dma32_doorbell *db = va_arg(ap, void *);
+                 va_end(ap);
+diff --git a/tests/scope-usb/run.sh b/tests/scope-usb/run.sh
+index 59e804e..d743c2b 100755
+--- a/tests/scope-usb/run.sh
++++ b/tests/scope-usb/run.sh
+@@ -8,6 +8,8 @@ cc -shared -fPIC -Wall -Wextra -Werror -I"$qemu_root" -I"$qemu_root/include" \
+   "$qemu_root/tests/scope-usb/fake-xdma.c" -ldl -o "$test_dir/fake-xdma.so"
+ python3 "$qemu_root/tests/scope-usb/test-physical-xhci.py" \
+   "$qemu_binary" "$test_dir/fake-xdma.so"
++python3 "$qemu_root/tests/scope-usb/test-lifecycle.py" \
++  "$qemu_binary" "$test_dir/fake-xdma.so"
+ kernel_source=${SCOPE_GUEST_KERNEL:-$qemu_root/../work_farm/software/linux}
+ mkdir -p "$test_dir/linux"
+ touch "$test_dir/linux/dma-direct.h"
+diff --git a/tests/scope-usb/test-lifecycle.py b/tests/scope-usb/test-lifecycle.py
+new file mode 100644
+index 0000000..d50efa9
+--- /dev/null
++++ b/tests/scope-usb/test-lifecycle.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python3
++"""Real QEMU lifecycle regression using only temporary regular files.
++
++No physical device or kernel module is opened. Tests ownership on allocation
++failure, normal signal exit, and exclusion of a second proxy.
++"""
++import json
++import mmap
++import os
++from pathlib import Path
++import signal
++import socket
++import struct
++import subprocess
++import sys
++import tempfile
++import time
++
++QEMU = Path(sys.argv[1]).resolve()
++SHIM = Path(sys.argv[2]).resolve()
++FPGA, XHCI = "fffe:00:01.0", "fffe:00:02.0"
++MBX, RING_OFF = 0x1000000, 0x100000000
++
++
++def wait_for_main_loop(proc, path):
++    deadline = time.monotonic() + 5
++    while time.monotonic() < deadline:
++        assert proc.poll() is None
++        with socket.socket(socket.AF_UNIX) as connection:
++            connection.settimeout(5)
++            try:
++                connection.connect(str(path))
++            except (FileNotFoundError, ConnectionRefusedError):
++                time.sleep(0.001)
++                continue
++            with connection.makefile("rwb", buffering=0) as monitor:
++                assert "QMP" in json.loads(monitor.readline())
++                for execute in ("qmp_capabilities", "query-status"):
++                    monitor.write((json.dumps({"execute": execute}) + "\n").encode())
++                    while True:
++                        response = json.loads(monitor.readline())
++                        if "event" not in response:
++                            assert "return" in response, response
++                            break
++            return
++    raise AssertionError("QEMU main loop did not start")
++
++
++def run_case(mode):
++    with tempfile.TemporaryDirectory(prefix="scope-lifecycle-") as directory:
++        root = Path(directory)
++        for bdf in (FPGA, XHCI):
++            (root / bdf).mkdir()
++        (root / FPGA / "resource").write_text(
++            "0 0 0\n0 0 0\n800000000 9ffffffff 200\n0 0 0\n0 0 0\n0 0 0\n")
++        (root / XHCI / "resource").write_text(
++            "10000000 1000ffff 200\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n")
++        config = bytearray(256)
++        struct.pack_into("<HH", config, 0, 0x1022, 0x43f7)
++        config[8:12] = bytes([1, 0x30, 3, 0x0c])
++        struct.pack_into("<H", config, 4, 0x406)
++        (root / XHCI / "config").write_bytes(config)
++        regs = bytearray(65536)
++        for off, value in ((0, 0x1100040), (4, (2 << 24) | (8 << 8) | 32),
++                           (0x10, 1), (0x14, 0x2000), (0x18, 0x1000), (0x44, 1)):
++            struct.pack_into("<I", regs, off, value)
++        (root / XHCI / "resource0").write_bytes(regs)
++        (root / "backends.json").write_text(json.dumps({"version": 1, "devices": [
++            {"type": "xhci", "real-host-bdf": XHCI}]}))
++        for name, size in (("user", 0x1030000), ("ctrl", RING_OFF + 65536),
++                           ("bypass", 0x200000000)):
++            with (root / name).open("wb") as stream:
++                stream.truncate(size)
++        env = dict(os.environ, LD_PRELOAD=str(SHIM), SCOPE_TEST_SYSFS=directory,
++                   SCOPE_TEST_CTRL=str(root / "ctrl"),
++                   SCOPE_TEST_IOCTL_LOG=str(root / "ioctl.log"),
++                   SCOPE_TEST_RING_MODE=mode)
++        device = (f"scope-fpga-vswitch,bus=rp,backend-config={root / 'backends.json'},"
++                  f"fpga-host-bdf={FPGA},xdma-user-dev={root / 'user'},"
++                  f"xdma-ctrl-dev={root / 'ctrl'},xdma-bypass-dev={root / 'bypass'},"
++                  "guest-ddr-base=0x80000000,guest-ddr-size=0x80000000,"
++                  "allow-unsafe-xhci-p2p=on")
++        command = [str(QEMU), "-machine", "q35", "-S", "-m", "128M",
++                   "-display", "none", "-monitor", "none", "-serial", "none",
++                   "-qmp", f"unix:{root / 'qmp'},server=on,wait=off",
++                   "-device", "pcie-root-port,id=rp", "-device", device]
++        with (root / "qemu.log").open("w+") as log:
++            proc = subprocess.Popen(command, env=env, stdout=log, stderr=log)
++            try:
++                if mode in ("busy", "stale"):
++                    proc.wait(timeout=6)
++                    assert proc.returncode != 0
++                    freed = (root / "ioctl.log").exists()
++                    assert not freed, "failed allocation freed another session's ring"
++                    if mode == "stale":
++                        assert (root / XHCI / "config").read_bytes() == config
++                        assert (root / XHCI / "resource0").read_bytes() == regs
++                    return
++                with (root / "user").open("r+b") as user_file, \
++                        (root / "ctrl").open("r+b") as ctrl_file:
++                    with mmap.mmap(user_file.fileno(), 0) as user, \
++                            mmap.mmap(ctrl_file.fileno(), 65536, offset=RING_OFF) as ring:
++                        def wait_for(predicate):
++                            deadline = time.monotonic() + 5
++                            while time.monotonic() < deadline:
++                                assert proc.poll() is None
++                                if predicate():
++                                    return
++                                time.sleep(0.001)
++                            raise AssertionError("proxy response timed out")
++
++                        wait_for(lambda: struct.unpack_from("<I", user, MBX + 0x30)[0] & 3 == 3)
++                        # Guest accepts the DMA capability then enables bus mastering.
++                        for seq, off, val in ((1, 0xbc, 0x444d4150), (2, 4, 6)):
++                            struct.pack_into("<8I", ring, seq * 64, 0x5844504b, 1,
++                                             0x0f470300, 32, seq, off, val, 0)
++                            wait_for(lambda: struct.unpack_from("<I", user, MBX + 0x10)[0] == seq)
++                        before = (root / XHCI / "config").read_bytes()
++                        assert struct.unpack_from("<H", before, 4)[0] & 4
++                        # Device realize precedes installation of QEMU's
++                        # termination signal handlers. A QMP response proves
++                        # initialization finished and the main loop is active.
++                        wait_for_main_loop(proc, root / "qmp")
++                        if mode == "concurrent":
++                            with (root / "second.log").open("w+") as second_log:
++                                second_command = list(command)
++                                second_command[second_command.index("-qmp") + 1] = \
++                                    f"unix:{root / 'second-qmp'},server=on,wait=off"
++                                second = subprocess.Popen(second_command, env=env,
++                                                          stdout=second_log, stderr=second_log)
++                                try:
++                                    second.wait(timeout=3)
++                                    assert second.returncode != 0
++                                    assert (root / XHCI / "config").read_bytes() == before
++                                    assert not (root / "ioctl.log").exists()
++                                finally:
++                                    if second.poll() is None:
++                                        second.kill()
++                                        second.wait(timeout=3)
++                        proc.send_signal(signal.SIGINT if mode == "sigint" else signal.SIGTERM)
++                        proc.wait(timeout=6)
++                        after = (root / XHCI / "config").read_bytes()
++                        assert not struct.unpack_from("<H", after, 4)[0] & 4, "exit left physical DMA enabled"
++                        assert (root / "ioctl.log").read_text() == "FREE\n", "ring not freed exactly once"
++                        if mode == "restart":
++                            proc = subprocess.Popen(command, env=env, stdout=log, stderr=log)
++                            wait_for_main_loop(proc, root / "qmp")
++                            proc.terminate()
++                            proc.wait(timeout=6)
++                            assert (root / "ioctl.log").read_text() == "FREE\nFREE\n"
++            except Exception:
++                log.flush()
++                log.seek(0)
++                print(log.read(), file=sys.stderr)
++                raise
++            finally:
++                if proc.poll() is None:
++                    proc.kill()
++                    proc.wait(timeout=3)
++
++
++cases = sys.argv[3:] or ("busy", "stale", "sigint", "sigterm", "concurrent", "restart")
++for case in cases:
++    run_case(case)
++    print(f"PASS: lifecycle {case}")

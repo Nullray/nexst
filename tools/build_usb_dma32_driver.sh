@@ -31,7 +31,8 @@ record = {'kernel': sys.argv[3], 'module': str(module),
           'module_sha256': hashlib.sha256(module.read_bytes()).hexdigest(),
           'module_srcversion': subprocess.check_output(['modinfo', '-F', 'srcversion', str(module)], text=True).strip(),
           'sources': {name: hashlib.sha256((source / 'xdma' / name).read_bytes()).hexdigest()
-                      for name in ('cdev_ctrl.c', 'nexst_dma32_ring.h')},
+                      for name in ('cdev_ctrl.c', 'nexst_dma32_ring.h',
+                                   'xdma_mod.c', 'xdma_mod.h', 'xdma_cdev.h')},
           'status': 'Built only; not loaded into the host kernel.'}
 (output / 'manifest.json').write_text(json.dumps(record, indent=2) + '\n')
 print('Built module:', module)

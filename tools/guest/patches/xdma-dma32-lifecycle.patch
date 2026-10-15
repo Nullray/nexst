@@ -1,0 +1,586 @@
+diff --git a/XDMA/linux-kernel/xdma/cdev_ctrl.c b/XDMA/linux-kernel/xdma/cdev_ctrl.c
+index 71dcbbbe208f1904eea4188531add806c029400b..a8d1eaeaf23df8591ac7b795df8da27dcfb38ede 100644
+--- a/XDMA/linux-kernel/xdma/cdev_ctrl.c
++++ b/XDMA/linux-kernel/xdma/cdev_ctrl.c
+@@ -21,13 +21,14 @@
+ 
+ #include <linux/ioctl.h>
+ #include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/jiffies.h>
++#include <linux/mutex.h>
+ #include "version.h"
+ #include "xdma_cdev.h"
+ 
+ 
+-// --- Inserted for Cyclic DMA hack ---
+-static struct xdma_transfer *g_c2h_cyclic_transfer = NULL;
+-// ------------------------------------
++static DEFINE_MUTEX(nexst_dma32_mutex);
+ 
+ #include "cdev_ctrl.h"
+ #include "nexst_dma32_ring.h"
+@@ -44,28 +45,61 @@
+ static long dma32_db_free_ioctl(struct xdma_cdev *xcdev);
+ static long dma32_db_put_ioctl(struct xdma_cdev *xcdev, void __user *arg);
+ 
+-static void nexst_cyclic_dma_stop(struct xdma_cdev *xcdev)
++static int nexst_cyclic_dma_stop(struct xdma_cdev *xcdev)
+ {
+ 	struct xdma_dev *xdev = xcdev->xdev;
+-
+-	if (!g_c2h_cyclic_transfer)
+-		return;
+-
+-	if (xdev->c2h_channel_max > 1) {
+-		struct xdma_engine *engine = &xdev->engine_c2h[1];
+-		engine_cyclic_stop(engine);
+-	}
+-
+-	if (g_c2h_cyclic_transfer->desc_virt) {
++	struct xdma_transfer *transfer = xcdev->dma32_transfer;
++	struct xdma_engine *engine;
++	struct xdma_transfer *stopped;
++	unsigned long flags, deadline;
++
++	if (!transfer)
++		return 0;
++
++	if (xdev->c2h_channel_max <= 1)
++		return -EINVAL;
++	engine = &xdev->engine_c2h[1];
++	/* engine_cyclic_stop() requires this lock; IRQ work uses the same list. */
++	spin_lock_irqsave(&engine->lock, flags);
++	if (!list_empty(&engine->transfer_list)) {
++		if (list_first_entry(&engine->transfer_list,
++			struct xdma_transfer, entry) != transfer) {
++			spin_unlock_irqrestore(&engine->lock, flags);
++			return -EBUSY;
++		}
++		stopped = engine_cyclic_stop(engine);
++		if (stopped != transfer) {
++			spin_unlock_irqrestore(&engine->lock, flags);
++			return -EIO;
++		}
++	} else if (engine->running) {
++		spin_unlock_irqrestore(&engine->lock, flags);
++		return -EBUSY;
++	}
++	spin_unlock_irqrestore(&engine->lock, flags);
++
++	/* Clearing RUN is not a completion fence. Flush the MMIO write and wait
++	 * for hardware to stop accessing descriptors and the host receive ring.
++	 * A timeout deliberately retains both allocations for explicit recovery.
++	 */
++	deadline = jiffies + msecs_to_jiffies(100);
++	while (read_register(&engine->regs->status) & XDMA_STAT_BUSY) {
++		if (time_after_eq(jiffies, deadline)) {
++			return -ETIMEDOUT;
++		}
++		usleep_range(100, 200);
++	}
++
++	if (transfer->desc_virt) {
+ 		dma_free_coherent(&xdev->pdev->dev,
+-			g_c2h_cyclic_transfer->desc_num * sizeof(struct xdma_desc),
+-			g_c2h_cyclic_transfer->desc_virt,
+-			g_c2h_cyclic_transfer->desc_bus);
+-	}
+-
+-	kfree(g_c2h_cyclic_transfer);
+-	g_c2h_cyclic_transfer = NULL;
++			transfer->desc_num * sizeof(struct xdma_desc),
++			transfer->desc_virt, transfer->desc_bus);
++	}
++
++	kfree(transfer);
++	xcdev->dma32_transfer = NULL;
+ 	pr_info("NexST proxy cyclic DMA stopped!\n");
++	return 0;
+ }
+ 
+ static struct xdma_dma32_packet_hdr *dma32_db_hdr(struct xdma_cdev *xcdev)
+@@ -232,172 +266,126 @@
+ 	return 0;
+ }
+ 
+-static long dma32_db_alloc_ioctl(struct xdma_cdev *xcdev, void __user *arg)
++/* Keep streaming DMA addressing unchanged while allocating coherent DMA32. */
++static int dma32_alloc_coherent32(struct device *dev, size_t size,
++				void **cpu, dma_addr_t *bus)
++{
++	u64 saved_mask = dev->coherent_dma_mask;
++	int rv;
++
++	*cpu = NULL;
++	rv = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
++	if (!rv)
++		*cpu = dma_alloc_coherent(dev, size, bus, GFP_KERNEL | GFP_DMA32);
++	dma_set_coherent_mask(dev, saved_mask);
++	if (rv)
++		return rv;
++	if (!*cpu)
++		return -ENOMEM;
++	if (upper_32_bits((u64)*bus)) {
++		dma_free_coherent(dev, size, *cpu, *bus);
++		*cpu = NULL;
++		return -ERANGE;
++	}
++	return 0;
++}
++
++static long dma32_db_alloc_ioctl(struct xdma_cdev *xcdev, struct file *owner,
++				void __user *arg)
+ {
+ 	struct xdma_dma32_doorbell req;
+ 	struct xdma_dev *xdev = xcdev->xdev;
+ 	struct device *dev = &xdev->pdev->dev;
+-	int rv = 0;
++	struct xdma_engine *engine;
++	struct xdma_transfer *transfer;
++	void *cpu, *descriptors;
++	dma_addr_t bus, descriptor_bus;
+ 	size_t size;
+-	void *cpu_addr;
+-	dma_addr_t dma_addr;
+-	u64 old_dma_mask = 0;
+-	u64 old_coherent_mask;
+-	bool lowered_mask = false;
++	unsigned long flags;
++	int rv, cleanup_rv, count;
+ 
+ 	if (copy_from_user(&req, arg, sizeof(req)))
+ 		return -EFAULT;
++	if (req.size && (req.size < PAGE_SIZE || req.size > 0x400000))
++		return -EINVAL;
++	if (xcdev->dma32_db_cpu || xcdev->dma32_transfer)
++		return -EBUSY;
++	if (xdev->c2h_channel_max <= 1)
++		return -EOPNOTSUPP;
++	engine = &xdev->engine_c2h[1];
++	spin_lock_irqsave(&engine->lock, flags);
++	rv = engine->running || !list_empty(&engine->transfer_list) ? -EBUSY : 0;
++	spin_unlock_irqrestore(&engine->lock, flags);
++	if (rv)
++		return rv;
+ 
+ 	size = req.size ? PAGE_ALIGN(req.size) : PAGE_SIZE;
+-
++	rv = dma32_alloc_coherent32(dev, size, &cpu, &bus);
++	if (rv)
++		return rv;
++	memset(cpu, 0, size);
+ 	spin_lock(&xcdev->lock);
+-	if (xcdev->dma32_db_cpu) {
+-		spin_unlock(&xcdev->lock);
+-		return -EBUSY;
+-	}
+-	spin_unlock(&xcdev->lock);
+-
+-	/*
+-	 * Defensive cleanup: if userspace exited unexpectedly and skipped FREE,
+-	 * clear stale global cyclic state before starting a new session.
+-	 */
+-	if (g_c2h_cyclic_transfer) {
+-		pr_warn("NexST proxy found stale cyclic transfer, forcing cleanup before realloc\n");
+-		nexst_cyclic_dma_stop(xcdev);
+-	}
+-
+-	/*
+-	 * GFP_DMA32 alone is not sufficient on some systems (e.g. with IOMMU)
+-	 * where device DMA masks allow >32-bit IOVA. Temporarily force both
+-	 * streaming and coherent masks to 32-bit for this allocation.
+-	 */
+-	old_coherent_mask = dev->coherent_dma_mask;
+-	if (dev->dma_mask)
+-		old_dma_mask = *dev->dma_mask;
+-
+-	if ((dev->dma_mask && *dev->dma_mask > DMA_BIT_MASK(32)) ||
+-	    dev->coherent_dma_mask > DMA_BIT_MASK(32)) {
+-		if ((dev->dma_mask && dma_set_mask(dev, DMA_BIT_MASK(32))) ||
+-		    dma_set_coherent_mask(dev, DMA_BIT_MASK(32)))
+-			return -EIO;
+-		lowered_mask = true;
+-	}
+-
+-	cpu_addr = dma_alloc_coherent(dev, size, &dma_addr,
+-				      GFP_KERNEL | GFP_DMA32);
+-
+-	if (lowered_mask) {
+-		if (dev->dma_mask)
+-			dma_set_mask(dev, old_dma_mask);
+-		dma_set_coherent_mask(dev, old_coherent_mask);
+-	}
+-	if (!cpu_addr)
+-		return -ENOMEM;
+-
+-	if (upper_32_bits((u64)dma_addr)) {
+-		dma_free_coherent(dev, size, cpu_addr, dma_addr);
+-		return -ERANGE;
+-	}
+-
+-	memset(cpu_addr, 0, size);
+-	spin_lock(&xcdev->lock);
+-	if (xcdev->dma32_db_cpu) {
+-		spin_unlock(&xcdev->lock);
+-		dma_free_coherent(dev, size, cpu_addr, dma_addr);
+-		return -EBUSY;
+-	}
+-	xcdev->dma32_db_cpu = cpu_addr;
+-	xcdev->dma32_db_dma = dma_addr;
++	xcdev->dma32_db_cpu = cpu;
++	xcdev->dma32_db_dma = bus;
+ 	xcdev->dma32_db_size = size;
++	xcdev->dma32_owner = owner;
+ 	dma32_db_init_header(xcdev);
+ 	spin_unlock(&xcdev->lock);
+ 
+-	// --- Hack: Setup Cyclic DMA on C2H engine 0 ---
+-        do {
+-                struct xdma_dev *xdev = xcdev->xdev;
+-                struct xdma_engine *engine;
+-                struct xdma_transfer *transfer;
+-                int num_desc;
+-                void *desc_virt;
+-                dma_addr_t desc_bus;
+-                u64 tmp_sys_dma_mask = dev->dma_mask ? *dev->dma_mask : 0;
+-                u64 tmp_sys_coh_mask = dev->coherent_dma_mask;
+-
+-                if (xdev->c2h_channel_max <= 1) break;
+-                engine = &xdev->engine_c2h[1];
+-
+-                /* One descriptor per TLAST packet. A single 64 KiB cyclic
+-                 * descriptor restarts at offset zero for every packet and
+-                 * loses unacknowledged BAR_WRITE_DONE messages.
+-                 */
+-                num_desc = size / NEXST_PROXY_RX_SLOT_BYTES;
+-
+-                if (dev->dma_mask)
+-                        dma_set_mask(dev, DMA_BIT_MASK(32));
+-                dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
+-
+-                desc_virt = dma_alloc_coherent(dev, num_desc * sizeof(struct xdma_desc), &desc_bus, GFP_KERNEL | GFP_DMA32);
+-
+-                if (dev->dma_mask)
+-                        dma_set_mask(dev, tmp_sys_dma_mask);
+-                dma_set_coherent_mask(dev, tmp_sys_coh_mask);
+-
+-				if (!desc_virt) break;
+-
+-                transfer = kzalloc(sizeof(struct xdma_transfer), GFP_KERNEL);
+-                if (!transfer) {
+-                        dma_free_coherent(dev, num_desc * sizeof(struct xdma_desc), desc_virt, desc_bus);
+-                        break;
+-                }
+-
+-                transfer->dir = engine->dir;
+-                transfer->desc_num = num_desc;
+-                transfer->desc_virt = desc_virt;
+-                transfer->desc_bus = desc_bus;
+-
+-                nexst_dma32_ring_init(transfer, dma_addr);
+-                transfer->cyclic = 1;
+-
++	count = size / NEXST_PROXY_RX_SLOT_BYTES;
++	rv = dma32_alloc_coherent32(dev, count * sizeof(struct xdma_desc),
++				    &descriptors, &descriptor_bus);
++	if (rv)
++		goto fail;
++	transfer = kzalloc(sizeof(*transfer), GFP_KERNEL);
++	if (!transfer) {
++		dma_free_coherent(dev, count * sizeof(struct xdma_desc),
++				  descriptors, descriptor_bus);
++		rv = -ENOMEM;
++		goto fail;
++	}
++	INIT_LIST_HEAD(&transfer->entry);
++	transfer->dir = engine->dir;
++	transfer->desc_num = count;
++	transfer->desc_virt = descriptors;
++	transfer->desc_bus = descriptor_bus;
++	transfer->cyclic = 1;
++	nexst_dma32_ring_init(transfer, bus);
+ #if HAS_SWAKE_UP
+-                init_swait_queue_head(&transfer->wq);
++	init_swait_queue_head(&transfer->wq);
+ #else
+-                init_waitqueue_head(&transfer->wq);
++	init_waitqueue_head(&transfer->wq);
+ #endif
+-
+-		rv = transfer_queue(engine, transfer);
+-		if (rv) {
+-			pr_err("NexST proxy cyclic DMA queue failed on C2H channel 1: %d\n", rv);
+-			if (transfer->desc_virt)
+-				dma_free_coherent(dev,
+-					num_desc * sizeof(struct xdma_desc),
+-					transfer->desc_virt, transfer->desc_bus);
+-			kfree(transfer);
+-					goto fail_dma32_db;
+-		}
+-
+-		g_c2h_cyclic_transfer = transfer;
+-		pr_info("NexST proxy cyclic DMA started on C2H channel 1: %d slots, %u bytes/slot!\n",
+-			num_desc, NEXST_PROXY_RX_SLOT_BYTES);
+-        } while(0);
+-        // ----------------------------------------------
+-
++	/* The transfer belongs to this cdev and its original PCI device only. */
++	xcdev->dma32_transfer = transfer;
++	dma_wmb();
++	rv = transfer_queue(engine, transfer);
++	if (!rv) {
++		spin_lock_irqsave(&engine->lock, flags);
++		if (!engine->running)
++			rv = -EIO;
++		spin_unlock_irqrestore(&engine->lock, flags);
++	}
++	if (rv)
++		goto fail;
++
++	pr_info("NexST proxy cyclic DMA started on C2H channel 1: %d slots, %u bytes/slot!\n",
++		count, NEXST_PROXY_RX_SLOT_BYTES);
+ 	req.size = size;
+-	req.dma_addr = (unsigned long long)dma_addr;
++	req.dma_addr = (unsigned long long)bus;
+ 	req.reserved = 0;
+-
+ 	if (copy_to_user(arg, &req, sizeof(req))) {
+-		dma32_db_free_ioctl(xcdev);
+-		return -EFAULT;
+-	}
+-
+-	return 0;
+-
+-fail_dma32_db:
+-	dma32_db_free_ioctl(xcdev);
+-	return rv ? rv : -EIO;
+-}
+-
+-	static long dma32_db_put_ioctl(struct xdma_cdev *xcdev, void __user *arg)
++		rv = -EFAULT;
++		goto fail;
++	}
++	return 0;
++
++fail:
++	cleanup_rv = dma32_db_free_ioctl(xcdev);
++	return cleanup_rv ? cleanup_rv : rv;
++}
++
++static long dma32_db_put_ioctl(struct xdma_cdev *xcdev, void __user *arg)
+ {
+ 	struct xdma_dma32_packet_req req;
+ 	void *tmp;
+@@ -453,9 +441,14 @@
+ static long dma32_db_free_ioctl(struct xdma_cdev *xcdev)
+ {
+ 	struct xdma_dev *xdev = xcdev->xdev;
++	int rv;
+ 	void *cpu_addr;
+ 	dma_addr_t dma_addr;
+ 	size_t size;
++
++	rv = nexst_cyclic_dma_stop(xcdev);
++	if (rv)
++		return rv;
+ 
+ 	spin_lock(&xcdev->lock);
+ 	cpu_addr = xcdev->dma32_db_cpu;
+@@ -465,16 +458,60 @@
+ 	xcdev->dma32_db_dma = 0;
+ 	xcdev->dma32_db_size = 0;
+ 	xcdev->dma32_db_seq = 0;
++	xcdev->dma32_owner = NULL;
+ 	spin_unlock(&xcdev->lock);
+-
+-	// --- Hack: Stop Cyclic DMA ---
+-	nexst_cyclic_dma_stop(xcdev);
+-	// -----------------------------
+ 
+ 	if (!cpu_addr)
+ 		return 0;
+ 
+ 	dma_free_coherent(&xdev->pdev->dev, size, cpu_addr, dma_addr);
++	return 0;
++}
++
++/* Called before the owning PCI device, engine queues or BARs are destroyed. */
++void cdev_ctrl_cleanup(struct xdma_cdev *xcdev)
++{
++	if (xcdev->magic != MAGIC_CHAR)
++		return;
++	mutex_lock(&nexst_dma32_mutex);
++	xcdev->dma32_removing = true;
++	if (dma32_db_free_ioctl(xcdev)) {
++		/* remove cannot be aborted. Keep DMA memory and its allocation
++		 * device alive rather than reuse possibly active memory. No new
++		 * probe can inherit these objects: state is exclusively per cdev.
++		 */
++		get_device(&xcdev->xdev->pdev->dev);
++		xcdev->dma32_owner = NULL;
++	}
++	mutex_unlock(&nexst_dma32_mutex);
++}
++
++static int char_ctrl_close(struct inode *inode, struct file *file)
++{
++	struct xdma_cdev *xcdev = file->private_data;
++	int rv = char_close(inode, file);
++
++	if (rv)
++		return rv;
++	mutex_lock(&nexst_dma32_mutex);
++	if (!xcdev->dma32_removing && xcdev->dma32_owner == file) {
++		rv = dma32_db_free_ioctl(xcdev);
++		/* A failed stop retains the allocation, not a dangling file ptr. */
++		xcdev->dma32_owner = NULL;
++	}
++	mutex_unlock(&nexst_dma32_mutex);
++	return rv;
++}
++
++/* Called with nexst_dma32_mutex held; QUERY never grants mutation rights. */
++static int dma32_db_access(struct xdma_cdev *xcdev, struct file *file, bool query)
++{
++	if (xcdev->dma32_removing)
++		return -ENODEV;
++	if (xcdev != &xcdev->xpdev->ctrl_cdev)
++		return -EINVAL;
++	if (!query && xcdev->dma32_owner && xcdev->dma32_owner != file)
++		return -EBUSY;
+ 	return 0;
+ }
+ 
+@@ -536,13 +573,31 @@
+ 		xdma_device_online(xdev->pdev, xdev);
+ 		break;
+ 	case XDMA_IOC_DMA32_DB_ALLOC:
+-		return dma32_db_alloc_ioctl(xcdev, (void __user *)arg);
+ 	case XDMA_IOC_DMA32_DB_QUERY:
+-		return dma32_db_query_ioctl(xcdev, (void __user *)arg);
+ 	case XDMA_IOC_DMA32_DB_FREE:
+-		return dma32_db_free_ioctl(xcdev);
+ 	case XDMA_IOC_DMA32_DB_PUT:
+-		return dma32_db_put_ioctl(xcdev, (void __user *)arg);
++		if (mutex_lock_interruptible(&nexst_dma32_mutex))
++			return -ERESTARTSYS;
++		result = dma32_db_access(xcdev, filp, cmd == XDMA_IOC_DMA32_DB_QUERY);
++		if (result)
++			goto dma32_unlock;
++		switch (cmd) {
++		case XDMA_IOC_DMA32_DB_ALLOC:
++			result = dma32_db_alloc_ioctl(xcdev, filp, (void __user *)arg);
++			break;
++		case XDMA_IOC_DMA32_DB_QUERY:
++			result = dma32_db_query_ioctl(xcdev, (void __user *)arg);
++			break;
++		case XDMA_IOC_DMA32_DB_FREE:
++			result = dma32_db_free_ioctl(xcdev);
++			break;
++		default:
++			result = dma32_db_put_ioctl(xcdev, (void __user *)arg);
++			break;
++		}
++dma32_unlock:
++		mutex_unlock(&nexst_dma32_mutex);
++		return result;
+ 	default:
+ 		pr_err("UNKNOWN ioctl cmd 0x%x.\n", cmd);
+ 		return -ENOTTY;
+@@ -572,18 +627,31 @@
+ 		size_t size;
+ 		unsigned long saved_pgoff;
+ 
++		mutex_lock(&nexst_dma32_mutex);
++		if (xcdev->dma32_removing) {
++			rv = -ENODEV;
++			goto dma32_mmap_unlock;
++		}
++		if (xcdev->dma32_owner != file) {
++			rv = -EBUSY;
++			goto dma32_mmap_unlock;
++		}
+ 		spin_lock(&xcdev->lock);
+ 		cpu_addr = xcdev->dma32_db_cpu;
+ 		dma_addr = xcdev->dma32_db_dma;
+ 		size = xcdev->dma32_db_size;
+ 		spin_unlock(&xcdev->lock);
+ 
+-		if (!cpu_addr)
+-			return -ENODATA;
++		if (!cpu_addr) {
++			rv = -ENODATA;
++			goto dma32_mmap_unlock;
++		}
+ 
+ 		vsize = vma->vm_end - vma->vm_start;
+-		if (vsize > size)
+-			return -EINVAL;
++		if (vsize > size) {
++			rv = -EINVAL;
++			goto dma32_mmap_unlock;
++		}
+ 
+ 		/*
+ 		 * dma_mmap_coherent() expects vm_pgoff to be an offset within this
+@@ -596,6 +664,8 @@
+ 				dma_addr, size);
+ 		if (rv)
+ 			vma->vm_pgoff = saved_pgoff;
++dma32_mmap_unlock:
++		mutex_unlock(&nexst_dma32_mutex);
+ 		return rv;
+ 	}
+ 
+@@ -650,7 +720,7 @@
+ static const struct file_operations ctrl_fops = {
+ 	.owner = THIS_MODULE,
+ 	.open = char_open,
+-	.release = char_close,
++	.release = char_ctrl_close,
+ 	.read = char_ctrl_read,
+ 	.write = char_ctrl_write,
+ 	.mmap = bridge_mmap,
+diff --git a/XDMA/linux-kernel/xdma/xdma_mod.c b/XDMA/linux-kernel/xdma/xdma_mod.c
+index 923454ad0503f17bcfc864ee7e076828a7fa135c..c00e6513c64e7f0a14a345070f2091615d72fb4c 100644
+--- a/XDMA/linux-kernel/xdma/xdma_mod.c
++++ b/XDMA/linux-kernel/xdma/xdma_mod.c
+@@ -129,6 +129,11 @@
+ 		kfree(xpdev);
+ 		return;
+ 	}
++	/* Quiesce all device DMA before destroying queues and BAR mappings. */
++	pci_clear_master(xpdev->pdev);
++	pci_wait_for_pending_transaction(xpdev->pdev);
++	cdev_ctrl_cleanup(&xpdev->ctrl_cdev);
++	cdev_ctrl_cleanup(&xpdev->user_cdev);
+ 	xpdev_destroy_interfaces(xpdev);
+ 	xpdev_destroy_uart(xpdev);
+ 	xpdev->xdev = NULL;
+diff --git a/XDMA/linux-kernel/xdma/xdma_mod.h b/XDMA/linux-kernel/xdma/xdma_mod.h
+index a3a0e1901f3670c23ec7ab377e6e65d28e7d99a3..154041246dacd2c8a500e12891decc84637c40be 100644
+--- a/XDMA/linux-kernel/xdma/xdma_mod.h
++++ b/XDMA/linux-kernel/xdma/xdma_mod.h
+@@ -76,6 +76,9 @@
+ 	dma_addr_t dma32_db_dma;
+ 	size_t dma32_db_size;
+ 	u32 dma32_db_seq;
++	struct xdma_transfer *dma32_transfer;
++	struct file *dma32_owner;
++	bool dma32_removing;
+ 	spinlock_t lock;
+ };
+ 
+diff --git a/XDMA/linux-kernel/xdma/xdma_cdev.h b/XDMA/linux-kernel/xdma/xdma_cdev.h
+index 4b2fc509862415f193f1f09781ec2b6d3d3f4e3e..2f46615b2aabde63e467e808966ae999b2591358 100644
+--- a/XDMA/linux-kernel/xdma/xdma_cdev.h
++++ b/XDMA/linux-kernel/xdma/xdma_cdev.h
+@@ -37,6 +37,7 @@
+ int char_close(struct inode *inode, struct file *file);
+ int xcdev_check(const char *fname, struct xdma_cdev *xcdev, bool check_engine);
+ void cdev_ctrl_init(struct xdma_cdev *xcdev);
++void cdev_ctrl_cleanup(struct xdma_cdev *xcdev);
+ void cdev_xvc_init(struct xdma_cdev *xcdev);
+ void cdev_event_init(struct xdma_cdev *xcdev);
+ void cdev_sgdma_init(struct xdma_cdev *xcdev);

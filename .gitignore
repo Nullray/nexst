@@ -33,7 +33,9 @@ hs_err_pid*.log
 *.rej
 *.patch
 !/tools/guest/patches/xdma-dma32-packet-ring.patch
+!/tools/guest/patches/xdma-dma32-lifecycle.patch
 !/tools/host/patches/qemu-xhci-usb-fixes.patch
+!/tools/host/patches/qemu-restart-lifecycle.patch
 *.swp
 *~
 *.backup.*

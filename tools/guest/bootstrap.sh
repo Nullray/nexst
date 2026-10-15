@@ -46,7 +46,18 @@ if (( ! kernel_only )); then
     apply_saved_patch "$repo_root/shell/software/xdma_drv" \
         e63f5a117a5a2cd83738105ea6c7c4b5ac16f6a3 \
         "$repo_root/tools/guest/patches/xdma-uart-kernel-api.patch"
-    apply_saved_patch "$repo_root/shell/software/xdma_drv" \
-        e63f5a117a5a2cd83738105ea6c7c4b5ac16f6a3 \
-        "$repo_root/tools/guest/patches/xdma-dma32-packet-ring.patch"
+    lifecycle_patch="$repo_root/tools/guest/patches/xdma-dma32-lifecycle.patch"
+    if git -C "$repo_root/shell/software/xdma_drv" apply \
+        --reverse --check "$lifecycle_patch" 2>/dev/null; then
+        # The lifecycle patch changes the packet-ring postimage. Verify its
+        # saved hashes rather than rejecting the earlier patch's new blob.
+        apply_saved_patch "$repo_root/shell/software/xdma_drv" \
+            e63f5a117a5a2cd83738105ea6c7c4b5ac16f6a3 "$lifecycle_patch"
+    else
+        apply_saved_patch "$repo_root/shell/software/xdma_drv" \
+            e63f5a117a5a2cd83738105ea6c7c4b5ac16f6a3 \
+            "$repo_root/tools/guest/patches/xdma-dma32-packet-ring.patch"
+        apply_saved_patch "$repo_root/shell/software/xdma_drv" \
+            e63f5a117a5a2cd83738105ea6c7c4b5ac16f6a3 "$lifecycle_patch"
+    fi
 fi
